@@ -4658,6 +4658,14 @@ static JSValue js_new_string16_len(JSContext *ctx, const uint16_t *buf, int len)
     return JS_MKPTR(JS_TAG_STRING, str);
 }
 
+/**
+ * js_new_string_char - 创建单字符字符串
+ * @ctx: 上下文
+ * @c: 字符（16 位）
+ * 返回: 字符串 JSValue
+ * 
+ * 说明：根据字符范围选择 8 位或 16 位表示
+ */
 static JSValue js_new_string_char(JSContext *ctx, uint16_t c)
 {
     if (c < 0x100) {
@@ -4669,6 +4677,18 @@ static JSValue js_new_string_char(JSContext *ctx, uint16_t c)
     }
 }
 
+/**
+ * js_sub_string - 创建子字符串
+ * @ctx: 上下文
+ * @p: 原字符串
+ * @start: 起始位置
+ * @end: 结束位置
+ * 返回: 子字符串 JSValue
+ * 
+ * 说明：
+ * - 如果是整个字符串，直接复用（增加引用计数）
+ * - 如果是宽字符但内容都是 ASCII，优化为 8 位字符串
+ */
 static JSValue js_sub_string(JSContext *ctx, JSString *p, int start, int end)
 {
     int len = end - start;
@@ -4685,6 +4705,7 @@ static JSValue js_sub_string(JSContext *ctx, JSString *p, int start, int end)
         if (c > 0xFF)
             return js_new_string16_len(ctx, p->u.str16 + start, len);
 
+        // 优化：宽字符但内容都是 ASCII，转为 8 位
         str = js_alloc_string(ctx, len, 0);
         if (!str)
             return JS_EXCEPTION;
@@ -4698,18 +4719,22 @@ static JSValue js_sub_string(JSContext *ctx, JSString *p, int start, int end)
     }
 }
 
+/* ============================================================================
+ * StringBuffer - 字符串缓冲区
+ * 用于高效构建字符串，支持动态扩容和字符编码转换
+ * ============================================================================ */
+
 typedef struct StringBuffer {
-    JSContext *ctx;
-    JSString *str;
-    int len;
-    int size;
-    int is_wide_char;
-    int error_status;
+    JSContext *ctx;          // 上下文
+    JSString *str;           // 字符串
+    int len;                 // 当前长度
+    int size;                // 容量
+    int is_wide_char;        // 是否 16 位字符
+    int error_status;        // 错误状态
 } StringBuffer;
 
-/* It is valid to call string_buffer_end() and all string_buffer functions even
-   if string_buffer_init() or another string_buffer function returns an error.
-   If the error_status is set, string_buffer_end() returns JS_EXCEPTION.
+/* 即使初始化或其他函数返回错误，调用 string_buffer_end() 和其他函数仍然是有效的。
+   如果 error_status 被设置，string_buffer_end() 返回 JS_EXCEPTION。
  */
 static int string_buffer_init2(JSContext *ctx, StringBuffer *s, int size,
                                int is_wide)
@@ -4725,23 +4750,39 @@ static int string_buffer_init2(JSContext *ctx, StringBuffer *s, int size,
         return s->error_status = -1;
     }
 #ifdef DUMP_LEAKS
-    /* the StringBuffer may reallocate the JSString, only link it at the end */
+    /* StringBuffer 可能会重新分配 JSString，只在最后链接 */
     list_del(&s->str->link);
 #endif
     return 0;
 }
 
+/**
+ * string_buffer_init - 初始化字符串缓冲区
+ * @ctx: 上下文
+ * @s: 缓冲区
+ * @size: 初始大小
+ * 返回: 0 成功，-1 失败
+ */
 static inline int string_buffer_init(JSContext *ctx, StringBuffer *s, int size)
 {
     return string_buffer_init2(ctx, s, size, 0);
 }
 
+/**
+ * string_buffer_free - 释放字符串缓冲区
+ * @s: 缓冲区
+ */
 static void string_buffer_free(StringBuffer *s)
 {
     js_free(s->ctx, s->str);
     s->str = NULL;
 }
 
+/**
+ * string_buffer_set_error - 设置错误状态
+ * @s: 缓冲区
+ * 返回: -1
+ */
 static int string_buffer_set_error(StringBuffer *s)
 {
     js_free(s->ctx, s->str);
@@ -4751,6 +4792,14 @@ static int string_buffer_set_error(StringBuffer *s)
     return s->error_status = -1;
 }
 
+/**
+ * string_buffer_widen - 将缓冲区扩展为 16 位字符
+ * @s: 缓冲区
+ * @size: 新大小
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：将 8 位字符数组转换为 16 位
+ */
 static no_inline int string_buffer_widen(StringBuffer *s, int size)
 {
     JSString *str;
@@ -4765,7 +4814,7 @@ static no_inline int string_buffer_widen(StringBuffer *s, int size)
         return string_buffer_set_error(s);
     size += slack >> 1;
     for(i = s->len; i-- > 0;) {
-        str->u.str16[i] = str->u.str8[i];
+        str->u.str16[i] = str->u.str8[i];  // 8 位转 16 位
     }
     s->is_wide_char = 1;
     s->size = size;
@@ -4773,6 +4822,15 @@ static no_inline int string_buffer_widen(StringBuffer *s, int size)
     return 0;
 }
 
+/**
+ * string_buffer_realloc - 重新分配缓冲区
+ * @s: 缓冲区
+ * @new_len: 新长度
+ * @c: 要添加的字符（用于判断是否需要转 16 位）
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：使用 3/2 增长策略
+ */
 static no_inline int string_buffer_realloc(StringBuffer *s, int new_len, int c)
 {
     JSString *new_str;
@@ -4788,7 +4846,7 @@ static no_inline int string_buffer_realloc(StringBuffer *s, int new_len, int c)
     }
     new_size = min_int(max_int(new_len, s->size * 3 / 2), JS_STRING_LEN_MAX);
     if (!s->is_wide_char && c >= 0x100) {
-        return string_buffer_widen(s, new_size);
+        return string_buffer_widen(s, new_size);  // 需要转 16 位
     }
     new_size_bytes = sizeof(JSString) + (new_size << s->is_wide_char) + 1 - s->is_wide_char;
     new_str = js_realloc2(s->ctx, s->str, new_size_bytes, &slack);
@@ -4800,6 +4858,14 @@ static no_inline int string_buffer_realloc(StringBuffer *s, int new_len, int c)
     return 0;
 }
 
+/**
+ * string_buffer_putc16_slow - 添加 16 位字符（慢速路径）
+ * @s: 缓冲区
+ * @c: 字符
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：处理扩容和编码转换
+ */
 static no_inline int string_buffer_putc16_slow(StringBuffer *s, uint32_t c)
 {
     if (unlikely(s->len >= s->size)) {
@@ -4818,6 +4884,12 @@ static no_inline int string_buffer_putc16_slow(StringBuffer *s, uint32_t c)
     return 0;
 }
 
+/**
+ * string_buffer_putc8 - 添加 8 位字符（0-255）
+ * @s: 缓冲区
+ * @c: 字符
+ * 返回: 0 成功，-1 失败
+ */
 /* 0 <= c <= 0xff */
 static int string_buffer_putc8(StringBuffer *s, uint32_t c)
 {
@@ -4833,6 +4905,14 @@ static int string_buffer_putc8(StringBuffer *s, uint32_t c)
     return 0;
 }
 
+/**
+ * string_buffer_putc16 - 添加 16 位字符（0-65535）
+ * @s: 缓冲区
+ * @c: 字符
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：快速路径内联，慢速路径调用 putc16_slow
+ */
 /* 0 <= c <= 0xffff */
 static int string_buffer_putc16(StringBuffer *s, uint32_t c)
 {
@@ -4848,6 +4928,14 @@ static int string_buffer_putc16(StringBuffer *s, uint32_t c)
     return string_buffer_putc16_slow(s, c);
 }
 
+/**
+ * string_buffer_putc_slow - 添加 Unicode 字符（慢速路径）
+ * @s: 缓冲区
+ * @c: 字符（0-0x10FFFF）
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：处理代理对（surrogate pair）
+ */
 static int string_buffer_putc_slow(StringBuffer *s, uint32_t c)
 {
     if (unlikely(c >= 0x10000)) {
@@ -4859,6 +4947,16 @@ static int string_buffer_putc_slow(StringBuffer *s, uint32_t c)
     return string_buffer_putc16(s, c);
 }
 
+/**
+ * string_buffer_putc - 添加 Unicode 字符（内联快速路径）
+ * @s: 缓冲区
+ * @c: 字符（0-0x10FFFF）
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：
+ * - BMP 字符（<0x10000）直接存储
+ * - 辅助平面字符使用代理对
+ */
 /* 0 <= c <= 0x10ffff */
 static inline int string_buffer_putc(StringBuffer *s, uint32_t c)
 {
@@ -4880,6 +4978,14 @@ static inline int string_buffer_putc(StringBuffer *s, uint32_t c)
     return string_buffer_putc_slow(s, c);
 }
 
+/**
+ * string_getc - 从字符串获取字符（处理代理对）
+ * @p: 字符串
+ * @pidx: 输入/输出参数，当前位置
+ * 返回: 字符值
+ * 
+ * 说明：自动处理 UTF-16 代理对
+ */
 static int string_getc(const JSString *p, int *pidx)
 {
     int idx, c, c1;
@@ -4900,6 +5006,13 @@ static int string_getc(const JSString *p, int *pidx)
     return c;
 }
 
+/**
+ * string_buffer_write8 - 写入 8 位字符串
+ * @s: 缓冲区
+ * @p: 数据
+ * @len: 长度
+ * 返回: 0 成功，-1 失败
+ */
 static int string_buffer_write8(StringBuffer *s, const uint8_t *p, int len)
 {
     int i;
@@ -4920,6 +5033,13 @@ static int string_buffer_write8(StringBuffer *s, const uint8_t *p, int len)
     return 0;
 }
 
+/**
+ * string_buffer_write16 - 写入 16 位字符串
+ * @s: 缓冲区
+ * @p: 数据
+ * @len: 长度
+ * 返回: 0 成功，-1 失败
+ */
 static int string_buffer_write16(StringBuffer *s, const uint16_t *p, int len)
 {
     int c = 0, i;
@@ -4946,12 +5066,26 @@ static int string_buffer_write16(StringBuffer *s, const uint16_t *p, int len)
     return 0;
 }
 
+/**
+ * string_buffer_puts8 - 追加 ASCII 字符串
+ * @s: 缓冲区
+ * @str: 字符串
+ * 返回: 0 成功，-1 失败
+ */
 /* appending an ASCII string */
 static int string_buffer_puts8(StringBuffer *s, const char *str)
 {
     return string_buffer_write8(s, (const uint8_t *)str, strlen(str));
 }
 
+/**
+ * string_buffer_concat - 连接字符串片段
+ * @s: 缓冲区
+ * @p: 源字符串
+ * @from: 起始位置
+ * @to: 结束位置
+ * 返回: 0 成功，-1 失败
+ */
 static int string_buffer_concat(StringBuffer *s, const JSString *p,
                                 uint32_t from, uint32_t to)
 {
@@ -4963,6 +5097,16 @@ static int string_buffer_concat(StringBuffer *s, const JSString *p,
         return string_buffer_write8(s, p->u.str8 + from, to - from);
 }
 
+/**
+ * string_buffer_concat_value - 连接 JSValue（转换为字符串）
+ * @s: 缓冲区
+ * @v: JSValue
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：
+ * - 支持绳索字符串（递归展开）
+ * - 非字符串值先转换为字符串
+ */
 static int string_buffer_concat_value(StringBuffer *s, JSValueConst v)
 {
     JSString *p;
@@ -4976,7 +5120,7 @@ static int string_buffer_concat_value(StringBuffer *s, JSValueConst v)
     if (unlikely(JS_VALUE_GET_TAG(v) != JS_TAG_STRING)) {
         if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE) {
             JSStringRope *r = JS_VALUE_GET_STRING_ROPE(v);
-            /* recursion is acceptable because the rope depth is bounded */
+            /* 递归是可接受的，因为绳索深度有界 */
             if (string_buffer_concat_value(s, r->left))
                 return -1;
             return string_buffer_concat_value(s, r->right);
@@ -4994,6 +5138,12 @@ static int string_buffer_concat_value(StringBuffer *s, JSValueConst v)
     return string_buffer_concat(s, p, 0, p->len);
 }
 
+/**
+ * string_buffer_concat_value_free - 连接 JSValue 并释放
+ * @s: 缓冲区
+ * @v: JSValue
+ * 返回: 0 成功，-1 失败
+ */
 static int string_buffer_concat_value_free(StringBuffer *s, JSValue v)
 {
     JSString *p;
