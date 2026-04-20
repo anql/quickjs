@@ -3503,6 +3503,12 @@ JSAtom JS_DupAtom(JSContext *ctx, JSAtom v)
     return v;
 }
 
+/**
+ * JS_AtomGetKind - 获取 Atom 类型
+ * @ctx: 上下文
+ * @v: Atom 值
+ * 返回: Atom 类型（字符串/Symbol/私有）
+ */
 static JSAtomKindEnum JS_AtomGetKind(JSContext *ctx, JSAtom v)
 {
     JSRuntime *rt;
@@ -3527,11 +3533,25 @@ static JSAtomKindEnum JS_AtomGetKind(JSContext *ctx, JSAtom v)
     }
 }
 
+/**
+ * JS_AtomIsString - 检查 Atom 是否是字符串
+ * @ctx: 上下文
+ * @v: Atom 值
+ * 返回: TRUE 是字符串，FALSE 不是
+ */
 static BOOL JS_AtomIsString(JSContext *ctx, JSAtom v)
 {
     return JS_AtomGetKind(ctx, v) == JS_ATOM_KIND_STRING;
 }
 
+/**
+ * js_get_atom_index - 获取 Atom 在数组中的索引
+ * @rt: 运行时
+ * @p: Atom 结构指针
+ * 返回: 索引值
+ * 
+ * 说明：对于 Symbol，直接使用 hash_next；对于字符串，需要在哈希表中查找
+ */
 static JSAtom js_get_atom_index(JSRuntime *rt, JSAtomStruct *p)
 {
     uint32_t i = p->hash_next;  /* atom_index */
@@ -3549,8 +3569,26 @@ static JSAtom js_get_atom_index(JSRuntime *rt, JSAtomStruct *p)
     return i;
 }
 
-/* string case (internal). Return JS_ATOM_NULL if error. 'str' is
-   freed. */
+/* ============================================================================
+ * Atom 创建核心函数
+ * ============================================================================ */
+
+/**
+ * __JS_NewAtom - 创建新 Atom（内部函数）
+ * @rt: 运行时
+ * @str: 字符串（会被释放）
+ * @atom_type: Atom 类型
+ * 返回: Atom 索引，失败返回 JS_ATOM_NULL
+ * 
+ * 实现逻辑：
+ * 1. 如果是字符串类型，先检查是否已存在相同 Atom
+ * 2. 如果不存在，分配新的 Atom 条目
+ * 3. 使用空闲链表管理空闲条目
+ * 4. 当 Atom 数量达到阈值时，扩展哈希表
+ * 
+ * 注意：str 参数会被释放或重用
+ */
+/* string case (internal). Return JS_ATOM_NULL if error. 'str' is freed. */
 static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
 {
     uint32_t h, h1, i;
@@ -3563,14 +3601,14 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
     if (atom_type < JS_ATOM_TYPE_SYMBOL) {
         /* str is not NULL */
         if (str->atom_type == atom_type) {
-            /* str is the atom, return its index */
+            /* str 已经是 atom，直接返回其索引 */
             i = js_get_atom_index(rt, str);
-            /* reduce string refcount and increase atom's unless constant */
+            /* 减少字符串引用计数，增加 atom 的引用计数（除非常量） */
             if (__JS_AtomIsConst(i))
                 str->header.ref_count--;
             return i;
         }
-        /* try and locate an already registered atom */
+        /* 尝试查找已存在的相同 atom */
         len = str->len;
         h = hash_string(str, atom_type);
         h &= JS_ATOM_HASH_MASK;
@@ -3598,14 +3636,15 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
         }
     }
 
+    // 如果没有空闲条目，扩展 atom 数组
     if (rt->atom_free_index == 0) {
         /* allow new atom entries */
         uint32_t new_size, start;
         JSAtomStruct **new_array;
 
-        /* alloc new with size progression 3/2:
+        /* 按 3/2 比例增长：
            4 6 9 13 19 28 42 63 94 141 211 316 474 711 1066 1599 2398 3597 5395 8092
-           preallocating space for predefined atoms (at least 504).
+           预分配至少 504 个预定义 atom 的空间。
          */
         new_size = max_int(711, rt->atom_size * 3 / 2);
         if (new_size > JS_ATOM_MAX)
@@ -3635,6 +3674,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
         rt->atom_size = new_size;
         rt->atom_array = new_array;
         rt->atom_free_index = start;
+        // 初始化空闲链表
         for(i = start; i < new_size; i++) {
             uint32_t next;
             if (i == (new_size - 1))
@@ -3645,6 +3685,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
         }
     }
 
+    // 创建或重用字符串结构
     if (str) {
         if (str->atom_type == 0) {
             p = str;
@@ -3677,6 +3718,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
 #endif
     }
 
+    // 从空闲链表分配条目
     /* use an already free entry */
     i = rt->atom_free_index;
     rt->atom_free_index = atom_get_free(rt->atom_array[i]);
@@ -3688,6 +3730,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
 
     rt->atom_count++;
 
+    // 加入哈希表（Symbol 除外）
     if (atom_type != JS_ATOM_TYPE_SYMBOL) {
         p->hash_next = rt->atom_hash[h1];
         rt->atom_hash[h1] = i;
@@ -3706,6 +3749,16 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
     return i;
 }
 
+/**
+ * __JS_NewAtomInit - 初始化时创建 Atom（仅用于零终止 8 位字符串）
+ * @rt: 运行时
+ * @str: 字符串
+ * @len: 长度
+ * @atom_type: Atom 类型
+ * 返回: Atom 索引，失败返回 JS_ATOM_NULL
+ * 
+ * 说明：仅在 JS_InitAtoms 中使用，用于创建预定义 Atom
+ */
 /* only works with zero terminated 8 bit strings */
 static JSAtom __JS_NewAtomInit(JSRuntime *rt, const char *str, int len,
                                int atom_type)
@@ -3719,6 +3772,16 @@ static JSAtom __JS_NewAtomInit(JSRuntime *rt, const char *str, int len,
     return __JS_NewAtom(rt, p, atom_type);
 }
 
+/**
+ * __JS_FindAtom - 查找已存在的 Atom
+ * @rt: 运行时
+ * @str: 字符串（必须是 ASCII）
+ * @len: 长度
+ * @atom_type: Atom 类型
+ * 返回: Atom 索引，不存在返回 JS_ATOM_NULL
+ * 
+ * 说明：用于优化，避免重复创建相同字符串的 Atom
+ */
 /* Warning: str must be ASCII only */
 static JSAtom __JS_FindAtom(JSRuntime *rt, const char *str, size_t len,
                             int atom_type)
@@ -3746,6 +3809,16 @@ static JSAtom __JS_FindAtom(JSRuntime *rt, const char *str, size_t len,
     return JS_ATOM_NULL;
 }
 
+/**
+ * JS_FreeAtomStruct - 释放 Atom 结构
+ * @rt: 运行时
+ * @p: Atom 结构指针
+ * 
+ * 说明：
+ * 1. 从哈希表中移除
+ * 2. 插入空闲链表
+ * 3. 释放内存（某些 Symbol 保留）
+ */
 static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
 {
 #if 0   /* JS_ATOM_NULL is not refcounted: __JS_AtomIsConst() includes 0 */
@@ -3777,17 +3850,16 @@ static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
             }
         }
     }
-    /* insert in free atom list */
+    /* 插入空闲 atom 链表 */
     rt->atom_array[i] = atom_set_free(rt->atom_free_index);
     rt->atom_free_index = i;
-    /* free the string structure */
+    /* 释放字符串结构 */
 #ifdef DUMP_LEAKS
     list_del(&p->link);
 #endif
     if (p->atom_type == JS_ATOM_TYPE_SYMBOL &&
         p->hash != JS_ATOM_HASH_PRIVATE && p->hash != 0) {
-        /* live weak references are still present on this object: keep
-           it */
+        /* 仍有活跃弱引用的对象：保留它 */
     } else {
         js_free_rt(rt, p);
     }
@@ -3795,6 +3867,13 @@ static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
     assert(rt->atom_count >= 0);
 }
 
+/**
+ * __JS_FreeAtom - 减少 Atom 引用计数
+ * @rt: 运行时
+ * @i: Atom 索引
+ * 
+ * 说明：引用计数归零时调用 JS_FreeAtomStruct
+ */
 static void __JS_FreeAtom(JSRuntime *rt, uint32_t i)
 {
     JSAtomStruct *p;
@@ -3805,6 +3884,20 @@ static void __JS_FreeAtom(JSRuntime *rt, uint32_t i)
     JS_FreeAtomStruct(rt, p);
 }
 
+/* ============================================================================
+ * 公开 Atom API
+ * ============================================================================ */
+
+/**
+ * JS_NewAtomStr - 从字符串创建 Atom
+ * @ctx: 上下文
+ * @p: 字符串（会被释放）
+ * 返回: Atom 索引
+ * 
+ * 说明：
+ * - 如果是数字字符串且范围合适，使用整数 Atom 优化
+ * - 否则调用 __JS_NewAtom 创建普通 Atom
+ */
 /* Warning: 'p' is freed */
 static JSAtom JS_NewAtomStr(JSContext *ctx, JSString *p)
 {
@@ -3813,13 +3906,21 @@ static JSAtom JS_NewAtomStr(JSContext *ctx, JSString *p)
     if (is_num_string(&n, p)) {
         if (n <= JS_ATOM_MAX_INT) {
             js_free_string(rt, p);
-            return __JS_AtomFromUInt32(n);
+            return __JS_AtomFromUInt32(n);  // 使用整数 Atom 优化
         }
     }
     /* XXX: should generate an exception */
     return __JS_NewAtom(rt, p, JS_ATOM_TYPE_STRING);
 }
 
+/**
+ * count_ascii - 计算 ASCII 字符数量
+ * @buf: 缓冲区
+ * @len: 长度
+ * 返回: ASCII 字符数量
+ * 
+ * 说明：用于优化，纯 ASCII 字符串可以直接使用
+ */
 /* XXX: optimize */
 static size_t count_ascii(const uint8_t *buf, size_t len)
 {
@@ -3831,11 +3932,23 @@ static size_t count_ascii(const uint8_t *buf, size_t len)
     return p - buf;
 }
 
+/**
+ * JS_NewAtomLen - 从字符串（指定长度）创建 Atom
+ * @ctx: 上下文
+ * @str: UTF-8 字符串
+ * @len: 长度
+ * 返回: Atom 索引，失败返回 JS_ATOM_NULL
+ * 
+ * 说明：
+ * - 先尝试查找已存在的 Atom（优化）
+ * - 如果不存在，创建字符串并转为 Atom
+ */
 /* str is UTF-8 encoded */
 JSAtom JS_NewAtomLen(JSContext *ctx, const char *str, size_t len)
 {
     JSValue val;
 
+    // 空字符串或纯 ASCII 字符串先尝试查找
     if (len == 0 ||
         (!is_digit(*str) &&
          count_ascii((const uint8_t *)str, len) == len)) {
@@ -3849,11 +3962,27 @@ JSAtom JS_NewAtomLen(JSContext *ctx, const char *str, size_t len)
     return JS_NewAtomStr(ctx, JS_VALUE_GET_STRING(val));
 }
 
+/**
+ * JS_NewAtom - 从零终止字符串创建 Atom
+ * @ctx: 上下文
+ * @str: UTF-8 字符串
+ * 返回: Atom 索引
+ */
 JSAtom JS_NewAtom(JSContext *ctx, const char *str)
 {
     return JS_NewAtomLen(ctx, str, strlen(str));
 }
 
+/**
+ * JS_NewAtomUInt32 - 从 UInt32 创建 Atom
+ * @ctx: 上下文
+ * @n: 无符号 32 位整数
+ * 返回: Atom 索引
+ * 
+ * 说明：
+ * - 如果 n <= JS_ATOM_MAX_INT，使用整数 Atom 优化
+ * - 否则转换为字符串再创建 Atom
+ */
 JSAtom JS_NewAtomUInt32(JSContext *ctx, uint32_t n)
 {
     if (n <= JS_ATOM_MAX_INT) {
@@ -3871,6 +4000,12 @@ JSAtom JS_NewAtomUInt32(JSContext *ctx, uint32_t n)
     }
 }
 
+/**
+ * JS_NewAtomInt64 - 从 Int64 创建 Atom（内部使用）
+ * @ctx: 上下文
+ * @n: 64 位整数
+ * 返回: Atom 索引
+ */
 static JSAtom JS_NewAtomInt64(JSContext *ctx, int64_t n)
 {
     if ((uint64_t)n <= JS_ATOM_MAX_INT) {
@@ -3888,6 +4023,13 @@ static JSAtom JS_NewAtomInt64(JSContext *ctx, int64_t n)
     }
 }
 
+/**
+ * JS_NewSymbol - 创建 Symbol
+ * @ctx: 上下文
+ * @p: 描述字符串（会被释放）
+ * @atom_type: Atom 类型
+ * 返回: Symbol JSValue，失败抛出异常
+ */
 /* 'p' is freed */
 static JSValue JS_NewSymbol(JSContext *ctx, JSString *p, int atom_type)
 {
@@ -3899,6 +4041,13 @@ static JSValue JS_NewSymbol(JSContext *ctx, JSString *p, int atom_type)
     return JS_MKPTR(JS_TAG_SYMBOL, rt->atom_array[atom]);
 }
 
+/**
+ * JS_NewSymbolFromAtom - 从 Atom 创建 Symbol
+ * @ctx: 上下文
+ * @descr: 描述 Atom（必须是非数字字符串 Atom）
+ * @atom_type: Atom 类型
+ * 返回: Symbol JSValue
+ */
 /* descr must be a non-numeric string atom */
 static JSValue JS_NewSymbolFromAtom(JSContext *ctx, JSAtom descr,
                                     int atom_type)
@@ -3915,6 +4064,16 @@ static JSValue JS_NewSymbolFromAtom(JSContext *ctx, JSAtom descr,
 
 #define ATOM_GET_STR_BUF_SIZE 64
 
+/**
+ * JS_AtomGetStrRT - 将 Atom 转换为字符串（运行时级别）
+ * @rt: 运行时
+ * @buf: 输出缓冲区
+ * @buf_size: 缓冲区大小
+ * @atom: Atom 值
+ * 返回: 字符串指针（可能指向 buf 或内部数据）
+ * 
+ * 说明：仅用于调试，性能较差
+ */
 /* Should only be used for debug. */
 static const char *JS_AtomGetStrRT(JSRuntime *rt, char *buf, int buf_size,
                                    JSAtom atom)
@@ -3937,7 +4096,7 @@ static const char *JS_AtomGetStrRT(JSRuntime *rt, char *buf, int buf_size,
             str = p;
             if (str) {
                 if (!str->is_wide_char) {
-                    /* special case ASCII strings */
+                    /* 特殊情况：ASCII 字符串直接返回 */
                     c = 0;
                     for(i = 0; i < str->len; i++) {
                         c |= str->u.str8[i];
@@ -3945,6 +4104,7 @@ static const char *JS_AtomGetStrRT(JSRuntime *rt, char *buf, int buf_size,
                     if (c < 0x80)
                         return (const char *)str->u.str8;
                 }
+                // 转换为 UTF-8
                 for(i = 0; i < str->len; i++) {
                     c = string_get(str, i);
                     if ((q - buf) >= buf_size - UTF8_CHAR_LEN_MAX)
@@ -3962,11 +4122,26 @@ static const char *JS_AtomGetStrRT(JSRuntime *rt, char *buf, int buf_size,
     return buf;
 }
 
+/**
+ * JS_AtomGetStr - 将 Atom 转换为字符串（上下文级别）
+ * @ctx: 上下文
+ * @buf: 输出缓冲区
+ * @buf_size: 缓冲区大小
+ * @atom: Atom 值
+ * 返回: 字符串指针
+ */
 static const char *JS_AtomGetStr(JSContext *ctx, char *buf, int buf_size, JSAtom atom)
 {
     return JS_AtomGetStrRT(ctx->rt, buf, buf_size, atom);
 }
 
+/**
+ * __JS_AtomToValue - 将 Atom 转换为 JSValue（内部函数）
+ * @ctx: 上下文
+ * @atom: Atom 值
+ * @force_string: 是否强制转换为字符串
+ * 返回: JSValue（字符串或 Symbol）
+ */
 static JSValue __JS_AtomToValue(JSContext *ctx, JSAtom atom, BOOL force_string)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
@@ -3994,6 +4169,12 @@ static JSValue __JS_AtomToValue(JSContext *ctx, JSAtom atom, BOOL force_string)
     }
 }
 
+/**
+ * JS_AtomToValue - 将 Atom 转换为 JSValue
+ * @ctx: 上下文
+ * @atom: Atom 值
+ * 返回: JSValue（字符串或 Symbol）
+ */
 JSValue JS_AtomToValue(JSContext *ctx, JSAtom atom)
 {
     return __JS_AtomToValue(ctx, atom, FALSE);
