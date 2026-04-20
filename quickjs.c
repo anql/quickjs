@@ -1,8 +1,34 @@
 /*
  * QuickJS Javascript Engine
+ * 快速 JavaScript 引擎
  *
  * Copyright (c) 2017-2025 Fabrice Bellard
  * Copyright (c) 2017-2025 Charlie Gordon
+ *
+ * 这是 QuickJS 引擎的核心实现文件，包含：
+ * - JSValue 的实现和操作
+ * - 垃圾回收器（GC）
+ * - 字节码编译和执行
+ * - 内置对象实现（Object, Array, Function 等）
+ * - 模块系统
+ * - Promise 和异步函数
+ * - 正则表达式引擎
+ * - JSON 解析和序列化
+ *
+ * 文件结构概览：
+ * 1. 基础数据结构和类型定义
+ * 2. 内存管理和垃圾回收
+ * 3. JSValue 操作函数
+ * 4. 原子（Atom）管理
+ * 5. 字符串处理
+ * 6. 对象系统（Shape, Property）
+ * 7. 函数编译和字节码
+ * 8. 操作码定义和执行
+ * 9. 内置对象实现
+ * 10. 模块系统
+ * 11. Promise 和异步处理
+ * 12. JSON 和序列化
+ * 13. 调试和 profiling 支持
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -236,79 +262,96 @@ typedef enum {
 
 typedef enum OPCodeEnum OPCodeEnum;
 
+/* ============================================================================
+ * JSRuntime 结构
+ * 运行时实例，代表整个 JS 引擎实例
+ * 一个进程通常只有一个运行时，管理所有上下文、内存、GC 等
+ * 这是 QuickJS 中最高层级的数据结构
+ * ============================================================================ */
 struct JSRuntime {
-    JSMallocFunctions mf;
-    JSMallocState malloc_state;
-    const char *rt_info;
+    /* --- 内存管理相关 --- */
+    JSMallocFunctions mf;              // 内存分配函数表
+    JSMallocState malloc_state;        // 内存分配状态（计数、大小、限制）
+    const char *rt_info;               // 运行时信息（用于调试）
 
-    int atom_hash_size; /* power of two */
-    int atom_count;
-    int atom_size;
-    int atom_count_resize; /* resize hash table at this count */
-    uint32_t *atom_hash;
-    JSAtomStruct **atom_array;
-    int atom_free_index; /* 0 = none */
+    /* --- Atom（原子）管理 --- */
+    int atom_hash_size;                // atom 哈希表大小（2 的幂）
+    int atom_count;                    // 当前 atom 数量
+    int atom_size;                     // atom 数组大小
+    int atom_count_resize;             // 达到此数量时调整哈希表大小
+    uint32_t *atom_hash;               // atom 哈希表
+    JSAtomStruct **atom_array;         // atom 数组
+    int atom_free_index;               // 空闲 atom 索引（0 = 无）
 
-    int class_count;    /* size of class_array */
-    JSClass *class_array;
+    /* --- 类系统 --- */
+    int class_count;                   // class_array 的大小
+    JSClass *class_array;              // 类数组
 
-    struct list_head context_list; /* list of JSContext.link */
-    /* list of JSGCObjectHeader.link. List of allocated GC objects (used
-       by the garbage collector) */
+    /* --- 上下文列表 --- */
+    struct list_head context_list;     // JSContext 链表
+
+    /* --- 垃圾回收相关 --- */
+    // 已分配 GC 对象的列表（GC 使用）
     struct list_head gc_obj_list;
-    /* list of JSGCObjectHeader.link. Used during JS_FreeValueRT() */
+    // JS_FreeValueRT() 期间使用的零引用计数对象列表
     struct list_head gc_zero_ref_count_list;
-    struct list_head tmp_obj_list; /* used during GC */
-    JSGCPhaseEnum gc_phase : 8;
-    size_t malloc_gc_threshold;
-    struct list_head weakref_list; /* list of JSWeakRefHeader.link */
+    struct list_head tmp_obj_list;     // GC 期间使用的临时列表
+    JSGCPhaseEnum gc_phase : 8;        // GC 阶段
+    size_t malloc_gc_threshold;        // 触发 GC 的内存阈值
+    
+    /* --- WeakRef 支持 --- */
+    struct list_head weakref_list;     // JSWeakRefHeader 链表
+
 #ifdef DUMP_LEAKS
-    struct list_head string_list; /* list of JSString.link */
+    struct list_head string_list;      // 字符串列表（用于泄漏检测）
 #endif
-    /* stack limitation */
-    uintptr_t stack_size; /* in bytes, 0 if no limit */
-    uintptr_t stack_top;
-    uintptr_t stack_limit; /* lower stack limit */
 
-    JSValue current_exception;
-    /* true if the current exception cannot be catched */
-    BOOL current_exception_is_uncatchable : 8;
-    /* true if inside an out of memory error, to avoid recursing */
-    BOOL in_out_of_memory : 8;
+    /* --- 栈限制 --- */
+    uintptr_t stack_size;              // 栈大小（字节），0 = 无限制
+    uintptr_t stack_top;               // 栈顶
+    uintptr_t stack_limit;             // 栈下限（用于检测溢出）
 
-    struct JSStackFrame *current_stack_frame;
+    /* --- 异常处理 --- */
+    JSValue current_exception;         // 当前异常
+    BOOL current_exception_is_uncatchable : 8;  // 当前异常是否不可捕获
+    BOOL in_out_of_memory : 8;         // 是否在内存不足错误中（避免递归）
 
-    JSInterruptHandler *interrupt_handler;
-    void *interrupt_opaque;
+    struct JSStackFrame *current_stack_frame;  // 当前栈帧
 
+    /* --- 中断处理 --- */
+    JSInterruptHandler *interrupt_handler;     // 中断处理器（用于超时、调试等）
+    void *interrupt_opaque;                    // 中断处理器用户数据
+
+    /* --- Promise 拒绝追踪 --- */
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
 
-    struct list_head job_list; /* list of JSJobEntry.link */
+    /* --- Job（微任务）队列 --- */
+    struct list_head job_list;         // JSJobEntry 链表
 
-    JSModuleNormalizeFunc *module_normalize_func;
-    BOOL module_loader_has_attr;
+    /* --- 模块系统 --- */
+    JSModuleNormalizeFunc *module_normalize_func;  // 模块名规范化函数
+    BOOL module_loader_has_attr;       // 模块加载器是否支持属性
     union {
         JSModuleLoaderFunc *module_loader_func;
         JSModuleLoaderFunc2 *module_loader_func2;
-    } u;
-    JSModuleCheckSupportedImportAttributes *module_check_attrs;
-    void *module_loader_opaque;
-    /* timestamp for internal use in module evaluation */
-    int64_t module_async_evaluation_next_timestamp;
+    } u;                               // 模块加载器函数
+    JSModuleCheckSupportedImportAttributes *module_check_attrs;  // 模块属性检查函数
+    void *module_loader_opaque;        // 模块加载器用户数据
+    int64_t module_async_evaluation_next_timestamp;  // 模块异步评估时间戳
 
-    BOOL can_block : 8; /* TRUE if Atomics.wait can block */
-    /* used to allocate, free and clone SharedArrayBuffers */
-    JSSharedArrayBufferFunctions sab_funcs;
-    /* see JS_SetStripInfo() */
-    uint8_t strip_flags;
+    BOOL can_block : 8;                // TRUE 表示 Atomics.wait 可以阻塞
+    JSSharedArrayBufferFunctions sab_funcs;  // SharedArrayBuffer 函数
+
+    uint8_t strip_flags;               // 调试信息剥离标志（见 JS_SetStripInfo()）
     
-    /* Shape hash table */
-    int shape_hash_bits;
-    int shape_hash_size;
-    int shape_hash_count; /* number of hashed shapes */
-    JSShape **shape_hash;
-    void *user_opaque;
+    /* --- Shape 哈希表（用于优化对象布局） --- */
+    int shape_hash_bits;               // shape 哈希位数
+    int shape_hash_size;               // shape 哈希表大小
+    int shape_hash_count;              // 已哈希的 shape 数量
+    JSShape **shape_hash;              // shape 哈希表
+    
+    void *user_opaque;                 // 用户自定义数据
 };
 
 struct JSClass {
@@ -445,51 +488,66 @@ typedef enum {
    enough to call the interrupt callback often. */
 #define JS_INTERRUPT_COUNTER_INIT 10000
 
+/* ============================================================================
+ * JSContext 结构
+ * 上下文实例，代表一个 JS 执行环境
+ * 类似浏览器中的 window 或 worker，一个运行时可以有多个上下文
+ * 每个上下文有自己独立的全局对象、内置对象、模块等
+ * ============================================================================ */
 struct JSContext {
-    JSGCObjectHeader header; /* must come first */
-    JSRuntime *rt;
-    struct list_head link;
+    JSGCObjectHeader header;           // GC 对象头（必须放在第一个）
+    JSRuntime *rt;                     // 所属的运行时
+    struct list_head link;             // 链接到 JSRuntime.context_list
 
-    uint16_t binary_object_count;
-    int binary_object_size;
-    
-    JSShape *array_shape;   /* initial shape for Array objects */
-    JSShape *arguments_shape;  /* shape for arguments objects */
-    JSShape *mapped_arguments_shape;  /* shape for mapped arguments objects */
-    JSShape *regexp_shape;  /* shape for regexp objects */
-    JSShape *regexp_result_shape;  /* shape for regexp result objects */
+    /* --- 二进制对象统计 --- */
+    uint16_t binary_object_count;      // 二进制对象计数
+    int binary_object_size;            // 二进制对象大小
 
-    JSValue *class_proto;
-    JSValue function_proto;
-    JSValue function_ctor;
-    JSValue array_ctor;
-    JSValue regexp_ctor;
-    JSValue promise_ctor;
-    JSValue native_error_proto[JS_NATIVE_ERROR_COUNT];
-    JSValue iterator_ctor;
-    JSValue async_iterator_proto;
-    JSValue array_proto_values;
-    JSValue throw_type_error;
-    JSValue eval_obj;
+    /* --- 常用 Shape 缓存（用于优化） --- */
+    JSShape *array_shape;              // Array 对象的初始 shape
+    JSShape *arguments_shape;          // arguments 对象的 shape
+    JSShape *mapped_arguments_shape;   // 映射 arguments 对象的 shape
+    JSShape *regexp_shape;             // RegExp 对象的 shape
+    JSShape *regexp_result_shape;      // RegExp 结果对象的 shape
 
-    JSValue global_obj; /* global object */
-    JSValue global_var_obj; /* contains the global let/const definitions */
+    /* --- 内置对象缓存 --- */
+    JSValue *class_proto;              // 类原型数组
+    JSValue function_proto;            // Function.prototype
+    JSValue function_ctor;             // Function 构造函数
+    JSValue array_ctor;                // Array 构造函数
+    JSValue regexp_ctor;               // RegExp 构造函数
+    JSValue promise_ctor;              // Promise 构造函数
+    JSValue native_error_proto[JS_NATIVE_ERROR_COUNT];  // 各种 Error 原型
+    JSValue iterator_ctor;             // Iterator 构造函数
+    JSValue async_iterator_proto;      // 异步迭代器原型
+    JSValue array_proto_values;        // Array.prototype.values
+    JSValue throw_type_error;          // 用于抛出 TypeError 的函数
+    JSValue eval_obj;                  // eval 对象
 
-    uint64_t random_state;
+    /* --- 全局对象 --- */
+    JSValue global_obj;                // 全局对象（globalThis）
+    JSValue global_var_obj;            // 包含全局 let/const 定义的对象
 
-    /* when the counter reaches zero, JSRutime.interrupt_handler is called */
+    uint64_t random_state;             // 随机数生成器状态
+
+    /* --- 中断计数器 --- */
+    // 当计数器归零时，调用 JSRuntime.interrupt_handler
+    // 用于实现执行超时、调试断点等功能
     int interrupt_counter;
 
-    struct list_head loaded_modules; /* list of JSModuleDef.link */
+    /* --- 已加载模块 --- */
+    struct list_head loaded_modules;   // JSModuleDef 链表
 
-    /* if NULL, RegExp compilation is not supported */
+    /* --- 可选功能函数指针 --- */
+    // 如果为 NULL，不支持 RegExp 编译
     JSValue (*compile_regexp)(JSContext *ctx, JSValueConst pattern,
                               JSValueConst flags);
-    /* if NULL, eval is not supported */
+    // 如果为 NULL，不支持 eval
     JSValue (*eval_internal)(JSContext *ctx, JSValueConst this_obj,
                              const char *input, size_t input_len,
                              const char *filename, int flags, int scope_idx);
-    void *user_opaque;
+    
+    void *user_opaque;                 // 用户自定义数据
 };
 
 typedef union JSFloat64Union {
@@ -618,44 +676,54 @@ typedef enum JSFunctionKindEnum {
     JS_FUNC_ASYNC_GENERATOR = (JS_FUNC_GENERATOR | JS_FUNC_ASYNC),
 } JSFunctionKindEnum;
 
+/* ============================================================================
+ * JSFunctionBytecode 结构
+ * 函数字节码结构，存储编译后的 JS 函数
+ * 包含字节码、变量信息、常量池、调试信息等
+ * ============================================================================ */
 typedef struct JSFunctionBytecode {
-    JSGCObjectHeader header; /* must come first */
-    uint8_t js_mode;
-    uint8_t has_prototype : 1; /* true if a prototype field is necessary */
-    uint8_t has_simple_parameter_list : 1;
-    uint8_t is_derived_class_constructor : 1;
-    /* true if home_object needs to be initialized */
-    uint8_t need_home_object : 1;
-    uint8_t func_kind : 2;
-    uint8_t new_target_allowed : 1;
-    uint8_t super_call_allowed : 1;
-    uint8_t super_allowed : 1;
-    uint8_t arguments_allowed : 1;
-    uint8_t has_debug : 1;
-    uint8_t read_only_bytecode : 1;
-    uint8_t is_direct_or_indirect_eval : 1; /* used by JS_GetScriptOrModuleName() */
-    /* XXX: 10 bits available */
-    uint8_t *byte_code_buf; /* (self pointer) */
-    int byte_code_len;
-    JSAtom func_name;
-    JSBytecodeVarDef *vardefs; /* arguments + local variables (arg_count + var_count) (self pointer) */
-    JSClosureVar *closure_var; /* list of variables in the closure (self pointer) */
-    uint16_t arg_count;
-    uint16_t var_count;
-    uint16_t defined_arg_count; /* for length function property */
-    uint16_t stack_size; /* maximum stack size */
-    uint16_t var_ref_count; /* number of local variable references */
-    JSContext *realm; /* function realm */
-    JSValue *cpool; /* constant pool (self pointer) */
-    int cpool_count;
-    int closure_var_count;
+    JSGCObjectHeader header;           // GC 对象头（必须放在第一个）
+    uint8_t js_mode;                   // JS 模式（严格模式、async 等）
+    
+    /* 标志位 */
+    uint8_t has_prototype : 1;         // 是否需要 prototype 字段
+    uint8_t has_simple_parameter_list : 1;  // 是否有简单参数列表
+    uint8_t is_derived_class_constructor : 1;  // 是否是派生类构造函数
+    uint8_t need_home_object : 1;      // 是否需要初始化 home_object（用于 super）
+    uint8_t func_kind : 2;             // 函数类型（普通、generator、async 等）
+    uint8_t new_target_allowed : 1;    // 是否允许 new.target
+    uint8_t super_call_allowed : 1;    // 是否允许 super 调用
+    uint8_t super_allowed : 1;         // 是否允许 super
+    uint8_t arguments_allowed : 1;     // 是否允许 arguments
+    uint8_t has_debug : 1;             // 是否有调试信息
+    uint8_t read_only_bytecode : 1;    // 字节码是否只读
+    uint8_t is_direct_or_indirect_eval : 1;  // 是否是直接或间接 eval（JS_GetScriptOrModuleName 使用）
+    /* XXX: 还有 10 位可用 */
+    
+    uint8_t *byte_code_buf;            // 字节码缓冲区（自指针）
+    int byte_code_len;                 // 字节码长度
+    JSAtom func_name;                  // 函数名
+    JSBytecodeVarDef *vardefs;         // 变量定义（参数 + 局部变量）（自指针）
+    JSClosureVar *closure_var;         // 闭包变量列表（自指针）
+    
+    uint16_t arg_count;                // 参数数量
+    uint16_t var_count;                // 局部变量数量
+    uint16_t defined_arg_count;        // 定义的参数数量（用于 function.length）
+    uint16_t stack_size;               // 最大栈大小
+    uint16_t var_ref_count;            // 局部变量引用数量
+    
+    JSContext *realm;                  // 函数所属的 realm（上下文）
+    JSValue *cpool;                    // 常量池（自指针）
+    int cpool_count;                   // 常量池大小
+    int closure_var_count;             // 闭包变量数量
+    
+    /* 调试信息（为了节省内存，是否应该移到单独的结构？） */
     struct {
-        /* debug info, move to separate structure to save memory? */
-        JSAtom filename;
-        int source_len; 
-        int pc2line_len;
-        uint8_t *pc2line_buf;
-        char *source;
+        JSAtom filename;               // 文件名
+        int source_len;                // 源代码长度
+        int pc2line_len;               // PC 到行号映射表长度
+        uint8_t *pc2line_buf;          // PC 到行号映射表
+        char *source;                  // 源代码
     } debug;
 } JSFunctionBytecode;
 
@@ -821,55 +889,69 @@ typedef enum {
     JS_MODULE_STATUS_EVALUATED,
 } JSModuleStatus;
 
+/* ============================================================================
+ * JSModuleDef 结构
+ * 模块定义结构，表示一个 ES6 模块
+ * 包含模块的导入、导出、依赖关系等信息
+ * 模块生命周期：UNLINKED -> LINKING -> LINKED -> EVALUATING -> EVALUATED
+ * ============================================================================ */
 struct JSModuleDef {
-    JSGCObjectHeader header; /* must come first */
-    JSAtom module_name;
-    struct list_head link;
+    JSGCObjectHeader header;           // GC 对象头（必须放在第一个）
+    JSAtom module_name;                // 模块名
+    struct list_head link;             // 链接到 JSContext.loaded_modules
 
-    JSReqModuleEntry *req_module_entries;
-    int req_module_entries_count;
-    int req_module_entries_size;
+    /* --- 请求的模块（依赖） --- */
+    JSReqModuleEntry *req_module_entries;     // 请求的模块条目数组
+    int req_module_entries_count;             // 请求的模块数量
+    int req_module_entries_size;              // 请求的模块数组大小
 
-    JSExportEntry *export_entries;
-    int export_entries_count;
-    int export_entries_size;
+    /* --- 导出条目 --- */
+    JSExportEntry *export_entries;            // 导出条目数组
+    int export_entries_count;                 // 导出数量
+    int export_entries_size;                  // 导出数组大小
 
-    JSStarExportEntry *star_export_entries;
+    JSStarExportEntry *star_export_entries;   // 星号导出（export * from）数组
     int star_export_entries_count;
     int star_export_entries_size;
 
-    JSImportEntry *import_entries;
+    /* --- 导入条目 --- */
+    JSImportEntry *import_entries;            // 导入条目数组
     int import_entries_count;
     int import_entries_size;
 
-    JSValue module_ns;
-    JSValue func_obj; /* only used for JS modules */
-    JSModuleInitFunc *init_func; /* only used for C modules */
-    BOOL has_tla : 8; /* true if func_obj contains await */
-    BOOL resolved : 8;
-    BOOL func_created : 8;
-    JSModuleStatus status : 8;
-    /* temp use during js_module_link() & js_module_evaluate() */
-    int dfs_index, dfs_ancestor_index;
-    JSModuleDef *stack_prev;
-    /* temp use during js_module_evaluate() */
-    JSModuleDef **async_parent_modules;
-    int async_parent_modules_count;
-    int async_parent_modules_size;
-    int pending_async_dependencies;
-    BOOL async_evaluation; /* true: async_evaluation_timestamp corresponds to [[AsyncEvaluationOrder]] 
-                              false: [[AsyncEvaluationOrder]] is UNSET or DONE */
-    int64_t async_evaluation_timestamp;
-    JSModuleDef *cycle_root;
-    JSValue promise; /* corresponds to spec field: capability */
-    JSValue resolving_funcs[2]; /* corresponds to spec field: capability */
+    /* --- 模块对象 --- */
+    JSValue module_ns;                        // 模块命名空间对象
+    JSValue func_obj;                         // 模块函数对象（仅 JS 模块使用）
+    JSModuleInitFunc *init_func;              // 模块初始化函数（仅 C 模块使用）
 
-    /* true if evaluation yielded an exception. It is saved in
-       eval_exception */
-    BOOL eval_has_exception : 8;
-    JSValue eval_exception;
-    JSValue meta_obj; /* for import.meta */
-    JSValue private_value; /* private value for C modules */
+    /* --- 模块状态标志 --- */
+    BOOL has_tla : 8;                         // func_obj 是否包含 await（顶层等待）
+    BOOL resolved : 8;                        // 是否已解析
+    BOOL func_created : 8;                    // 函数是否已创建
+    JSModuleStatus status : 8;                // 模块状态（见 JSModuleStatus 枚举）
+
+    /* js_module_link() 和 js_module_evaluate() 期间临时使用 */
+    int dfs_index, dfs_ancestor_index;        // DFS 索引和祖先索引（用于循环依赖检测）
+    JSModuleDef *stack_prev;                  // 栈中的前一个模块
+
+    /* js_module_evaluate() 期间临时使用 */
+    JSModuleDef **async_parent_modules;       // 异步父模块数组
+    int async_parent_modules_count;           // 异步父模块数量
+    int async_parent_modules_size;            // 异步父模块数组大小
+    int pending_async_dependencies;           // 待处理的异步依赖数量
+    BOOL async_evaluation;                    // 是否正在异步评估
+    int64_t async_evaluation_timestamp;       // 异步评估时间戳
+    JSModuleDef *cycle_root;                  // 循环依赖的根模块
+
+    /* Promise 相关（用于异步模块评估） */
+    JSValue promise;                          // 对应规范字段：capability
+    JSValue resolving_funcs[2];               // 对应规范字段：capability
+
+    /* 评估异常 */
+    BOOL eval_has_exception : 8;              // 评估是否抛出异常
+    JSValue eval_exception;                   // 评估异常对象
+    JSValue meta_obj;                         // import.meta 对象
+    JSValue private_value;                    // C 模块的私有值
 };
 
 typedef struct JSJobEntry {
@@ -924,37 +1006,45 @@ struct JSShape {
     JSShapeProperty prop[0]; /* prop_size elements */
 };
 
+/* ============================================================================
+ * JSObject 结构
+ * JavaScript 对象的核心实现
+ * 所有 JS 对象（包括数组、函数、Date 等）都使用此结构
+ * 通过 class_id 区分不同类型的对象
+ * ============================================================================ */
 struct JSObject {
     union {
-        JSGCObjectHeader header;
+        JSGCObjectHeader header;       // GC 对象头
         struct {
-            int __gc_ref_count; /* corresponds to header.ref_count */
-            uint8_t __gc_mark : 7; /* corresponds to header.mark/gc_obj_type */
-            /* TRUE if the array prototype is "normal":
-               - no small index properties which are get/set or non writable
-               - its prototype is Object.prototype
-               - Object.prototype has no small index properties which are get/set or non writable
-               - the prototype of Object.prototype is null (always true as it is immutable)
+            int __gc_ref_count;        // 引用计数（对应 header.ref_count）
+            uint8_t __gc_mark : 7;     // GC 标记（对应 header.mark/gc_obj_type）
+            
+            /* 如果数组原型是"标准的"则为 TRUE：
+               - 没有小索引的 get/set 或不可写属性
+               - 原型是 Object.prototype
+               - Object.prototype 没有小索引的 get/set 或不可写属性
+               - Object.prototype 的原型是 null（总是 TRUE，因为不可变）
             */
             uint8_t is_std_array_prototype : 1;
 
-            uint8_t extensible : 1;
-            uint8_t free_mark : 1; /* only used when freeing objects with cycles */
-            uint8_t is_exotic : 1; /* TRUE if object has exotic property handlers */
-            uint8_t fast_array : 1; /* TRUE if u.array is used for get/put (for JS_CLASS_ARRAY, JS_CLASS_ARGUMENTS, JS_CLASS_MAPPED_ARGUMENTS and typed arrays) */
-            uint8_t is_constructor : 1; /* TRUE if object is a constructor function */
-            uint8_t has_immutable_prototype : 1; /* cannot modify the prototype */
-            uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
-            uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
-            uint16_t class_id; /* see JS_CLASS_x */
+            uint8_t extensible : 1;            // 对象是否可扩展
+            uint8_t free_mark : 1;             // 仅在释放带循环的对象时使用
+            uint8_t is_exotic : 1;             // 是否有特殊属性处理器（如 Proxy）
+            uint8_t fast_array : 1;            // 是否使用快速数组优化
+            uint8_t is_constructor : 1;        // 是否是构造函数
+            uint8_t has_immutable_prototype : 1;  // 原型是否不可修改
+            uint8_t tmp_mark : 1;              // 临时标记（JS_WriteObjectRec 使用）
+            uint8_t is_HTMLDDA : 1;            //  annex B IsHtmlDDA 特殊行为
+            uint16_t class_id;                 // 类 ID（见 JS_CLASS_x 枚举）
         };
     };
-    /* count the number of weak references to this object. The object
-       structure is freed only if header.ref_count = 0 and
-       weakref_count = 0 */
-    uint32_t weakref_count; 
-    JSShape *shape; /* prototype and property names + flag */
-    JSProperty *prop; /* array of properties */
+    
+    /* 弱引用计数。只有当 header.ref_count = 0 且 weakref_count = 0 时，
+       对象结构才会被释放 */
+    uint32_t weakref_count;
+    
+    JSShape *shape;        // Shape：包含原型和属性名 + 标志
+    JSProperty *prop;      // 属性数组
     union {
         void *opaque;
         struct JSBoundFunction *bound_function; /* JS_CLASS_BOUND_FUNCTION */
