@@ -2471,25 +2471,59 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     return ret;
 }
 
+/* ============================================================================
+ * Atom 空闲链表管理
+ * 使用原子指针的最低位作为空闲标记
+ * ============================================================================ */
+
+/**
+ * atom_get_free - 获取空闲 Atom 索引
+ * @p: Atom 结构指针
+ * 返回: 空闲索引值
+ */
 static inline uint32_t atom_get_free(const JSAtomStruct *p)
 {
     return (uintptr_t)p >> 1;
 }
 
+/**
+ * atom_is_free - 检查 Atom 是否空闲
+ * @p: Atom 结构指针
+ * 返回: TRUE 空闲，FALSE 已使用
+ */
 static inline BOOL atom_is_free(const JSAtomStruct *p)
 {
     return (uintptr_t)p & 1;
 }
 
+/**
+ * atom_set_free - 标记 Atom 为空闲
+ * @v: 索引值
+ * 返回: 标记为空闲的指针
+ */
 static inline JSAtomStruct *atom_set_free(uint32_t v)
 {
     return (JSAtomStruct *)(((uintptr_t)v << 1) | 1);
 }
 
+/* ============================================================================
+ * 字符串分配和释放
+ * ============================================================================ */
+
+/**
+ * js_alloc_string_rt - 运行时级别分配字符串
+ * @rt: 运行时实例
+ * @max_len: 最大长度
+ * @is_wide_char: 是否 16 位字符
+ * 返回: 字符串指针，失败返回 NULL
+ * 
+ * 说明：字符串内容未初始化
+ */
 /* Note: the string contents are uninitialized */
 static JSString *js_alloc_string_rt(JSRuntime *rt, int max_len, int is_wide_char)
 {
     JSString *str;
+    // 计算大小：结构体 + 字符数据 + null 终止符
     str = js_malloc_rt(rt, sizeof(JSString) + (max_len << is_wide_char) + 1 - is_wide_char);
     if (unlikely(!str))
         return NULL;
@@ -2497,14 +2531,21 @@ static JSString *js_alloc_string_rt(JSRuntime *rt, int max_len, int is_wide_char
     str->is_wide_char = is_wide_char;
     str->len = max_len;
     str->atom_type = 0;
-    str->hash = 0;          /* optional but costless */
-    str->hash_next = 0;     /* optional */
+    str->hash = 0;          // 可选但无成本
+    str->hash_next = 0;     // 可选
 #ifdef DUMP_LEAKS
     list_add_tail(&str->link, &rt->string_list);
 #endif
     return str;
 }
 
+/**
+ * js_alloc_string - 上下文级别分配字符串
+ * @ctx: 上下文
+ * @max_len: 最大长度
+ * @is_wide_char: 是否 16 位字符
+ * 返回: 字符串指针，失败抛出异常
+ */
 static JSString *js_alloc_string(JSContext *ctx, int max_len, int is_wide_char)
 {
     JSString *p;
@@ -2516,56 +2557,84 @@ static JSString *js_alloc_string(JSContext *ctx, int max_len, int is_wide_char)
     return p;
 }
 
+/**
+ * js_free_string - 释放字符串
+ * @rt: 运行时实例
+ * @str: 字符串指针
+ * 
+ * 说明：比 JS_FreeValueRT() 更快，直接操作引用计数
+ */
 /* same as JS_FreeValueRT() but faster */
 static inline void js_free_string(JSRuntime *rt, JSString *str)
 {
     if (--str->header.ref_count <= 0) {
         if (str->atom_type) {
-            JS_FreeAtomStruct(rt, str);
+            JS_FreeAtomStruct(rt, str);  // Atom 需要特殊处理
         } else {
 #ifdef DUMP_LEAKS
             list_del(&str->link);
 #endif
-            js_free_rt(rt, str);
+            js_free_rt(rt, str);  // 普通字符串直接释放
         }
     }
 }
 
+/**
+ * JS_SetRuntimeInfo - 设置运行时信息
+ * @rt: 运行时实例
+ * @s: 信息字符串（用于调试输出）
+ */
 void JS_SetRuntimeInfo(JSRuntime *rt, const char *s)
 {
     if (rt)
         rt->rt_info = s;
 }
 
+/* ============================================================================
+ * JS_FreeRuntime - 释放运行时实例
+ * 这是 QuickJS 最复杂的清理函数，按顺序释放所有资源
+ * @rt: 运行时实例
+ * 
+ * 清理顺序：
+ * 1. 当前异常
+ * 2. Job 队列
+ * 3. GC 对象（运行 GC）
+ * 4. 类定义
+ * 5. Atom（调试模式下检查泄漏）
+ * 6. Shape 哈希表
+ * 7. 字符串（调试模式下检查泄漏）
+ * 8. 运行时结构本身
+ * ============================================================================ */
 void JS_FreeRuntime(JSRuntime *rt)
 {
     struct list_head *el, *el1;
     int i;
 
+    // 1. 释放当前异常
     JS_FreeValueRT(rt, rt->current_exception);
 
+    // 2. 清理 Job 队列
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
         for(i = 0; i < e->argc; i++)
-            JS_FreeValueRT(rt, e->argv[i]);
-        JS_FreeContext(e->realm);
-        js_free_rt(rt, e);
+            JS_FreeValueRT(rt, e->argv[i]);  // 释放参数
+        JS_FreeContext(e->realm);  // 释放上下文引用
+        js_free_rt(rt, e);  // 释放 Job 条目
     }
     init_list_head(&rt->job_list);
 
-    /* don't remove the weak objects to avoid create new jobs with
-       FinalizationRegistry */
+    // 3. 运行 GC 清理对象
+    /* 不要移除弱引用对象，以避免 FinalizationRegistry 创建新的 Job */
     JS_RunGCInternal(rt, FALSE);
 
 #ifdef DUMP_LEAKS
-    /* leaking objects */
+    /* 检测泄漏的对象 */
     {
         BOOL header_done;
         JSGCObjectHeader *p;
         int count;
 
-        /* remove the internal refcounts to display only the object
-           referenced externally */
+        /* 移除内部引用计数，只显示外部引用的对象 */
         list_for_each(el, &rt->gc_obj_list) {
             p = list_entry(el, JSGCObjectHeader, link);
             p->mark = 0;
@@ -2596,20 +2665,20 @@ void JS_FreeRuntime(JSRuntime *rt)
             printf("Secondary object leaks: %d\n", count);
     }
 #endif
-    assert(list_empty(&rt->gc_obj_list));
-    assert(list_empty(&rt->weakref_list));
+    assert(list_empty(&rt->gc_obj_list));  // 确保所有 GC 对象已释放
+    assert(list_empty(&rt->weakref_list)); // 确保所有 WeakRef 已释放
 
-    /* free the classes */
+    // 4. 释放类定义
     for(i = 0; i < rt->class_count; i++) {
         JSClass *cl = &rt->class_array[i];
         if (cl->class_id != 0) {
-            JS_FreeAtomRT(rt, cl->class_name);
+            JS_FreeAtomRT(rt, cl->class_name);  // 释放类名 Atom
         }
     }
     js_free_rt(rt, rt->class_array);
 
 #ifdef DUMP_LEAKS
-    /* only the atoms defined in JS_InitAtoms() should be left */
+    /* 只有 JS_InitAtoms() 定义的 Atom 应该剩余 */
     {
         BOOL header_done = FALSE;
 
@@ -2666,7 +2735,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
 #endif
 
-    /* free the atoms */
+    // 5. 释放 Atom
     for(i = 0; i < rt->atom_size; i++) {
         JSAtomStruct *p = rt->atom_array[i];
         if (!atom_is_free(p)) {
@@ -2680,6 +2749,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     js_free_rt(rt, rt->atom_hash);
     js_free_rt(rt, rt->shape_hash);
 #ifdef DUMP_LEAKS
+    // 6. 检查字符串泄漏
     if (!list_empty(&rt->string_list)) {
         if (rt->rt_info) {
             printf("%s:1: string leakage:", rt->rt_info);
@@ -2707,6 +2777,7 @@ void JS_FreeRuntime(JSRuntime *rt)
         if (rt->rt_info)
             printf("\n");
     }
+    // 7. 检查内存泄漏
     {
         JSMallocState *s = &rt->malloc_state;
         if (s->malloc_count > 1) {
@@ -2719,12 +2790,27 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
 #endif
 
+    // 8. 释放运行时结构本身
     {
         JSMallocState ms = rt->malloc_state;
         rt->mf.js_free(&ms, rt);
     }
 }
 
+/* ============================================================================
+ * 上下文创建和销毁
+ * ============================================================================ */
+
+/**
+ * JS_NewContextRaw - 创建原始上下文（无内置对象）
+ * @rt: 运行时实例
+ * 返回: 上下文指针，失败返回 NULL
+ * 
+ * 说明：
+ * - 只创建最基本的上下文结构
+ * - 不包含任何内置对象（Object, Array 等）
+ * - 用于节省内存或自定义内置对象
+ */
 JSContext *JS_NewContextRaw(JSRuntime *rt)
 {
     JSContext *ctx;
@@ -2736,6 +2822,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->header.ref_count = 1;
     add_gc_object(rt, &ctx->header, JS_GC_OBJ_TYPE_JS_CONTEXT);
 
+    // 分配类原型数组
     ctx->class_proto = js_malloc_rt(rt, sizeof(ctx->class_proto[0]) *
                                     rt->class_count);
     if (!ctx->class_proto) {
@@ -2743,15 +2830,17 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
         return NULL;
     }
     ctx->rt = rt;
-    list_add_tail(&ctx->link, &rt->context_list);
+    list_add_tail(&ctx->link, &rt->context_list);  // 加入运行时上下文列表
+    // 初始化所有类原型为 NULL
     for(i = 0; i < rt->class_count; i++)
         ctx->class_proto[i] = JS_NULL;
     ctx->array_ctor = JS_NULL;
     ctx->iterator_ctor = JS_NULL;
     ctx->regexp_ctor = JS_NULL;
     ctx->promise_ctor = JS_NULL;
-    init_list_head(&ctx->loaded_modules);
+    init_list_head(&ctx->loaded_modules);  // 初始化模块列表
 
+    // 添加基本对象（Object, Function, Array）
     if (JS_AddIntrinsicBasicObjects(ctx)) {
         JS_FreeContext(ctx);
         return NULL;
@@ -2759,6 +2848,16 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     return ctx;
 }
 
+/**
+ * JS_NewContext - 创建完整上下文（包含所有内置对象）
+ * @rt: 运行时实例
+ * 返回: 上下文指针，失败返回 NULL
+ * 
+ * 说明：
+ * - 在 JS_NewContextRaw 基础上添加所有内置对象
+ * - 包括 Date, RegExp, JSON, Promise, Map/Set 等
+ * - 这是最常用的上下文创建函数
+ */
 JSContext *JS_NewContext(JSRuntime *rt)
 {
     JSContext *ctx;
@@ -2767,17 +2866,18 @@ JSContext *JS_NewContext(JSRuntime *rt)
     if (!ctx)
         return NULL;
 
-    if (JS_AddIntrinsicBaseObjects(ctx) ||
-        JS_AddIntrinsicDate(ctx) ||
-        JS_AddIntrinsicEval(ctx) ||
-        JS_AddIntrinsicStringNormalize(ctx) ||
-        JS_AddIntrinsicRegExp(ctx) ||
-        JS_AddIntrinsicJSON(ctx) ||
-        JS_AddIntrinsicProxy(ctx) ||
-        JS_AddIntrinsicMapSet(ctx) ||
-        JS_AddIntrinsicTypedArrays(ctx) ||
-        JS_AddIntrinsicPromise(ctx) ||
-        JS_AddIntrinsicWeakRef(ctx)) {
+    // 依次添加所有内置对象
+    if (JS_AddIntrinsicBaseObjects(ctx) ||  // 基础对象
+        JS_AddIntrinsicDate(ctx) ||          // Date
+        JS_AddIntrinsicEval(ctx) ||          // eval
+        JS_AddIntrinsicStringNormalize(ctx) || // 字符串规范化
+        JS_AddIntrinsicRegExp(ctx) ||        // RegExp
+        JS_AddIntrinsicJSON(ctx) ||          // JSON
+        JS_AddIntrinsicProxy(ctx) ||         // Proxy
+        JS_AddIntrinsicMapSet(ctx) ||        // Map/Set
+        JS_AddIntrinsicTypedArrays(ctx) ||   // 类型化数组
+        JS_AddIntrinsicPromise(ctx) ||       // Promise
+        JS_AddIntrinsicWeakRef(ctx)) {       // WeakRef
         JS_FreeContext(ctx);
         return NULL;
     }
