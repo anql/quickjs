@@ -5165,6 +5165,13 @@ static int string_buffer_concat_value_free(StringBuffer *s, JSValue v)
     return res;
 }
 
+/**
+ * string_buffer_fill - 用字符填充缓冲区
+ * @s: 缓冲区
+ * @c: 字符
+ * @count: 数量
+ * 返回: 0 成功，-1 失败
+ */
 static int string_buffer_fill(StringBuffer *s, int c, int count)
 {
     /* XXX: optimize */
@@ -5179,6 +5186,16 @@ static int string_buffer_fill(StringBuffer *s, int c, int count)
     return 0;
 }
 
+/**
+ * string_buffer_end - 结束缓冲区并返回字符串
+ * @s: 缓冲区
+ * 返回: 字符串 JSValue
+ * 
+ * 说明：
+ * - 如果为空，返回空字符串 Atom
+ * - 否则调整大小到实际长度
+ * - 添加 null 终止符
+ */
 static JSValue string_buffer_end(StringBuffer *s)
 {
     JSString *str;
@@ -5191,7 +5208,7 @@ static JSValue string_buffer_end(StringBuffer *s)
         return JS_AtomToString(s->ctx, JS_ATOM_empty_string);
     }
     if (s->len < s->size) {
-        /* smaller size so js_realloc should not fail, but OK if it does */
+        /* 更小的尺寸，js_realloc 不应失败，但失败了也 OK */
         /* XXX: should add some slack to avoid unnecessary calls */
         /* XXX: might need to use malloc+free to ensure smaller size */
         str = js_realloc_rt(s->ctx->rt, str, sizeof(JSString) +
@@ -5211,6 +5228,19 @@ static JSValue string_buffer_end(StringBuffer *s)
     return JS_MKPTR(JS_TAG_STRING, str);
 }
 
+/**
+ * JS_NewStringLen - 从 UTF-8 缓冲区创建字符串
+ * @ctx: 上下文
+ * @buf: UTF-8 缓冲区
+ * @buf_len: 长度
+ * 返回: 字符串 JSValue，失败抛出异常
+ * 
+ * 说明：
+ * - 先扫描 ASCII 部分（快速路径）
+ * - UTF-8 序列转换为 UTF-16
+ * - 处理无效 UTF-8（替换为 U+FFFD）
+ * - 处理代理对
+ */
 /* create a string from a UTF-8 buffer */
 JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
 {
@@ -5226,7 +5256,7 @@ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
     if (len1 > JS_STRING_LEN_MAX)
         return JS_ThrowInternalError(ctx, "string too long");
     if (p == p_end) {
-        /* ASCII string */
+        /* ASCII string - 快速路径 */
         return js_new_string8_len(ctx, buf, buf_len);
     } else {
         if (string_buffer_init(ctx, b, buf_len))
@@ -5236,7 +5266,7 @@ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
             if (*p < 128) {
                 string_buffer_putc8(b, *p++);
             } else {
-                /* parse utf-8 sequence, return 0xFFFFFFFF for error */
+                /* 解析 UTF-8 序列，错误返回 0xFFFFFFFF */
                 c = unicode_from_utf8(p, p_end - p, &p_next);
                 if (c < 0x10000) {
                     p = p_next;
@@ -5246,7 +5276,7 @@ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
                     string_buffer_putc16(b, get_hi_surrogate(c));
                     c = get_lo_surrogate(c);
                 } else {
-                    /* invalid char */
+                    /* invalid char - 无效字符替换为 U+FFFD */
                     c = 0xfffd;
                     /* skip the invalid chars */
                     /* XXX: seems incorrect. Why not just use c = *p++; ? */
@@ -5269,6 +5299,16 @@ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
     return JS_EXCEPTION;
 }
 
+/**
+ * JS_ConcatString3 - 连接三个字符串（str1 + str2 + str3）
+ * @ctx: 上下文
+ * @str1: 第一个字符串（C 字符串）
+ * @str2: 第二个字符串（JSValue）
+ * @str3: 第三个字符串（C 字符串）
+ * 返回: 连接后的字符串 JSValue
+ * 
+ * 说明：str2 会被消耗（引用计数减一）
+ */
 static JSValue JS_ConcatString3(JSContext *ctx, const char *str1,
                                 JSValue str2, const char *str3)
 {
@@ -5300,6 +5340,14 @@ static JSValue JS_ConcatString3(JSContext *ctx, const char *str1,
     return JS_EXCEPTION;
 }
 
+/**
+ * JS_NewAtomString - 创建字符串并加入 Atom 表
+ * @ctx: 上下文
+ * @str: 字符串
+ * 返回: 字符串 JSValue
+ * 
+ * 说明：用于创建可复用的字符串（如属性名）
+ */
 JSValue JS_NewAtomString(JSContext *ctx, const char *str)
 {
     JSAtom atom = JS_NewAtom(ctx, str);
@@ -5310,6 +5358,21 @@ JSValue JS_NewAtomString(JSContext *ctx, const char *str)
     return val;
 }
 
+/**
+ * JS_ToCStringLen2 - 将 JSValue 转换为 UTF-8 C 字符串
+ * @ctx: 上下文
+ * @plen: 输出参数，返回长度
+ * @val1: JSValue
+ * @cesu8: 是否使用 CESU-8 编码（非 BMP 字符编码为 1 或 2 个 UTF-8 序列）
+ * 返回: C 字符串指针（用 JS_FreeCString 释放），异常返回 NULL
+ * 
+ * 说明：
+ * - 非字符串值先转换为字符串
+ * - ASCII 字符串直接返回（快速路径）
+ * - 16 位字符串转换为 UTF-8
+ * - 处理代理对（cesu8=false 时合并为 4 字节 UTF-8）
+ * - 返回的字符串有独立的引用计数
+ */
 /* return (NULL, 0) if exception. */
 /* return pointer into a JSString with a live ref_count */
 /* cesu8 determines if non-BMP1 codepoints are encoded as 1 or 2 utf-8 sequences */
@@ -5334,11 +5397,10 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1, BO
         const uint8_t *src = str->u.str8;
         int count;
 
-        /* count the number of non-ASCII characters */
-        /* Scanning the whole string is required for ASCII strings,
-           and computing the number of non-ASCII bytes is less expensive
-           than testing each byte, hence this method is faster for ASCII
-           strings, which is the most common case.
+        /* 计算非 ASCII 字符数量 */
+        /* 扫描整个字符串对 ASCII 字符串是必须的，
+           计算非 ASCII 字节数比测试每个字节更便宜，
+           因此这种方法对最常见的 ASCII 字符串更快。
          */
         count = 0;
         for (pos = 0; pos < len; pos++) {
@@ -5347,7 +5409,7 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1, BO
         if (count == 0) {
             if (plen)
                 *plen = len;
-            return (const char *)src;
+            return (const char *)src;  // ASCII 字符串直接返回
         }
         str_new = js_alloc_string(ctx, len + count, 0);
         if (!str_new)
@@ -5364,9 +5426,7 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1, BO
         }
     } else {
         const uint16_t *src = str->u.str16;
-        /* Allocate 3 bytes per 16 bit code point. Surrogate pairs may
-           produce 4 bytes but use 2 code points.
-         */
+        /* 每个 16 位码点分配 3 字节。代理对可能产生 4 字节但使用 2 个码点。 */
         str_new = js_alloc_string(ctx, len * 3, 0);
         if (!str_new)
             goto fail;
@@ -5382,7 +5442,7 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1, BO
                         c1 = src[pos];
                         if (is_lo_surrogate(c1)) {
                             pos++;
-                            c = from_surrogate(c, c1);
+                            c = from_surrogate(c, c1);  // 合并代理对
                         } else {
                             /* Keep unmatched surrogate code points */
                             /* c = 0xfffd; */ /* error */
@@ -5409,6 +5469,11 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1, BO
     return NULL;
 }
 
+/**
+ * JS_FreeCString - 释放 JS_ToCStringLen2 返回的 C 字符串
+ * @ctx: 上下文
+ * @ptr: C 字符串指针
+ */
 void JS_FreeCString(JSContext *ctx, const char *ptr)
 {
     JSString *p;
@@ -5419,6 +5484,17 @@ void JS_FreeCString(JSContext *ctx, const char *ptr)
     JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, p));
 }
 
+/* ============================================================================
+ * 字符串比较函数
+ * ============================================================================ */
+
+/**
+ * memcmp16_8 - 比较 16 位和 8 位字符串
+ * @src1: 16 位字符串
+ * @src2: 8 位字符串
+ * @len: 长度
+ * 返回: 差值
+ */
 static int memcmp16_8(const uint16_t *src1, const uint8_t *src2, int len)
 {
     int c, i;
@@ -5430,6 +5506,13 @@ static int memcmp16_8(const uint16_t *src1, const uint8_t *src2, int len)
     return 0;
 }
 
+/**
+ * memcmp16 - 比较两个 16 位字符串
+ * @src1: 第一个字符串
+ * @src2: 第二个字符串
+ * @len: 长度
+ * 返回: 差值
+ */
 static int memcmp16(const uint16_t *src1, const uint16_t *src2, int len)
 {
     int c, i;
@@ -5441,6 +5524,17 @@ static int memcmp16(const uint16_t *src1, const uint16_t *src2, int len)
     return 0;
 }
 
+/**
+ * js_string_memcmp - 比较字符串片段
+ * @p1: 第一个字符串
+ * @pos1: 起始位置 1
+ * @p2: 第二个字符串
+ * @pos2: 起始位置 2
+ * @len: 长度
+ * 返回: 差值
+ * 
+ * 说明：自动处理 8 位/16 位混合比较
+ */
 static int js_string_memcmp(const JSString *p1, int pos1, const JSString *p2,
                             int pos2, int len)
 {
@@ -5460,6 +5554,18 @@ static int js_string_memcmp(const JSString *p1, int pos1, const JSString *p2,
     return res;
 }
 
+/**
+ * js_string_eq - 字符串相等比较
+ * @ctx: 上下文
+ * @p1: 第一个字符串
+ * @p2: 第二个字符串
+ * 返回: TRUE 相等，FALSE 不相等
+ * 
+ * 说明：
+ * - 长度不同直接返回 FALSE
+ * - 同一指针直接返回 TRUE
+ * - 否则逐字符比较
+ */
 static BOOL js_string_eq(JSContext *ctx,
                          const JSString *p1, const JSString *p2)
 {
@@ -5470,6 +5576,13 @@ static BOOL js_string_eq(JSContext *ctx,
     return js_string_memcmp(p1, 0, p2, 0, p1->len) == 0;
 }
 
+/**
+ * js_string_compare - 字符串字典序比较
+ * @ctx: 上下文
+ * @p1: 第一个字符串
+ * @p2: 第二个字符串
+ * 返回: <0 p1<p2, 0 p1==p2, >0 p1>p2
+ */
 /* return < 0, 0 or > 0 */
 static int js_string_compare(JSContext *ctx,
                              const JSString *p1, const JSString *p2)
@@ -5488,6 +5601,13 @@ static int js_string_compare(JSContext *ctx,
     return res;
 }
 
+/**
+ * copy_str16 - 复制字符串到 16 位缓冲区
+ * @dst: 目标缓冲区
+ * @p: 源字符串
+ * @offset: 偏移
+ * @len: 长度
+ */
 static void copy_str16(uint16_t *dst, const JSString *p, int offset, int len)
 {
     if (p->is_wide_char) {
