@@ -2997,20 +2997,34 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
         mark_func(rt, &ctx->regexp_result_shape->header);
 }
 
+/* ============================================================================
+ * 上下文释放
+ * ============================================================================ */
+
+/**
+ * JS_FreeContext - 释放上下文
+ * @ctx: 上下文实例
+ * 
+ * 说明：
+ * - 使用引用计数管理，只有引用计数归零时才真正释放
+ * - 释放顺序：模块→全局对象→内置对象→原型→Shape
+ * - 支持 DUMP_* 调试模式输出诊断信息
+ */
 void JS_FreeContext(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
     int i;
 
+    // 引用计数减一，大于 0 则直接返回
     if (--ctx->header.ref_count > 0)
         return;
     assert(ctx->header.ref_count == 0);
 
 #ifdef DUMP_ATOMS
-    JS_DumpAtoms(ctx->rt);
+    JS_DumpAtoms(ctx->rt);  // 输出 Atom 信息
 #endif
 #ifdef DUMP_SHAPES
-    JS_DumpShapes(ctx->rt);
+    JS_DumpShapes(ctx->rt);  // 输出 Shape 信息
 #endif
 #ifdef DUMP_OBJECTS
     {
@@ -3029,26 +3043,34 @@ void JS_FreeContext(JSContext *ctx)
     {
         JSMemoryUsage stats;
         JS_ComputeMemoryUsage(rt, &stats);
-        JS_DumpMemoryUsage(stdout, &stats, rt);
+        JS_DumpMemoryUsage(stdout, &stats, rt);  // 输出内存使用统计
     }
 #endif
 
+    // 1. 释放所有模块
     js_free_modules(ctx, JS_FREE_MODULE_ALL);
 
+    // 2. 释放全局对象
     JS_FreeValue(ctx, ctx->global_obj);
     JS_FreeValue(ctx, ctx->global_var_obj);
 
+    // 3. 释放内置函数和对象
     JS_FreeValue(ctx, ctx->throw_type_error);
     JS_FreeValue(ctx, ctx->eval_obj);
-
     JS_FreeValue(ctx, ctx->array_proto_values);
+    
+    // 4. 释放 Error 原型
     for(i = 0; i < JS_NATIVE_ERROR_COUNT; i++) {
         JS_FreeValue(ctx, ctx->native_error_proto[i]);
     }
+    
+    // 5. 释放类原型
     for(i = 0; i < rt->class_count; i++) {
         JS_FreeValue(ctx, ctx->class_proto[i]);
     }
     js_free_rt(rt, ctx->class_proto);
+    
+    // 6. 释放构造函数和原型
     JS_FreeValue(ctx, ctx->iterator_ctor);
     JS_FreeValue(ctx, ctx->async_iterator_proto);
     JS_FreeValue(ctx, ctx->promise_ctor);
@@ -3057,77 +3079,136 @@ void JS_FreeContext(JSContext *ctx)
     JS_FreeValue(ctx, ctx->function_ctor);
     JS_FreeValue(ctx, ctx->function_proto);
 
+    // 7. 释放 Shape
     js_free_shape_null(ctx->rt, ctx->array_shape);
     js_free_shape_null(ctx->rt, ctx->arguments_shape);
     js_free_shape_null(ctx->rt, ctx->mapped_arguments_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
 
+    // 8. 从链表移除并释放
     list_del(&ctx->link);
     remove_gc_object(&ctx->header);
     js_free_rt(ctx->rt, ctx);
 }
 
+/**
+ * JS_GetRuntime - 获取上下文所属的运行时
+ * @ctx: 上下文
+ * 返回: 运行时指针
+ */
 JSRuntime *JS_GetRuntime(JSContext *ctx)
 {
     return ctx->rt;
 }
 
+/* ============================================================================
+ * 栈管理
+ * 用于检测栈溢出
+ * ============================================================================ */
+
+/**
+ * update_stack_limit - 更新栈限制
+ * @rt: 运行时实例
+ * 
+ * 说明：根据栈大小和栈顶计算栈下限
+ */
 static void update_stack_limit(JSRuntime *rt)
 {
     if (rt->stack_size == 0) {
-        rt->stack_limit = 0; /* no limit */
+        rt->stack_limit = 0; /* 无限制 */
     } else {
         rt->stack_limit = rt->stack_top - rt->stack_size;
     }
 }
 
+/**
+ * JS_SetMaxStackSize - 设置最大栈大小
+ * @rt: 运行时实例
+ * @stack_size: 栈大小（字节），0 表示无限制
+ */
 void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size)
 {
     rt->stack_size = stack_size;
     update_stack_limit(rt);
 }
 
+/**
+ * JS_UpdateStackTop - 更新栈顶指针
+ * @rt: 运行时实例
+ * 
+ * 说明：切换线程时必须调用，以更新栈顶值
+ */
 void JS_UpdateStackTop(JSRuntime *rt)
 {
     rt->stack_top = js_get_stack_pointer();
     update_stack_limit(rt);
 }
 
+/**
+ * is_strict_mode - 检查当前是否是严格模式
+ * @ctx: 上下文
+ * 返回: TRUE 严格模式，FALSE 非严格模式
+ */
 static inline BOOL is_strict_mode(JSContext *ctx)
 {
     JSStackFrame *sf = ctx->rt->current_stack_frame;
     return (sf && (sf->js_mode & JS_MODE_STRICT));
 }
 
-/* JSAtom support */
+/* ============================================================================
+ * Atom 支持
+ * Atom 是内部化的字符串，用于高效的属性名和标识符存储
+ * ============================================================================ */
 
-#define JS_ATOM_TAG_INT (1U << 31)
-#define JS_ATOM_MAX_INT (JS_ATOM_TAG_INT - 1)
-#define JS_ATOM_MAX     ((1U << 30) - 1)
+#define JS_ATOM_TAG_INT (1U << 31)        // 整数 Atom 标记（最高位）
+#define JS_ATOM_MAX_INT (JS_ATOM_TAG_INT - 1)  // 最大整数 Atom
+#define JS_ATOM_MAX     ((1U << 30) - 1)  // 最大 Atom 值（30 位）
 
-/* return the max count from the hash size */
+/* 根据哈希大小返回最大计数 */
 #define JS_ATOM_COUNT_RESIZE(n) ((n) * 2)
 
+/**
+ * __JS_AtomIsConst - 检查 Atom 是否是常量
+ * @v: Atom 值
+ * 返回: TRUE 常量，FALSE 非常量
+ * 
+ * 说明：常量 Atom 不需要引用计数
+ */
 static inline BOOL __JS_AtomIsConst(JSAtom v)
 {
 #if defined(DUMP_LEAKS) && DUMP_LEAKS > 1
         return (int32_t)v <= 0;
 #else
-        return (int32_t)v < JS_ATOM_END;
+        return (int32_t)v < JS_ATOM_END;  // 预定义的 Atom 是常量
 #endif
 }
 
+/**
+ * __JS_AtomIsTaggedInt - 检查 Atom 是否是标记的整数
+ * @v: Atom 值
+ * 返回: TRUE 是整数，FALSE 不是
+ */
 static inline BOOL __JS_AtomIsTaggedInt(JSAtom v)
 {
     return (v & JS_ATOM_TAG_INT) != 0;
 }
 
+/**
+ * __JS_AtomFromUInt32 - 从 UInt32 创建 Atom
+ * @v: 无符号 32 位整数
+ * 返回: Atom 值
+ */
 static inline JSAtom __JS_AtomFromUInt32(uint32_t v)
 {
     return v | JS_ATOM_TAG_INT;
 }
 
+/**
+ * __JS_AtomToUInt32 - 将 Atom 转换为 UInt32
+ * @atom: Atom 值
+ * 返回: 无符号 32 位整数
+ */
 static inline uint32_t __JS_AtomToUInt32(JSAtom atom)
 {
     return atom & ~JS_ATOM_TAG_INT;
@@ -3138,6 +3219,14 @@ static inline int is_num(int c)
     return c >= '0' && c <= '9';
 }
 
+/**
+ * is_num_string - 检查字符串是否是数字（0 到 2^32-1）
+ * @pval: 输出参数，返回数值
+ * @p: 字符串
+ * 返回: TRUE 是数字字符串，FALSE 不是
+ * 
+ * 说明：用于数组索引优化，将数字字符串转换为整数 Atom
+ */
 /* return TRUE if the string is a number n with 0 <= n <= 2^32-1 */
 static inline BOOL is_num_string(uint32_t *pval, const JSString *p)
 {
@@ -3152,7 +3241,7 @@ static inline BOOL is_num_string(uint32_t *pval, const JSString *p)
     if (is_num(c)) {
         if (c == '0') {
             if (len != 1)
-                return FALSE;
+                return FALSE;  // "0" 是有效的，"01" 不是
             n = 0;
         } else {
             n = c - '0';
@@ -3162,7 +3251,7 @@ static inline BOOL is_num_string(uint32_t *pval, const JSString *p)
                     return FALSE;
                 n64 = (uint64_t)n * 10 + (c - '0');
                 if ((n64 >> 32) != 0)
-                    return FALSE;
+                    return FALSE;  // 溢出 32 位
                 n = n64;
             }
         }
@@ -3173,6 +3262,18 @@ static inline BOOL is_num_string(uint32_t *pval, const JSString *p)
     }
 }
 
+/* ============================================================================
+ * 字符串哈希函数
+ * 使用 263 作为乘数（质数）
+ * ============================================================================ */
+
+/**
+ * hash_string8 - 8 位字符串哈希
+ * @str: 字符串
+ * @len: 长度
+ * @h: 初始哈希值
+ * 返回: 哈希值
+ */
 /* XXX: could use faster version ? */
 static inline uint32_t hash_string8(const uint8_t *str, size_t len, uint32_t h)
 {
@@ -3183,6 +3284,13 @@ static inline uint32_t hash_string8(const uint8_t *str, size_t len, uint32_t h)
     return h;
 }
 
+/**
+ * hash_string16 - 16 位字符串哈希
+ * @str: 字符串
+ * @len: 长度
+ * @h: 初始哈希值
+ * 返回: 哈希值
+ */
 static inline uint32_t hash_string16(const uint16_t *str,
                                      size_t len, uint32_t h)
 {
@@ -3193,6 +3301,12 @@ static inline uint32_t hash_string16(const uint16_t *str,
     return h;
 }
 
+/**
+ * hash_string - 字符串哈希（自动选择 8 位或 16 位）
+ * @str: 字符串
+ * @h: 初始哈希值
+ * 返回: 哈希值
+ */
 static uint32_t hash_string(const JSString *str, uint32_t h)
 {
     if (str->is_wide_char)
@@ -3202,32 +3316,58 @@ static uint32_t hash_string(const JSString *str, uint32_t h)
     return h;
 }
 
+/**
+ * hash_string_rope - 绳索字符串哈希（递归）
+ * @val: JSValue（字符串或绳索）
+ * @h: 初始哈希值
+ * 返回: 哈希值
+ */
 static uint32_t hash_string_rope(JSValueConst val, uint32_t h)
 {
     if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING) {
         return hash_string(JS_VALUE_GET_STRING(val), h);
     } else {
         JSStringRope *r = JS_VALUE_GET_STRING_ROPE(val);
-        h = hash_string_rope(r->left, h);
-        return hash_string_rope(r->right, h);
+        h = hash_string_rope(r->left, h);  // 递归左子树
+        return hash_string_rope(r->right, h);  // 递归右子树
     }
 }
 
+/* ============================================================================
+ * 调试输出函数
+ * ============================================================================ */
+
+/**
+ * JS_DumpChar - 输出字符（带转义）
+ * @fo: 输出文件
+ * @c: 字符
+ * @sep: 分隔符（用于判断是否需要转义）
+ */
 static __maybe_unused void JS_DumpChar(FILE *fo, int c, int sep)
 {
     if (c == sep || c == '\\') {
         fputc('\\', fo);
         fputc(c, fo);
     } else if (c >= ' ' && c <= 126) {
-        fputc(c, fo);
+        fputc(c, fo);  // 可打印字符直接输出
     } else if (c == '\n') {
         fputc('\\', fo);
         fputc('n', fo);
     } else {
-        fprintf(fo, "\\u%04x", c);
+        fprintf(fo, "\\u%04x", c);  // Unicode 转义
     }
 }
 
+/**
+ * JS_DumpString - 输出字符串（调试用）
+ * @rt: 运行时
+ * @p: 字符串
+ * 
+ * 说明：
+ * - 输出引用计数
+ * - 引用计数为 1 用双引号，否则用单引号
+ * - 特殊字符转义输出
+ */
 static __maybe_unused void JS_DumpString(JSRuntime *rt, const JSString *p)
 {
     int i, sep;
