@@ -5621,6 +5621,15 @@ static void copy_str16(uint16_t *dst, const JSString *p, int offset, int len)
     }
 }
 
+/**
+ * JS_ConcatString1 - 连接两个字符串
+ * @ctx: 上下文
+ * @p1: 第一个字符串
+ * @p2: 第二个字符串
+ * 返回: 连接后的字符串 JSValue
+ * 
+ * 说明：自动处理 8 位/16 位混合连接
+ */
 static JSValue JS_ConcatString1(JSContext *ctx,
                                 const JSString *p1, const JSString *p2)
 {
@@ -5646,6 +5655,15 @@ static JSValue JS_ConcatString1(JSContext *ctx,
     return JS_MKPTR(JS_TAG_STRING, p);
 }
 
+/**
+ * JS_ConcatStringInPlace - 原地连接字符串（优化）
+ * @ctx: 上下文
+ * @p1: 第一个字符串（必须引用计数为 1）
+ * @op2: 第二个字符串（JSValue）
+ * 返回: TRUE 成功原地连接，FALSE 需要重新分配
+ * 
+ * 说明：如果 p1 有足够的空闲空间，直接追加，避免重新分配
+ */
 static BOOL JS_ConcatStringInPlace(JSContext *ctx, JSString *p1, JSValueConst op2) {
     if (JS_VALUE_GET_TAG(op2) == JS_TAG_STRING) {
         JSString *p2 = JS_VALUE_GET_STRING(op2);
@@ -5682,6 +5700,15 @@ static BOOL JS_ConcatStringInPlace(JSContext *ctx, JSString *p1, JSValueConst op
     return FALSE;
 }
 
+/**
+ * JS_ConcatString2 - 连接两个 JSValue 字符串
+ * @ctx: 上下文
+ * @op1: 第一个字符串
+ * @op2: 第二个字符串
+ * 返回: 连接后的字符串 JSValue
+ * 
+ * 说明：先尝试原地连接，失败则重新分配
+ */
 static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2)
 {
     JSValue ret;
@@ -5689,7 +5716,7 @@ static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2)
     p1 = JS_VALUE_GET_STRING(op1);
     if (JS_ConcatStringInPlace(ctx, p1, op2)) {
         JS_FreeValue(ctx, op2);
-        return op1;
+        return op1;  // 原地连接成功，返回 op1
     }
     p2 = JS_VALUE_GET_STRING(op2);
     ret = JS_ConcatString1(ctx, p1, p2);
@@ -5698,6 +5725,14 @@ static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2)
     return ret;
 }
 
+/**
+ * string_rope_get - 获取绳索字符串指定位置的字符
+ * @val: 字符串或绳索 JSValue
+ * @idx: 位置索引
+ * 返回: 字符值
+ * 
+ * 说明：递归遍历绳索树找到对应字符
+ */
 /* Return the character at position 'idx'. 'val' must be a string or rope */
 static int string_rope_get(JSValueConst val, uint32_t idx)
 {
@@ -5717,17 +5752,33 @@ static int string_rope_get(JSValueConst val, uint32_t idx)
     }
 }
 
+/**
+ * JSStringRopeIter - 绳索字符串迭代器
+ * 使用栈结构遍历绳索树
+ */
 typedef struct {
     JSValueConst stack[JS_STRING_ROPE_MAX_DEPTH];
     int stack_len;
 } JSStringRopeIter;
 
+/**
+ * string_rope_iter_init - 初始化绳索迭代器
+ * @s: 迭代器
+ * @val: 绳索 JSValue
+ */
 static void string_rope_iter_init(JSStringRopeIter *s, JSValueConst val)
 {
     s->stack_len = 0;
     s->stack[s->stack_len++] = val;
 }
 
+/**
+ * string_rope_iter_next - 迭代绳索返回下一个字符串片段
+ * @s: 迭代器
+ * 返回: 字符串指针，遍历完成返回 NULL
+ * 
+ * 说明：使用栈中序遍历绳索树，返回叶子节点字符串
+ */
 /* iterate thru a rope and return the strings in order */
 static JSString *string_rope_iter_next(JSStringRopeIter *s)
 {
@@ -5742,11 +5793,16 @@ static JSString *string_rope_iter_next(JSStringRopeIter *s)
             return JS_VALUE_GET_STRING(val);
         r = JS_VALUE_GET_STRING_ROPE(val);
         assert(s->stack_len < JS_STRING_ROPE_MAX_DEPTH);
-        s->stack[s->stack_len++] = r->right;
-        val = r->left;
+        s->stack[s->stack_len++] = r->right;  // 右子树入栈
+        val = r->left;  // 继续遍历左子树
     }
 }
 
+/**
+ * string_rope_get_len - 获取绳索字符串长度
+ * @val: 字符串或绳索 JSValue
+ * 返回: 长度
+ */
 static uint32_t string_rope_get_len(JSValueConst val)
 {
     if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING)
@@ -5755,6 +5811,18 @@ static uint32_t string_rope_get_len(JSValueConst val)
         return JS_VALUE_GET_STRING_ROPE(val)->len;
 }
 
+/**
+ * js_string_rope_compare - 比较绳索字符串
+ * @ctx: 上下文
+ * @op1: 第一个绳索
+ * @op2: 第二个绳索
+ * @eq_only: 是否仅比较相等性
+ * 返回: <0 op1<op2, 0 op1==op2, >0 op1>op2
+ * 
+ * 说明：
+ * - 逐段比较，避免完全线性化
+ * - eq_only=true 时长度不同直接返回
+ */
 static int js_string_rope_compare(JSContext *ctx, JSValueConst op1,
                                   JSValueConst op2, BOOL eq_only)
 {
@@ -5765,8 +5833,7 @@ static int js_string_rope_compare(JSContext *ctx, JSValueConst op1,
     
     len1 = string_rope_get_len(op1);
     len2 = string_rope_get_len(op2);
-    /* no need to go further for equality test if
-       different length */
+    /* 相等测试时长度不同无需继续 */
     if (eq_only && len1 != len2)
         return 1; 
     len = min_uint32(len1, len2);
@@ -5804,6 +5871,17 @@ static int js_string_rope_compare(JSContext *ctx, JSValueConst op1,
     return res;
 }
 
+/**
+ * js_linearize_string_rope - 线性化绳索字符串
+ * @ctx: 上下文
+ * @rope: 绳索 JSValue
+ * 返回: 线性化后的字符串 JSValue
+ * 
+ * 说明：
+ * - 将绳索树展开为普通字符串
+ * - 如果引用计数>1，更新绳索避免重复线性化
+ * - 使用 StringBuffer 高效拼接
+ */
 /* 'rope' must be a rope. return a string and modify the rope so that
    it won't need to be linearized again. */
 static JSValue js_linearize_string_rope(JSContext *ctx, JSValue rope)
@@ -5814,7 +5892,7 @@ static JSValue js_linearize_string_rope(JSContext *ctx, JSValue rope)
     
     r = JS_VALUE_GET_STRING_ROPE(rope);
 
-    /* check whether it is already linearized */
+    /* 检查是否已经线性化 */
     if (JS_VALUE_GET_TAG(r->right) == JS_TAG_STRING &&
         JS_VALUE_GET_STRING(r->right)->len == 0) {
         ret = JS_DupValue(ctx, r->left);
@@ -5827,7 +5905,7 @@ static JSValue js_linearize_string_rope(JSContext *ctx, JSValue rope)
         goto fail;
     ret = string_buffer_end(b);
     if (r->header.ref_count > 1) {
-        /* update the rope so that it won't need to be linearized again */
+        /* 更新绳索，避免重复线性化 */
         JS_FreeValue(ctx, r->left);
         JS_FreeValue(ctx, r->right);
         r->left = JS_DupValue(ctx, ret);
@@ -5842,6 +5920,18 @@ static JSValue js_linearize_string_rope(JSContext *ctx, JSValue rope)
 
 static JSValue js_rebalancee_string_rope(JSContext *ctx, JSValueConst rope);
 
+/**
+ * js_new_string_rope - 创建新的绳索字符串
+ * @ctx: 上下文
+ * @op1: 第一个操作数（字符串或绳索）
+ * @op2: 第二个操作数（字符串或绳索）
+ * 返回: 绳索 JSValue
+ * 
+ * 说明：
+ * - 计算总长度和深度
+ * - 深度超过阈值时自动重平衡
+ * - 用于高效字符串拼接
+ */
 /* op1 and op2 must be strings or string ropes */
 static JSValue js_new_string_rope(JSContext *ctx, JSValue op1, JSValue op2)
 {
@@ -5897,7 +5987,7 @@ static JSValue js_new_string_rope(JSContext *ctx, JSValue op1, JSValue op2)
             printf("rebalance: final depth=%d\n", JS_VALUE_GET_STRING_ROPE(res2)->depth);
 #endif
         JS_FreeValue(ctx, res);
-        return res2;
+        return res2;  // 深度超限，重平衡
     } else {
         return res;
     }
@@ -5907,9 +5997,12 @@ static JSValue js_new_string_rope(JSContext *ctx, JSValue op1, JSValue op2)
     return JS_EXCEPTION;
 }
 
-#define ROPE_N_BUCKETS 44
+#define ROPE_N_BUCKETS 44  // 绳索桶数量（对应斐波那契数列）
 
-/* Fibonacii numbers starting from F_2 */
+/* 斐波那契数列，从 F_2 开始
+ * 用于绳索重平衡算法的桶大小
+ * 每个桶存储对应长度范围的绳索
+ */
 static const uint32_t rope_bucket_len[ROPE_N_BUCKETS] = {
           1,          2,          3,          5,
           8,         13,         21,         34,
@@ -5924,6 +6017,18 @@ static const uint32_t rope_bucket_len[ROPE_N_BUCKETS] = {
   267914296,  433494437,  701408733, 1134903170, /* > JS_STRING_LEN_MAX */
 };
 
+/**
+ * js_rebalancee_string_rope_rec - 绳索重平衡递归函数
+ * @ctx: 上下文
+ * @buckets: 桶数组（按斐波那契长度分组）
+ * @val: 当前处理的绳索或字符串
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：
+ * - 将绳索分解为字符串片段
+ * - 按斐波那契长度分组到桶中
+ * - 合并相同长度的绳索
+ */
 static int js_rebalancee_string_rope_rec(JSContext *ctx, JSValue *buckets,
                                           JSValueConst val)
 {
@@ -5935,9 +6040,8 @@ static int js_rebalancee_string_rope_rec(JSContext *ctx, JSValue *buckets,
         len = p->len;
         if (len == 0)
             return 0; /* nothing to do */
-        /* find the bucket i so that rope_bucket_len[i] <= len <
-           rope_bucket_len[i + 1] and concatenate the ropes in the
-           buckets before */
+        /* 找到桶 i，使得 rope_bucket_len[i] <= len < rope_bucket_len[i + 1]
+           并合并前面的桶 */
         a = JS_NULL;
         i = 0;
         while (len >= rope_bucket_len[i + 1]) {
@@ -5977,6 +6081,17 @@ static int js_rebalancee_string_rope_rec(JSContext *ctx, JSValue *buckets,
     return 0;
 }
 
+/**
+ * js_rebalancee_string_rope - 重平衡绳索字符串
+ * @ctx: 上下文
+ * @rope: 绳索 JSValue
+ * 返回: 平衡后的新绳索
+ * 
+ * 说明：
+ * - 算法来自 "Ropes: an Alternative to Strings"
+ * - 使用斐波那契数列分组
+ * - 确保绳索树深度为 O(log n)
+ */
 /* Return a new rope which is balanced. Algorithm from "Ropes: an
    Alternative to Strings", Hans-J. Boehm, Russ Atkinson and Michael
    Plass. */
@@ -6015,12 +6130,26 @@ static JSValue js_rebalancee_string_rope(JSContext *ctx, JSValueConst rope)
     return JS_EXCEPTION;
 }
 
+/**
+ * JS_ConcatString - 连接两个字符串（转换为字符串后连接）
+ * @ctx: 上下文
+ * @op1: 第一个操作数（自动转换为字符串）
+ * @op2: 第二个操作数（自动转换为字符串）
+ * 返回: 连接后的字符串 JSValue
+ * 
+ * 说明：
+ * - 非字符串/绳索值先转换为字符串
+ * - 短字符串直接拼接（优化）
+ * - 长字符串使用绳索（避免复制）
+ * - 特殊情况优化：空字符串、绳索 + 短字符串等
+ */
 /* op1 and op2 are converted to strings. For convenience, op1 or op2 =
    JS_EXCEPTION are accepted and return JS_EXCEPTION.  */
 static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
 {
     JSString *p1, *p2;
 
+    // 转换 op1 为字符串
     if (unlikely(JS_VALUE_GET_TAG(op1) != JS_TAG_STRING &&
                  JS_VALUE_GET_TAG(op1) != JS_TAG_STRING_ROPE)) {
         op1 = JS_ToStringFree(ctx, op1);
@@ -6029,6 +6158,7 @@ static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
             return JS_EXCEPTION;
         }
     }
+    // 转换 op2 为字符串
     if (unlikely(JS_VALUE_GET_TAG(op2) != JS_TAG_STRING &&
                  JS_VALUE_GET_TAG(op2) != JS_TAG_STRING_ROPE)) {
         op2 = JS_ToStringFree(ctx, op2);
@@ -6038,24 +6168,25 @@ static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
         }
     }
 
-    /* normal concatenation for short strings */
+    /* 短字符串正常拼接 */
     if (JS_VALUE_GET_TAG(op2) == JS_TAG_STRING) {
         p2 = JS_VALUE_GET_STRING(op2);
         if (p2->len == 0) {
             JS_FreeValue(ctx, op2);
-            return op1;
+            return op1;  // op2 为空，直接返回 op1
         }
         if (p2->len <= JS_STRING_ROPE_SHORT_LEN) {
             if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING) {
                 p1 = JS_VALUE_GET_STRING(op1);
                 if (p1->len <= JS_STRING_ROPE_SHORT2_LEN) {
-                    return JS_ConcatString2(ctx, op1, op2);
+                    return JS_ConcatString2(ctx, op1, op2);  // 都短，直接拼接
                 } else {
-                    return js_new_string_rope(ctx, op1, op2);
+                    return js_new_string_rope(ctx, op1, op2);  // op1 长，用绳索
                 }
             } else {
                 JSStringRope *r1;
                 r1 = JS_VALUE_GET_STRING_ROPE(op1);
+                // 优化：绳索的右子树是短字符串时，先拼接右子树
                 if (JS_VALUE_GET_TAG(r1->right) == JS_TAG_STRING &&
                     JS_VALUE_GET_STRING(r1->right)->len <= JS_STRING_ROPE_SHORT_LEN) {
                     JSValue val, ret;
@@ -6075,9 +6206,10 @@ static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
         p1 = JS_VALUE_GET_STRING(op1);
         if (p1->len == 0) {
             JS_FreeValue(ctx, op1);
-            return op2;
+            return op2;  // op1 为空，直接返回 op2
         }
         r2 = JS_VALUE_GET_STRING_ROPE(op2);
+        // 优化：绳索的左子树是短字符串时，先拼接左子树
         if (JS_VALUE_GET_TAG(r2->left) == JS_TAG_STRING &&
             JS_VALUE_GET_STRING(r2->left)->len <= JS_STRING_ROPE_SHORT_LEN) {
             JSValue val, ret;
@@ -6094,37 +6226,75 @@ static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
     return js_new_string_rope(ctx, op1, op2);
 }
 
-/* Shape support */
+/* ============================================================================
+ * Shape 支持
+ * Shape 是对象布局的模板，包含原型和属性名 + 标志
+ * 相同 Shape 的对象可以共享内存布局，节省内存
+ * ============================================================================ */
 
+/**
+ * get_shape_size - 计算 Shape 分配大小
+ * @hash_size: 哈希表大小
+ * @prop_size: 属性数组大小
+ * 返回: 总字节数
+ * 
+ * 布局：[哈希表][JSShape 结构][属性数组]
+ */
 static inline size_t get_shape_size(size_t hash_size, size_t prop_size)
 {
     return hash_size * sizeof(uint32_t) + sizeof(JSShape) +
         prop_size * sizeof(JSShapeProperty);
 }
 
+/**
+ * get_shape_from_alloc - 从分配指针获取 Shape 指针
+ * @sh_alloc: 分配的记忆块指针
+ * @hash_size: 哈希表大小
+ * 返回: Shape 指针
+ */
 static inline JSShape *get_shape_from_alloc(void *sh_alloc, size_t hash_size)
 {
     return (JSShape *)(void *)((uint32_t *)sh_alloc + hash_size);
 }
 
+/**
+ * prop_hash_end - 获取属性哈希表末尾指针
+ * @sh: Shape 指针
+ * 返回: 哈希表起始地址（也是 Shape 结构起始）
+ */
 static inline uint32_t *prop_hash_end(JSShape *sh)
 {
     return (uint32_t *)sh;
 }
 
+/**
+ * get_alloc_from_shape - 从 Shape 获取分配指针
+ * @sh: Shape 指针
+ * 返回: 分配的记忆块指针
+ */
 static inline void *get_alloc_from_shape(JSShape *sh)
 {
     return prop_hash_end(sh) - ((intptr_t)sh->prop_hash_mask + 1);
 }
 
+/**
+ * get_shape_prop - 获取属性数组指针
+ * @sh: Shape 指针
+ * 返回: 属性数组指针
+ */
 static inline JSShapeProperty *get_shape_prop(JSShape *sh)
 {
     return sh->prop;
 }
 
+/**
+ * init_shape_hash - 初始化 Shape 哈希表
+ * @rt: 运行时
+ * 返回: 0 成功，-1 失败
+ */
 static int init_shape_hash(JSRuntime *rt)
 {
-    rt->shape_hash_bits = 4;   /* 16 shapes */
+    rt->shape_hash_bits = 4;   /* 16 shapes 初始大小 */
     rt->shape_hash_size = 1 << rt->shape_hash_bits;
     rt->shape_hash_count = 0;
     rt->shape_hash = js_mallocz_rt(rt, sizeof(rt->shape_hash[0]) *
@@ -6134,18 +6304,28 @@ static int init_shape_hash(JSRuntime *rt)
     return 0;
 }
 
-/* same magic hash multiplier as the Linux kernel */
+/* 与 Linux 内核相同的魔法哈希乘数 */
 static uint32_t shape_hash(uint32_t h, uint32_t val)
 {
     return (h + val) * 0x9e370001;
 }
 
-/* truncate the shape hash to 'hash_bits' bits */
+/**
+ * get_shape_hash - 截断 Shape 哈希到指定位数
+ * @h: 哈希值
+ * @hash_bits: 哈希位数
+ * 返回: 截断后的哈希值
+ */
 static uint32_t get_shape_hash(uint32_t h, int hash_bits)
 {
     return h >> (32 - hash_bits);
 }
 
+/**
+ * shape_initial_hash - 计算 Shape 初始哈希值
+ * @proto: 原型对象
+ * 返回: 哈希值
+ */
 static uint32_t shape_initial_hash(JSObject *proto)
 {
     uint32_t h;
@@ -6155,6 +6335,14 @@ static uint32_t shape_initial_hash(JSObject *proto)
     return h;
 }
 
+/**
+ * resize_shape_hash - 调整 Shape 哈希表大小
+ * @rt: 运行时
+ * @new_shape_hash_bits: 新的哈希位数
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：重新哈希所有现有 Shape
+ */
 static int resize_shape_hash(JSRuntime *rt, int new_shape_hash_bits)
 {
     int new_shape_hash_size, i;
@@ -6181,6 +6369,11 @@ static int resize_shape_hash(JSRuntime *rt, int new_shape_hash_bits)
     return 0;
 }
 
+/**
+ * js_shape_hash_link - 将 Shape 链接到哈希表
+ * @rt: 运行时
+ * @sh: Shape 指针
+ */
 static void js_shape_hash_link(JSRuntime *rt, JSShape *sh)
 {
     uint32_t h;
@@ -6190,6 +6383,11 @@ static void js_shape_hash_link(JSRuntime *rt, JSShape *sh)
     rt->shape_hash_count++;
 }
 
+/**
+ * js_shape_hash_unlink - 从哈希表移除 Shape
+ * @rt: 运行时
+ * @sh: Shape 指针
+ */
 static void js_shape_hash_unlink(JSRuntime *rt, JSShape *sh)
 {
     uint32_t h;
@@ -6203,6 +6401,14 @@ static void js_shape_hash_unlink(JSRuntime *rt, JSShape *sh)
     rt->shape_hash_count--;
 }
 
+/**
+ * js_new_shape_nohash - 创建新 Shape（不加入哈希表）
+ * @ctx: 上下文
+ * @proto: 原型对象
+ * @hash_size: 哈希表大小
+ * @prop_size: 属性数组大小
+ * 返回: Shape 指针，失败返回 NULL
+ */
 /* create a new empty shape with prototype 'proto'. It is not hashed */
 static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
                                            int hash_size, int prop_size)
@@ -6230,6 +6436,16 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     return sh;
 }
 
+/**
+ * js_new_shape2 - 创建新 Shape（加入哈希表）
+ * @ctx: 上下文
+ * @proto: 原型对象
+ * @hash_size: 哈希表大小
+ * @prop_size: 属性数组大小
+ * 返回: Shape 指针，失败返回 NULL
+ * 
+ * 说明：必要时自动扩展哈希表
+ */
 /* create a new empty shape with prototype 'proto' */
 static no_inline JSShape *js_new_shape2(JSContext *ctx, JSObject *proto,
                                         int hash_size, int prop_size)
@@ -6237,7 +6453,7 @@ static no_inline JSShape *js_new_shape2(JSContext *ctx, JSObject *proto,
     JSRuntime *rt = ctx->rt;
     JSShape *sh;
 
-    /* resize the shape hash table if necessary */
+    /* 必要时调整哈希表大小 */
     if (2 * (rt->shape_hash_count + 1) > rt->shape_hash_size) {
         resize_shape_hash(rt, rt->shape_hash_bits + 1);
     }
@@ -6246,19 +6462,33 @@ static no_inline JSShape *js_new_shape2(JSContext *ctx, JSObject *proto,
     if (!sh)
         return NULL;
     
-    /* insert in the hash table */
+    /* 加入哈希表 */
     sh->hash = shape_initial_hash(proto);
     sh->is_hashed = TRUE;
     js_shape_hash_link(ctx->rt, sh);
     return sh;
 }
 
+/**
+ * js_new_shape - 创建新 Shape（默认大小）
+ * @ctx: 上下文
+ * @proto: 原型对象
+ * 返回: Shape 指针
+ */
 static JSShape *js_new_shape(JSContext *ctx, JSObject *proto)
 {
     return js_new_shape2(ctx, proto, JS_PROP_INITIAL_HASH_SIZE,
                          JS_PROP_INITIAL_SIZE);
 }
 
+/**
+ * js_clone_shape - 克隆 Shape
+ * @ctx: 上下文
+ * @sh1: 原 Shape
+ * 返回: 新 Shape 指针
+ * 
+ * 说明：新 Shape 不加入哈希表，复制所有属性
+ */
 /* The shape is cloned. The new shape is not inserted in the shape
    hash table */
 static JSShape *js_clone_shape(JSContext *ctx, JSShape *sh1)
@@ -6289,12 +6519,28 @@ static JSShape *js_clone_shape(JSContext *ctx, JSShape *sh1)
     return sh;
 }
 
+/**
+ * js_dup_shape - 增加 Shape 引用计数
+ * @sh: Shape 指针
+ * 返回: Shape 指针
+ */
 static JSShape *js_dup_shape(JSShape *sh)
 {
     sh->header.ref_count++;
     return sh;
 }
 
+/**
+ * js_free_shape0 - 释放 Shape（引用计数已为 0）
+ * @rt: 运行时
+ * @sh: Shape 指针
+ * 
+ * 说明：
+ * - 从哈希表移除
+ * - 释放原型引用
+ * - 释放所有属性 Atom
+ * - 释放内存
+ */
 static void js_free_shape0(JSRuntime *rt, JSShape *sh)
 {
     uint32_t i;
@@ -6315,6 +6561,11 @@ static void js_free_shape0(JSRuntime *rt, JSShape *sh)
     js_free_rt(rt, get_alloc_from_shape(sh));
 }
 
+/**
+ * js_free_shape - 释放 Shape（减少引用计数）
+ * @rt: 运行时
+ * @sh: Shape 指针
+ */
 static void js_free_shape(JSRuntime *rt, JSShape *sh)
 {
     if (unlikely(--sh->header.ref_count <= 0)) {
@@ -6322,12 +6573,31 @@ static void js_free_shape(JSRuntime *rt, JSShape *sh)
     }
 }
 
+/**
+ * js_free_shape_null - 释放 Shape（可接受 NULL）
+ * @rt: 运行时
+ * @sh: Shape 指针
+ */
 static void js_free_shape_null(JSRuntime *rt, JSShape *sh)
 {
     if (sh)
         js_free_shape(rt, sh);
 }
 
+/**
+ * resize_properties - 扩展属性数组空间
+ * @ctx: 上下文
+ * @psh: Shape 指针的指针
+ * @p: 对象指针（可为 NULL）
+ * @count: 需要的最小属性数量
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：
+ * - 使用 3/2 增长策略
+ * - 先重新分配对象属性数组（避免 GC 期间崩溃）
+ * - 再重新分配 Shape（包含哈希表和属性定义）
+ * - 使用 3/2 增长策略避免频繁重新分配
+ */
 /* make space to hold at least 'count' properties */
 static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
                                        JSObject *p, uint32_t count)
@@ -6341,8 +6611,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
 
     sh = *psh;
     new_size = max_int(count, sh->prop_size * 3 / 2);
-    /* Reallocate prop array first to avoid crash or size inconsistency
-       in case of memory allocation failure */
+    /* 先重新分配属性数组，避免内存分配失败时崩溃或大小不一致 */
     if (p) {
         JSProperty *new_prop;
         new_prop = js_realloc(ctx, p->prop, sizeof(new_prop[0]) * new_size);
@@ -6353,21 +6622,20 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
     new_hash_size = sh->prop_hash_mask + 1;
     while (new_hash_size < new_size)
         new_hash_size = 2 * new_hash_size;
-    /* resize the property shapes. Using js_realloc() is not possible in
-       case the GC runs during the allocation */
+    /* 重新分配属性 Shape。不能使用 js_realloc()，因为 GC 可能在分配期间运行 */
     old_sh = sh;
     sh_alloc = js_malloc(ctx, get_shape_size(new_hash_size, new_size));
     if (!sh_alloc)
         return -1;
     sh = get_shape_from_alloc(sh_alloc, new_hash_size);
     list_del(&old_sh->header.link);
-    /* copy all the shape properties */
+    /* 复制所有 Shape 属性 */
     memcpy(sh, old_sh,
            sizeof(JSShape) + sizeof(sh->prop[0]) * old_sh->prop_count);
     list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
 
     if (new_hash_size != (sh->prop_hash_mask + 1)) {
-        /* resize the hash table and the properties */
+        /* 调整哈希表和属性数组大小 */
         new_hash_mask = new_hash_size - 1;
         sh->prop_hash_mask = new_hash_mask;
         memset(prop_hash_end(sh) - new_hash_size, 0,
@@ -6380,16 +6648,27 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
             }
         }
     } else {
-        /* just copy the previous hash table */
+        /* 仅复制之前的哈希表 */
         memcpy(prop_hash_end(sh) - new_hash_size, prop_hash_end(old_sh) - new_hash_size,
                sizeof(prop_hash_end(sh)[0]) * new_hash_size);
     }
-    js_free(ctx, get_alloc_from_shape(old_sh));
+    js_free(ctx, get_alloc_from_shape(old_sh));  // 释放旧 Shape
     *psh = sh;
     sh->prop_size = new_size;
     return 0;
 }
 
+/**
+ * compact_properties - 压缩属性（删除已删除的属性）
+ * @ctx: 上下文
+ * @p: 对象指针
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：
+ * - 移除已删除的属性条目
+ * - 缩小属性数组和哈希表
+ * - 仅用于未哈希的 Shape
+ */
 /* remove the deleted properties. */
 static int compact_properties(JSContext *ctx, JSObject *p)
 {
@@ -6403,16 +6682,18 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     sh = p->shape;
     assert(!sh->is_hashed);
 
+    // 计算新大小（移除已删除的属性）
     new_size = max_int(JS_PROP_INITIAL_SIZE,
                        sh->prop_count - sh->deleted_prop_count);
     assert(new_size <= sh->prop_size);
 
+    // 缩小哈希表
     new_hash_size = sh->prop_hash_mask + 1;
     while ((new_hash_size / 2) >= new_size)
         new_hash_size = new_hash_size / 2;
     new_hash_mask = new_hash_size - 1;
 
-    /* resize the hash table and the properties */
+    /* 调整哈希表和属性数组大小 */
     old_sh = sh;
     sh_alloc = js_malloc(ctx, get_shape_size(new_hash_size, new_size));
     if (!sh_alloc)
@@ -6425,6 +6706,7 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     memset(prop_hash_end(sh) - new_hash_size, 0,
            sizeof(prop_hash_end(sh)[0]) * new_hash_size);
 
+    // 复制有效属性（跳过已删除的）
     j = 0;
     old_pr = old_sh->prop;
     pr = sh->prop;
@@ -6451,13 +6733,27 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     p->shape = sh;
     js_free(ctx, get_alloc_from_shape(old_sh));
 
-    /* reduce the size of the object properties */
+    /* 缩小对象属性数组 */
     new_prop = js_realloc(ctx, p->prop, sizeof(new_prop[0]) * new_size);
     if (new_prop)
         p->prop = new_prop;
     return 0;
 }
 
+/**
+ * add_shape_property - 向 Shape 添加属性
+ * @ctx: 上下文
+ * @psh: Shape 指针的指针
+ * @p: 对象指针（可为 NULL）
+ * @atom: 属性名 Atom
+ * @prop_flags: 属性标志
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：
+ * - 必要时扩展属性数组
+ * - 更新 Shape 哈希值
+ * - 将属性加入哈希表
+ */
 static int add_shape_property(JSContext *ctx, JSShape **psh,
                               JSObject *p, JSAtom atom, int prop_flags)
 {
@@ -6467,7 +6763,7 @@ static int add_shape_property(JSContext *ctx, JSShape **psh,
     uint32_t hash_mask, new_shape_hash = 0;
     intptr_t h;
 
-    /* update the shape hash */
+    /* 更新 Shape 哈希 */
     if (sh->is_hashed) {
         js_shape_hash_unlink(rt, sh);
         new_shape_hash = shape_hash(shape_hash(sh->hash, atom), prop_flags);
@@ -6475,8 +6771,8 @@ static int add_shape_property(JSContext *ctx, JSShape **psh,
 
     if (unlikely(sh->prop_count >= sh->prop_size)) {
         if (resize_properties(ctx, psh, p, sh->prop_count + 1)) {
-            /* in case of error, reinsert in the hash table.
-               sh is still valid if resize_properties() failed */
+            /* 出错时重新插入哈希表
+               resize_properties() 失败时 sh 仍然有效 */
             if (sh->is_hashed)
                 js_shape_hash_link(rt, sh);
             return -1;
@@ -6487,13 +6783,13 @@ static int add_shape_property(JSContext *ctx, JSShape **psh,
         sh->hash = new_shape_hash;
         js_shape_hash_link(rt, sh);
     }
-    /* Initialize the new shape property.
-       The object property at p->prop[sh->prop_count] is uninitialized */
+    /* 初始化新 Shape 属性
+       p->prop[sh->prop_count] 处的对象属性未初始化 */
     prop = get_shape_prop(sh);
     pr = &prop[sh->prop_count++];
     pr->atom = JS_DupAtom(ctx, atom);
     pr->flags = prop_flags;
-    /* add in hash table */
+    /* 加入哈希表 */
     hash_mask = sh->prop_hash_mask;
     h = atom & hash_mask;
     pr->hash_next = prop_hash_end(sh)[-h - 1];
@@ -6501,6 +6797,14 @@ static int add_shape_property(JSContext *ctx, JSShape **psh,
     return 0;
 }
 
+/**
+ * find_hashed_shape_proto - 查找匹配原型的空 Shape
+ * @rt: 运行时
+ * @proto: 原型对象
+ * 返回: 匹配的 Shape 指针，未找到返回 NULL
+ * 
+ * 说明：用于查找可复用的空 Shape（无属性）
+ */
 /* find a hashed empty shape matching the prototype. Return NULL if
    not found */
 static JSShape *find_hashed_shape_proto(JSRuntime *rt, JSObject *proto)
@@ -6520,6 +6824,16 @@ static JSShape *find_hashed_shape_proto(JSRuntime *rt, JSObject *proto)
     return NULL;
 }
 
+/**
+ * find_hashed_shape_prop - 查找匹配 sh + (prop, prop_flags) 的 Shape
+ * @rt: 运行时
+ * @sh: 原 Shape
+ * @atom: 属性名 Atom
+ * @prop_flags: 属性标志
+ * 返回: 匹配的 Shape 指针，未找到返回 NULL
+ * 
+ * 说明：用于 Shape 缓存，避免重复创建相同布局的 Shape
+ */
 /* find a hashed shape matching sh + (prop, prop_flags). Return NULL if
    not found */
 static JSShape *find_hashed_shape_prop(JSRuntime *rt, JSShape *sh,
