@@ -8010,7 +8010,7 @@ void __JS_FreeValueRT(JSRuntime *rt, JSValue v)
         {
             JSString *p = JS_VALUE_GET_STRING(v);
             if (p->atom_type) {
-                JS_FreeAtomStruct(rt, p);
+                JS_FreeAtomStruct(rt, p);  // Atom 字符串特殊处理
             } else {
 #ifdef DUMP_LEAKS
                 list_del(&p->link);
@@ -8020,7 +8020,7 @@ void __JS_FreeValueRT(JSRuntime *rt, JSValue v)
         }
         break;
     case JS_TAG_STRING_ROPE:
-        /* Note: recursion is acceptable because the rope depth is bounded */
+        /* 注意：递归是可接受的，因为绳索深度有界 */
         {
             JSStringRope *p = JS_VALUE_GET_STRING_ROPE(v);
             JS_FreeValueRT(rt, p->left);
@@ -8036,7 +8036,7 @@ void __JS_FreeValueRT(JSRuntime *rt, JSValue v)
             if (rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
                 list_del(&p->link);
                 list_add(&p->link, &rt->gc_zero_ref_count_list);
-                p->mark = 1; /* indicate that the object is about to be freed */
+                p->mark = 1; /* 标记对象即将被释放 */
                 if (rt->gc_phase == JS_GC_PHASE_NONE) {
                     free_zero_refcount(rt);
                 }
@@ -8060,19 +8060,39 @@ void __JS_FreeValueRT(JSRuntime *rt, JSValue v)
     }
 }
 
+/**
+ * __JS_FreeValue - 释放 JSValue（上下文级别）
+ * @ctx: 上下文
+ * @v: 要释放的 JSValue
+ */
 void __JS_FreeValue(JSContext *ctx, JSValue v)
 {
     __JS_FreeValueRT(ctx->rt, v);
 }
 
-/* garbage collection */
+/* ============================================================================
+ * 垃圾回收（GC）
+ * QuickJS 使用引用计数 + 标记 - 清除混合 GC 算法
+ * - 引用计数处理大多数对象
+ * - 标记 - 清除处理循环引用
+ * ============================================================================ */
 
+/**
+ * gc_remove_weak_objects - 移除弱引用对象
+ * @rt: 运行时
+ * 
+ * 说明：
+ * - 遍历所有弱引用
+ * - 删除 Map/Set 中的弱引用条目
+ * - 触发 FinalizationRegistry 回调
+ * - 分阶段处理避免修改链表时崩溃
+ */
 static void gc_remove_weak_objects(JSRuntime *rt)
 {
     struct list_head *el;
 
-    /* add the freed objects to rt->gc_zero_ref_count_list so that
-       rt->weakref_list is not modified while we traverse it */
+    /* 将释放的对象添加到 gc_zero_ref_count_list
+       这样遍历 weakref_list 时不会被修改 */
     rt->gc_phase = JS_GC_PHASE_DECREF; 
         
     list_for_each(el, &rt->weakref_list) {
@@ -8093,10 +8113,18 @@ static void gc_remove_weak_objects(JSRuntime *rt)
     }
 
     rt->gc_phase = JS_GC_PHASE_NONE;
-    /* free the freed objects here. */
+    /* 释放已释放的对象 */
     free_zero_refcount(rt);
 }
 
+/**
+ * add_gc_object - 添加 GC 对象到列表
+ * @rt: 运行时
+ * @h: GC 对象头
+ * @type: GC 对象类型
+ * 
+ * 说明：所有需要 GC 管理的对象都必须加入此列表
+ */
 static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
                           JSGCObjectTypeEnum type)
 {
@@ -8105,11 +8133,23 @@ static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
     list_add_tail(&h->link, &rt->gc_obj_list);
 }
 
+/**
+ * remove_gc_object - 从 GC 列表移除对象
+ * @h: GC 对象头
+ */
 static void remove_gc_object(JSGCObjectHeader *h)
 {
     list_del(&h->link);
 }
 
+/**
+ * JS_MarkValue - 标记 JSValue（GC 使用）
+ * @rt: 运行时
+ * @val: 要标记的 JSValue
+ * @mark_func: 标记函数
+ * 
+ * 说明：仅标记有引用计数的对象（Object、Function、Module）
+ */
 void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 {
     if (JS_VALUE_HAS_REF_COUNT(val)) {
@@ -8125,6 +8165,22 @@ void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
     }
 }
 
+/**
+ * mark_children - 标记 GC 对象的所有子对象
+ * @rt: 运行时
+ * @gp: GC 对象头
+ * @mark_func: 标记函数
+ * 
+ * 说明：递归标记对象引用的所有其他 GC 对象
+ * 处理各种对象类型：
+ * - JS_OBJECT: 标记 Shape、属性、getter/setter、类特定标记
+ * - FUNCTION_BYTECODE: 标记常量池、realm
+ * - VAR_REF: 标记变量值或异步函数
+ * - ASYNC_FUNCTION: 标记栈帧、参数、局部变量
+ * - SHAPE: 标记原型
+ * - JS_CONTEXT: 标记上下文所有对象
+ * - MODULE: 标记模块所有对象
+ */
 static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                           JS_MarkFunc *mark_func)
 {
@@ -8136,8 +8192,8 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             JSShape *sh;
             int i;
             sh = p->shape;
-            mark_func(rt, &sh->header);
-            /* mark all the fields */
+            mark_func(rt, &sh->header);  // 标记 Shape
+            /* 标记所有字段 */
             prs = get_shape_prop(sh);
             for(i = 0; i < sh->prop_count; i++) {
                 JSProperty *pr = &p->prop[i];
@@ -8149,8 +8205,7 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                             if (pr->u.getset.setter)
                                 mark_func(rt, &pr->u.getset.setter->header);
                         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
-                            /* Note: the tag does not matter
-                               provided it is a GC object */
+                            /* 注意：标签不重要，只要是 GC 对象即可 */
                             mark_func(rt, &pr->u.var_ref->header);
                         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
                             js_autoinit_mark(rt, pr, mark_func);
@@ -8171,7 +8226,7 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
         }
         break;
     case JS_GC_OBJ_TYPE_FUNCTION_BYTECODE:
-        /* the template objects can be part of a cycle */
+        /* 模板对象可能是循环的一部分 */
         {
             JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
             int i;
@@ -8205,12 +8260,10 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             if (!s->is_completed) {
                 JS_MarkValue(rt, sf->cur_func, mark_func);
                 JS_MarkValue(rt, s->this_val, mark_func);
-                /* sf->cur_sp = NULL if the function is running */
+                /* sf->cur_sp = NULL 表示函数正在运行 */
                 if (sf->cur_sp) {
-                    /* if the function is running, cur_sp is not known so we
-                       cannot mark the stack. Marking the variables is not needed
-                       because a running function cannot be part of a removable
-                       cycle */
+                    /* 如果函数正在运行，cur_sp 未知，无法标记栈
+                       标记变量也不需要，因为运行中的函数不能成为可移除循环的一部分 */
                     for(sp = sf->arg_buf; sp < sf->cur_sp; sp++)
                         JS_MarkValue(rt, *sp, mark_func);
                 }
@@ -8244,6 +8297,13 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
     }
 }
 
+/**
+ * gc_decref_child - GC 子对象引用计数减一
+ * @rt: 运行时
+ * @p: GC 对象头
+ * 
+ * 说明：引用计数归零且 mark=1 时移到临时列表
+ */
 static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
 {
     assert(p->ref_count > 0);
@@ -8254,6 +8314,15 @@ static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
     }
 }
 
+/**
+ * gc_decref - GC 第一阶段：减少所有子对象引用计数
+ * @rt: 运行时
+ * 
+ * 说明：
+ * - 遍历所有 GC 对象
+ * - 标记所有子对象
+ * - 引用计数归零的对象移到临时列表
+ */
 static void gc_decref(JSRuntime *rt)
 {
     struct list_head *el, *el1;
@@ -8261,9 +8330,8 @@ static void gc_decref(JSRuntime *rt)
 
     init_list_head(&rt->tmp_obj_list);
 
-    /* decrement the refcount of all the children of all the GC
-       objects and move the GC objects with zero refcount to
-       tmp_obj_list */
+    /* 减少所有 GC 对象子对象的引用计数
+       引用计数为零的对象移到 tmp_obj_list */
     list_for_each_safe(el, el1, &rt->gc_obj_list) {
         p = list_entry(el, JSGCObjectHeader, link);
         assert(p->mark == 0);
@@ -8276,43 +8344,71 @@ static void gc_decref(JSRuntime *rt)
     }
 }
 
+/**
+ * gc_scan_incref_child - GC 扫描时子对象引用计数加一
+ * @rt: 运行时
+ * @p: GC 对象头
+ * 
+ * 说明：引用计数从 0 变 1 时从临时列表移回 GC 列表
+ */
 static void gc_scan_incref_child(JSRuntime *rt, JSGCObjectHeader *p)
 {
     p->ref_count++;
     if (p->ref_count == 1) {
-        /* ref_count was 0: remove from tmp_obj_list and add at the
-           end of gc_obj_list */
+        /* 引用计数原来是 0：从 tmp_obj_list 移除并加到 gc_obj_list 末尾 */
         list_del(&p->link);
         list_add_tail(&p->link, &rt->gc_obj_list);
-        p->mark = 0; /* reset the mark for the next GC call */
+        p->mark = 0; /* 重置 mark 供下次 GC 使用 */
     }
 }
 
+/**
+ * gc_scan_incref_child2 - GC 扫描时子对象引用计数加一（简化版）
+ * @rt: 运行时
+ * @p: GC 对象头
+ */
 static void gc_scan_incref_child2(JSRuntime *rt, JSGCObjectHeader *p)
 {
     p->ref_count++;
 }
 
+/**
+ * gc_scan - GC 第二阶段：扫描并保留活跃对象
+ * @rt: 运行时
+ * 
+ * 说明：
+ * - 保留引用计数>0 的对象及其子对象
+ * - 恢复待删除对象的引用计数
+ */
 static void gc_scan(JSRuntime *rt)
 {
     struct list_head *el;
     JSGCObjectHeader *p;
 
-    /* keep the objects with a refcount > 0 and their children. */
+    /* 保留引用计数>0 的对象及其子对象 */
     list_for_each(el, &rt->gc_obj_list) {
         p = list_entry(el, JSGCObjectHeader, link);
         assert(p->ref_count > 0);
-        p->mark = 0; /* reset the mark for the next GC call */
+        p->mark = 0; /* 重置 mark 供下次 GC 使用 */
         mark_children(rt, p, gc_scan_incref_child);
     }
 
-    /* restore the refcount of the objects to be deleted. */
+    /* 恢复待删除对象的引用计数 */
     list_for_each(el, &rt->tmp_obj_list) {
         p = list_entry(el, JSGCObjectHeader, link);
         mark_children(rt, p, gc_scan_incref_child2);
     }
 }
 
+/**
+ * gc_free_cycles - GC 第三阶段：释放循环引用对象
+ * @rt: 运行时
+ * 
+ * 说明：
+ * - 仅释放与 JSValue 或异步函数相关的 GC 对象
+ * - 其他对象会自动被引用
+ * - 处理弱引用（weakref_count != 0 时保留）
+ */
 static void gc_free_cycles(JSRuntime *rt)
 {
     struct list_head *el, *el1;
@@ -8328,9 +8424,8 @@ static void gc_free_cycles(JSRuntime *rt)
         if (el == &rt->tmp_obj_list)
             break;
         p = list_entry(el, JSGCObjectHeader, link);
-        /* Only need to free the GC object associated with JS values
-           or async functions. The rest will be automatically removed
-           because they must be referenced by them. */
+        /* 仅需释放与 JSValue 或异步函数相关的 GC 对象
+           其余会自动被移除，因为它们必须被这些对象引用 */
         switch(p->gc_obj_type) {
         case JS_GC_OBJ_TYPE_JS_OBJECT:
         case JS_GC_OBJ_TYPE_FUNCTION_BYTECODE:
@@ -8362,7 +8457,7 @@ static void gc_free_cycles(JSRuntime *rt)
                p->gc_obj_type == JS_GC_OBJ_TYPE_MODULE);
         if (p->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT &&
             ((JSObject *)p)->weakref_count != 0) {
-            /* keep the object because there are weak references to it */
+            /* 保留对象，因为有弱引用指向它 */
             p->mark = 0;
         } else {
             js_free_rt(rt, p);
@@ -8372,31 +8467,54 @@ static void gc_free_cycles(JSRuntime *rt)
     init_list_head(&rt->gc_zero_ref_count_list);
 }
 
+/**
+ * JS_RunGCInternal - 运行 GC（内部函数）
+ * @rt: 运行时
+ * @remove_weak_objects: 是否移除弱引用对象
+ * 
+ * GC 流程：
+ * 1. 移除弱引用对象（可选）
+ * 2. 减少所有子对象引用计数（gc_decref）
+ * 3. 扫描并保留活跃对象（gc_scan）
+ * 4. 释放循环引用对象（gc_free_cycles）
+ */
 static void JS_RunGCInternal(JSRuntime *rt, BOOL remove_weak_objects)
 {
     if (remove_weak_objects) {
-        /* free the weakly referenced object or symbol structures, delete
-           the associated Map/Set entries and queue the finalization
-           registry callbacks. */
+        /* 释放弱引用对象或符号结构，删除关联的 Map/Set 条目，
+           排队 FinalizationRegistry 回调 */
         gc_remove_weak_objects(rt);
     }
     
-    /* decrement the reference of the children of each object. mark =
-       1 after this pass. */
+    /* 减少每个对象子对象的引用计数。此阶段后 mark = 1 */
     gc_decref(rt);
 
-    /* keep the GC objects with a non zero refcount and their childs */
+    /* 保留引用计数非零的 GC 对象及其子对象 */
     gc_scan(rt);
 
-    /* free the GC objects in a cycle */
+    /* 释放循环中的 GC 对象 */
     gc_free_cycles(rt);
 }
 
+/**
+ * JS_RunGC - 运行垃圾回收
+ * @rt: 运行时
+ * 
+ * 说明：公开 API，会移除弱引用对象
+ */
 void JS_RunGC(JSRuntime *rt)
 {
     JS_RunGCInternal(rt, TRUE);
 }
 
+/**
+ * JS_IsLiveObject - 检查对象是否存活
+ * @rt: 运行时
+ * @obj: 对象 JSValue
+ * 返回: FALSE 不是对象或对象已释放（僵尸对象）
+ * 
+ * 说明：僵尸对象在释放循环时在 finalizer 中可见
+ */
 /* Return false if not an object or if the object has already been
    freed (zombie objects are visible in finalizers when freeing
    cycles). */
@@ -8409,21 +8527,38 @@ BOOL JS_IsLiveObject(JSRuntime *rt, JSValueConst obj)
     return !p->free_mark;
 }
 
-/* Compute memory used by various object types */
-/* XXX: poor man's approach to handling multiply referenced objects */
+/* ============================================================================
+ * 内存使用统计
+ * 计算各种对象类型的内存使用情况
+ * XXX: 处理多重引用对象的简陋方法
+ * ============================================================================ */
+
+/**
+ * JSMemoryUsage_helper - 内存使用统计辅助结构
+ * 使用 double 类型以便处理多重引用对象的分数计数
+ */
 typedef struct JSMemoryUsage_helper {
-    double memory_used_count;
-    double str_count;
-    double str_size;
-    int64_t js_func_count;
-    double js_func_size;
-    int64_t js_func_code_size;
-    int64_t js_func_pc2line_count;
-    int64_t js_func_pc2line_size;
+    double memory_used_count;    // 内存使用计数
+    double str_count;            // 字符串计数
+    double str_size;             // 字符串大小
+    int64_t js_func_count;       // JS 函数计数
+    double js_func_size;         // JS 函数大小
+    int64_t js_func_code_size;   // JS 函数代码大小
+    int64_t js_func_pc2line_count;  // PC 到行号映射计数
+    int64_t js_func_pc2line_size;   // PC 到行号映射大小
 } JSMemoryUsage_helper;
 
 static void compute_value_size(JSValueConst val, JSMemoryUsage_helper *hp);
 
+/**
+ * compute_jsstring_size - 计算字符串内存使用
+ * @str: 字符串指针
+ * @hp: 辅助结构指针
+ * 
+ * 说明：
+ * - Atom 字符串单独处理
+ * - 多重引用对象按引用计数分数计算
+ */
 static void compute_jsstring_size(JSString *str, JSMemoryUsage_helper *hp)
 {
     if (!str->atom_type) {  /* atoms are handled separately */
@@ -8434,6 +8569,16 @@ static void compute_jsstring_size(JSString *str, JSMemoryUsage_helper *hp)
     }
 }
 
+/**
+ * compute_bytecode_size - 计算字节码内存使用
+ * @b: 字节码指针
+ * @hp: 辅助结构指针
+ * 
+ * 说明：
+ * - 计算变量定义、常量池、闭包变量
+ * - 计算调试信息（源代码、PC2Line 表）
+ * - 递归计算常量池中的值
+ */
 static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *hp)
 {
     int memory_used_count, js_func_size, i;
@@ -8473,6 +8618,11 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
     hp->memory_used_count += memory_used_count;
 }
 
+/**
+ * compute_value_size - 计算 JSValue 内存使用
+ * @val: JSValue
+ * @hp: 辅助结构指针
+ */
 static void compute_value_size(JSValueConst val, JSMemoryUsage_helper *hp)
 {
     switch(JS_VALUE_GET_TAG(val)) {
@@ -8485,6 +8635,16 @@ static void compute_value_size(JSValueConst val, JSMemoryUsage_helper *hp)
     }
 }
 
+/**
+ * JS_ComputeMemoryUsage - 计算内存使用情况
+ * @rt: 运行时
+ * @s: 输出结构
+ * 
+ * 说明：
+ * - 遍历所有 GC 对象
+ * - 分类统计各种对象类型
+ * - 处理多重引用（分数计数）
+ */
 void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
 {
     struct list_head *el, *el1;
