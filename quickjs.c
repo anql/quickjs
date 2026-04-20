@@ -9066,11 +9066,24 @@ void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt)
     }
 }
 
+/**
+ * JS_GetGlobalObject - 获取全局对象
+ * @ctx: 上下文
+ * 返回: 全局对象 JSValue（增加引用计数）
+ */
 JSValue JS_GetGlobalObject(JSContext *ctx)
 {
     return JS_DupValue(ctx, ctx->global_obj);
 }
 
+/**
+ * JS_Throw - 抛出异常
+ * @ctx: 上下文
+ * @obj: 异常对象
+ * 返回: JS_EXCEPTION
+ * 
+ * 说明：obj 会被消耗（引用计数转移给 current_exception）
+ */
 /* WARNING: obj is freed */
 JSValue JS_Throw(JSContext *ctx, JSValue obj)
 {
@@ -9081,6 +9094,13 @@ JSValue JS_Throw(JSContext *ctx, JSValue obj)
     return JS_EXCEPTION;
 }
 
+/**
+ * JS_GetException - 获取待处理异常
+ * @ctx: 上下文
+ * 返回: 异常对象（不能调用两次）
+ * 
+ * 说明：获取后 current_exception 被重置为 UNINITIALIZED
+ */
 /* return the pending exception (cannot be called twice). */
 JSValue JS_GetException(JSContext *ctx)
 {
@@ -9091,11 +9111,28 @@ JSValue JS_GetException(JSContext *ctx)
     return val;
 }
 
+/**
+ * JS_HasException - 检查是否有异常
+ * @ctx: 上下文
+ * 返回: TRUE 有异常，FALSE 无异常
+ */
 JS_BOOL JS_HasException(JSContext *ctx)
 {
     return !JS_IsUninitialized(ctx->rt->current_exception);
 }
 
+/* ============================================================================
+ * LEB128 编码/解码
+ * 用于字节码中的 PC2Line 表压缩编码
+ * ============================================================================ */
+
+/**
+ * dbuf_put_leb128 - 写入无符号 LEB128 编码
+ * @s: 动态缓冲区
+ * @v: 要编码的值
+ * 
+ * 说明：可变长度编码，每 7 位一个字节，最高位表示是否继续
+ */
 static void dbuf_put_leb128(DynBuf *s, uint32_t v)
 {
     uint32_t a;
@@ -9111,12 +9148,26 @@ static void dbuf_put_leb128(DynBuf *s, uint32_t v)
     }
 }
 
+/**
+ * dbuf_put_sleb128 - 写入有符号 LEB128 编码
+ * @s: 动态缓冲区
+ * @v1: 要编码的有符号值
+ * 
+ * 说明：使用 ZigZag 编码将有符号数转为无符号再编码
+ */
 static void dbuf_put_sleb128(DynBuf *s, int32_t v1)
 {
     uint32_t v = v1;
     dbuf_put_leb128(s, (2 * v) ^ -(v >> 31));
 }
 
+/**
+ * get_leb128 - 读取无符号 LEB128 编码
+ * @pval: 输出参数，返回解码值
+ * @buf: 缓冲区
+ * @buf_end: 缓冲区末尾
+ * 返回: 读取的字节数，失败返回 -1
+ */
 static int get_leb128(uint32_t *pval, const uint8_t *buf,
                       const uint8_t *buf_end)
 {
@@ -9137,6 +9188,13 @@ static int get_leb128(uint32_t *pval, const uint8_t *buf,
     return -1;
 }
 
+/**
+ * get_sleb128 - 读取有符号 LEB128 编码
+ * @pval: 输出参数，返回解码值
+ * @buf: 缓冲区
+ * @buf_end: 缓冲区末尾
+ * 返回: 读取的字节数，失败返回 -1
+ */
 static int get_sleb128(int32_t *pval, const uint8_t *buf,
                        const uint8_t *buf_end)
 {
@@ -9147,10 +9205,23 @@ static int get_sleb128(int32_t *pval, const uint8_t *buf,
         *pval = 0;
         return -1;
     }
-    *pval = (val >> 1) ^ -(val & 1);
+    *pval = (val >> 1) ^ -(val & 1);  // ZigZag 解码
     return ret;
 }
 
+/**
+ * find_line_num - 根据 PC 查找源代码行号
+ * @ctx: 上下文
+ * @b: 函数字节码
+ * @pc_value: 程序计数器值（-1 表示获取函数定义位置）
+ * @pcol_num: 输出参数，返回列号
+ * 返回: 行号，失败返回 0
+ * 
+ * 说明：
+ * - 使用 PC2Line 表（LEB128 压缩编码）
+ * - 支持增量编码（差分行号和列号）
+ * - 调试信息被剥离时返回 0
+ */
 /* use pc_value = -1 to get the position of the function definition */
 static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
                          uint32_t pc_value, int *pcol_num)
@@ -9166,7 +9237,7 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
     p = b->debug.pc2line_buf;
     p_end = p + b->debug.pc2line_len;
 
-    /* get the function line and column numbers */
+    /* 获取函数行号和列号 */
     ret = get_leb128(&val, p, p_end);
     if (ret < 0)
         goto fail;
@@ -9184,6 +9255,7 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
         while (p < p_end) {
             op = *p++;
             if (op == 0) {
+                /* 大增量：使用完整 LEB128 编码 */
                 ret = get_leb128(&val, p, p_end);
                 if (ret < 0)
                     goto fail;
@@ -9195,6 +9267,7 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
                 p += ret;
                 new_line_num = line_num + v;
             } else {
+                /* 小增量：使用压缩编码 */
                 op -= PC2LINE_OP_FIRST;
                 pc += (op / PC2LINE_RANGE);
                 new_line_num = line_num + (op % PC2LINE_RANGE) + PC2LINE_BASE;
@@ -9219,6 +9292,18 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
     return 0;
 }
 
+/**
+ * get_prop_string - 获取对象的字符串属性（不执行 JS 代码）
+ * @ctx: 上下文
+ * @obj: 对象 JSValue
+ * @prop: 属性名 Atom
+ * 返回: C 字符串指针（需 JS_FreeCString 释放），失败返回 NULL
+ * 
+ * 说明：
+ * - 用于栈回溯和调试输出
+ * - 只查找自有属性或原型链一层
+ * - 仅处理普通字符串属性
+ */
 /* return a string property without executing arbitrary JS code (used
    when dumping the stack trace or in debug print). */
 static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop)
@@ -9233,8 +9318,7 @@ static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop
     p = JS_VALUE_GET_OBJ(obj);
     prs = find_own_property(&pr, p, prop);
     if (!prs) {
-        /* we look at one level in the prototype to handle the 'name'
-           field of the Error objects */
+        /* 查找原型链一层，用于处理 Error 对象的 'name' 字段 */
         p = p->shape->proto;
         if (!p)
             return NULL;
@@ -9251,8 +9335,23 @@ static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop
     return JS_ToCString(ctx, val);
 }
 
-#define JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL (1 << 0)
+#define JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL (1 << 0)  // 跳过第一层栈帧
 
+/**
+ * build_backtrace - 构建错误回溯信息
+ * @ctx: 上下文
+ * @error_obj: 错误对象
+ * @filename: 文件名（可选，用于解析错误）
+ * @line_num: 行号
+ * @col_num: 列号
+ * @backtrace_flags: 回溯标志
+ * 
+ * 说明：
+ * - 遍历当前栈帧
+ * - 获取函数名、文件名、行号、列号
+ * - 生成 stack 属性字符串
+ * - 设置 fileName、lineNumber、columnNumber 属性
+ */
 /* if filename != NULL, an additional level is added with the filename
    and line number information (used for parse error). */
 static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
@@ -9267,7 +9366,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
     JSObject *p;
 
     if (!JS_IsObject(error_obj))
-        return; /* protection in the out of memory case */
+        return; /* 内存不足时的保护 */
     
     js_dbuf_init(ctx, &dbuf);
     if (filename) {
@@ -9278,7 +9377,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
         str = JS_NewString(ctx, filename);
         if (JS_IsException(str))
             return;
-        /* Note: SpiderMonkey does that, could update once there is a standard */
+        /* Note: SpiderMonkey 也这样做，有标准后可更新 */
         if (JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_fileName, str,
                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0 ||
             JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_lineNumber, JS_NewInt32(ctx, line_num),
@@ -9336,6 +9435,17 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
                            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
 }
 
+/**
+ * is_backtrace_needed - 检查是否需要回溯
+ * @ctx: 上下文
+ * @obj: 对象 JSValue
+ * 返回: TRUE 需要回溯，FALSE 不需要
+ * 
+ * 说明：
+ * - 仅 Error 对象需要回溯
+ * - 已有 stack 属性的不需要
+ * - 重要：此函数不能抛出异常
+ */
 /* Note: it is important that no exception is returned by this function */
 static BOOL is_backtrace_needed(JSContext *ctx, JSValueConst obj)
 {
@@ -9350,11 +9460,31 @@ static BOOL is_backtrace_needed(JSContext *ctx, JSValueConst obj)
     return TRUE;
 }
 
+/**
+ * JS_NewError - 创建 Error 对象
+ * @ctx: 上下文
+ * 返回: Error 对象 JSValue
+ */
 JSValue JS_NewError(JSContext *ctx)
 {
     return JS_NewObjectClass(ctx, JS_CLASS_ERROR);
 }
 
+/**
+ * JS_ThrowError2 - 抛出错误（内部函数）
+ * @ctx: 上下文
+ * @error_num: 错误类型枚举
+ * @fmt: 格式化字符串
+ * @ap: 可变参数列表
+ * @add_backtrace: 是否添加回溯
+ * 返回: JS_EXCEPTION
+ * 
+ * 说明：
+ * - 格式化错误消息
+ * - 创建对应类型的 Error 对象
+ * - 设置 message 属性
+ * - 可选添加回溯信息
+ */
 static JSValue JS_ThrowError2(JSContext *ctx, JSErrorEnum error_num,
                               const char *fmt, va_list ap, BOOL add_backtrace)
 {
@@ -9365,7 +9495,7 @@ static JSValue JS_ThrowError2(JSContext *ctx, JSErrorEnum error_num,
     obj = JS_NewObjectProtoClass(ctx, ctx->native_error_proto[error_num],
                                  JS_CLASS_ERROR);
     if (unlikely(JS_IsException(obj))) {
-        /* out of memory: throw JS_NULL to avoid recursing */
+        /* 内存不足：抛出 JS_NULL 避免递归 */
         obj = JS_NULL;
     } else {
         JS_DefinePropertyValue(ctx, obj, JS_ATOM_message,
@@ -9379,6 +9509,18 @@ static JSValue JS_ThrowError2(JSContext *ctx, JSErrorEnum error_num,
     return ret;
 }
 
+/**
+ * JS_ThrowError - 抛出错误
+ * @ctx: 上下文
+ * @error_num: 错误类型
+ * @fmt: 格式化字符串
+ * @ap: 可变参数列表
+ * 返回: JS_EXCEPTION
+ * 
+ * 说明：
+ * - 字节码函数调用时稍后添加回溯
+ * - 内存不足时不添加回溯（避免递归）
+ */
 static JSValue JS_ThrowError(JSContext *ctx, JSErrorEnum error_num,
                              const char *fmt, va_list ap)
 {
@@ -9386,13 +9528,20 @@ static JSValue JS_ThrowError(JSContext *ctx, JSErrorEnum error_num,
     JSStackFrame *sf;
     BOOL add_backtrace;
 
-    /* the backtrace is added later if called from a bytecode function */
+    /* 如果是字节码函数调用，稍后添加回溯 */
     sf = rt->current_stack_frame;
     add_backtrace = !rt->in_out_of_memory &&
         (!sf || (JS_GetFunctionBytecode(sf->cur_func) == NULL));
     return JS_ThrowError2(ctx, error_num, fmt, ap, add_backtrace);
 }
 
+/**
+ * JS_ThrowSyntaxError - 抛出语法错误
+ * @ctx: 上下文
+ * @fmt: 格式化字符串
+ * @...: 可变参数
+ * 返回: JS_EXCEPTION
+ */
 JSValue __attribute__((format(printf, 2, 3))) JS_ThrowSyntaxError(JSContext *ctx, const char *fmt, ...)
 {
     JSValue val;
@@ -9404,6 +9553,13 @@ JSValue __attribute__((format(printf, 2, 3))) JS_ThrowSyntaxError(JSContext *ctx
     return val;
 }
 
+/**
+ * JS_ThrowTypeError - 抛出类型错误
+ * @ctx: 上下文
+ * @fmt: 格式化字符串
+ * @...: 可变参数
+ * 返回: JS_EXCEPTION
+ */
 JSValue __attribute__((format(printf, 2, 3))) JS_ThrowTypeError(JSContext *ctx, const char *fmt, ...)
 {
     JSValue val;
@@ -9415,6 +9571,16 @@ JSValue __attribute__((format(printf, 2, 3))) JS_ThrowTypeError(JSContext *ctx, 
     return val;
 }
 
+/**
+ * JS_ThrowTypeErrorOrFalse - 抛出类型错误或返回 FALSE
+ * @ctx: 上下文
+ * @flags: 属性标志（检查 THROW/THROW_STRICT）
+ * @fmt: 格式化字符串
+ * @...: 可变参数
+ * 返回: -1 抛出异常，FALSE 返回 false
+ * 
+ * 说明：用于属性设置失败时的处理
+ */
 static int __attribute__((format(printf, 3, 4))) JS_ThrowTypeErrorOrFalse(JSContext *ctx, int flags, const char *fmt, ...)
 {
     va_list ap;
@@ -9430,6 +9596,16 @@ static int __attribute__((format(printf, 3, 4))) JS_ThrowTypeErrorOrFalse(JSCont
     }
 }
 
+/**
+ * __JS_ThrowTypeErrorAtom - 抛出类型错误（带 Atom 参数）
+ * @ctx: 上下文
+ * @atom: Atom 参数（用于格式化字符串）
+ * @fmt: 格式化字符串
+ * @...: 可变参数
+ * 返回: JS_EXCEPTION
+ * 
+ * 注意：不要直接使用，使用宏 JS_ThrowTypeErrorAtom
+ */
 /* never use it directly */
 static JSValue __attribute__((format(printf, 3, 4))) __JS_ThrowTypeErrorAtom(JSContext *ctx, JSAtom atom, const char *fmt, ...)
 {
@@ -9438,6 +9614,16 @@ static JSValue __attribute__((format(printf, 3, 4))) __JS_ThrowTypeErrorAtom(JSC
                              JS_AtomGetStr(ctx, buf, sizeof(buf), atom));
 }
 
+/**
+ * __JS_ThrowSyntaxErrorAtom - 抛出语法错误（带 Atom 参数）
+ * @ctx: 上下文
+ * @atom: Atom 参数
+ * @fmt: 格式化字符串
+ * @...: 可变参数
+ * 返回: JS_EXCEPTION
+ * 
+ * 注意：不要直接使用，使用宏 JS_ThrowSyntaxErrorAtom
+ */
 /* never use it directly */
 static JSValue __attribute__((format(printf, 3, 4))) __JS_ThrowSyntaxErrorAtom(JSContext *ctx, JSAtom atom, const char *fmt, ...)
 {
@@ -9446,11 +9632,17 @@ static JSValue __attribute__((format(printf, 3, 4))) __JS_ThrowSyntaxErrorAtom(J
                              JS_AtomGetStr(ctx, buf, sizeof(buf), atom));
 }
 
-/* %s is replaced by 'atom'. The macro is used so that gcc can check
-    the format string. */
+/* %s 被 'atom' 替换。使用宏以便 gcc 检查格式化字符串。 */
 #define JS_ThrowTypeErrorAtom(ctx, fmt, atom) __JS_ThrowTypeErrorAtom(ctx, atom, fmt, "")
 #define JS_ThrowSyntaxErrorAtom(ctx, fmt, atom) __JS_ThrowSyntaxErrorAtom(ctx, atom, fmt, "")
 
+/**
+ * JS_ThrowTypeErrorReadOnly - 抛出只读错误
+ * @ctx: 上下文
+ * @flags: 属性标志
+ * @atom: 属性名 Atom
+ * 返回: -1 抛出异常，FALSE 返回 false
+ */
 static int JS_ThrowTypeErrorReadOnly(JSContext *ctx, int flags, JSAtom atom)
 {
     if ((flags & JS_PROP_THROW) ||
@@ -9462,6 +9654,13 @@ static int JS_ThrowTypeErrorReadOnly(JSContext *ctx, int flags, JSAtom atom)
     }
 }
 
+/**
+ * JS_ThrowReferenceError - 抛出引用错误
+ * @ctx: 上下文
+ * @fmt: 格式化字符串
+ * @...: 可变参数
+ * 返回: JS_EXCEPTION
+ */
 JSValue __attribute__((format(printf, 2, 3))) JS_ThrowReferenceError(JSContext *ctx, const char *fmt, ...)
 {
     JSValue val;
@@ -9473,6 +9672,13 @@ JSValue __attribute__((format(printf, 2, 3))) JS_ThrowReferenceError(JSContext *
     return val;
 }
 
+/**
+ * JS_ThrowRangeError - 抛出范围错误
+ * @ctx: 上下文
+ * @fmt: 格式化字符串
+ * @...: 可变参数
+ * 返回: JS_EXCEPTION
+ */
 JSValue __attribute__((format(printf, 2, 3))) JS_ThrowRangeError(JSContext *ctx, const char *fmt, ...)
 {
     JSValue val;
@@ -9484,6 +9690,13 @@ JSValue __attribute__((format(printf, 2, 3))) JS_ThrowRangeError(JSContext *ctx,
     return val;
 }
 
+/**
+ * JS_ThrowInternalError - 抛出内部错误
+ * @ctx: 上下文
+ * @fmt: 格式化字符串
+ * @...: 可变参数
+ * 返回: JS_EXCEPTION
+ */
 JSValue __attribute__((format(printf, 2, 3))) JS_ThrowInternalError(JSContext *ctx, const char *fmt, ...)
 {
     JSValue val;
@@ -9495,6 +9708,11 @@ JSValue __attribute__((format(printf, 2, 3))) JS_ThrowInternalError(JSContext *c
     return val;
 }
 
+/**
+ * JS_ThrowOutOfMemory - 抛出内存不足错误
+ * @ctx: 上下文
+ * 返回: JS_EXCEPTION
+ */
 JSValue JS_ThrowOutOfMemory(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
