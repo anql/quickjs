@@ -9712,6 +9712,10 @@ JSValue __attribute__((format(printf, 2, 3))) JS_ThrowInternalError(JSContext *c
  * JS_ThrowOutOfMemory - 抛出内存不足错误
  * @ctx: 上下文
  * 返回: JS_EXCEPTION
+ * 
+ * 说明：
+ * - 使用 in_out_of_memory 标志防止递归
+ * - 内存不足时再抛内存异常会导致无限递归
  */
 JSValue JS_ThrowOutOfMemory(JSContext *ctx)
 {
@@ -9724,16 +9728,34 @@ JSValue JS_ThrowOutOfMemory(JSContext *ctx)
     return JS_EXCEPTION;
 }
 
+/**
+ * JS_ThrowStackOverflow - 抛出栈溢出错误
+ * @ctx: 上下文
+ * 返回: JS_EXCEPTION
+ */
 static JSValue JS_ThrowStackOverflow(JSContext *ctx)
 {
     return JS_ThrowInternalError(ctx, "stack overflow");
 }
 
+/**
+ * JS_ThrowTypeErrorNotAnObject - 抛出"不是对象"类型错误
+ * @ctx: 上下文
+ * 返回: JS_EXCEPTION
+ */
 static JSValue JS_ThrowTypeErrorNotAnObject(JSContext *ctx)
 {
     return JS_ThrowTypeError(ctx, "not an object");
 }
 
+/**
+ * JS_ThrowTypeErrorNotAConstructor - 抛出"不是构造函数"类型错误
+ * @ctx: 上下文
+ * @func_obj: 函数对象
+ * 返回: JS_EXCEPTION
+ * 
+ * 说明：尝试获取函数名以提供更有用的错误消息
+ */
 static JSValue JS_ThrowTypeErrorNotAConstructor(JSContext *ctx,
                                                 JSValueConst func_obj)
 {
@@ -9750,11 +9772,22 @@ static JSValue JS_ThrowTypeErrorNotAConstructor(JSContext *ctx,
     return JS_EXCEPTION;
 }
 
+/**
+ * JS_ThrowTypeErrorNotASymbol - 抛出"不是 Symbol"类型错误
+ * @ctx: 上下文
+ * 返回: JS_EXCEPTION
+ */
 static JSValue JS_ThrowTypeErrorNotASymbol(JSContext *ctx)
 {
     return JS_ThrowTypeError(ctx, "not a symbol");
 }
 
+/**
+ * JS_ThrowReferenceErrorNotDefined - 抛出"未定义"引用错误
+ * @ctx: 上下文
+ * @name: 变量名 Atom
+ * 返回: JS_EXCEPTION
+ */
 static JSValue JS_ThrowReferenceErrorNotDefined(JSContext *ctx, JSAtom name)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
@@ -9762,6 +9795,12 @@ static JSValue JS_ThrowReferenceErrorNotDefined(JSContext *ctx, JSAtom name)
                                   JS_AtomGetStr(ctx, buf, sizeof(buf), name));
 }
 
+/**
+ * JS_ThrowReferenceErrorUninitialized - 抛出"未初始化"引用错误
+ * @ctx: 上下文
+ * @name: 变量名 Atom（JS_ATOM_NULL 表示词法变量）
+ * 返回: JS_EXCEPTION
+ */
 static JSValue JS_ThrowReferenceErrorUninitialized(JSContext *ctx, JSAtom name)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
@@ -9770,6 +9809,14 @@ static JSValue JS_ThrowReferenceErrorUninitialized(JSContext *ctx, JSAtom name)
                                   JS_AtomGetStr(ctx, buf, sizeof(buf), name));
 }
 
+/**
+ * JS_ThrowReferenceErrorUninitialized2 - 抛出"未初始化"引用错误（字节码版本）
+ * @ctx: 上下文
+ * @b: 函数字节码
+ * @idx: 变量索引
+ * @is_ref: 是否是闭包引用
+ * 返回: JS_EXCEPTION
+ */
 static JSValue JS_ThrowReferenceErrorUninitialized2(JSContext *ctx,
                                                     JSFunctionBytecode *b,
                                                     int idx, BOOL is_ref)
@@ -9778,13 +9825,19 @@ static JSValue JS_ThrowReferenceErrorUninitialized2(JSContext *ctx,
     if (is_ref) {
         atom = b->closure_var[idx].var_name;
     } else {
-        /* not present if the function is stripped and contains no eval() */
+        /* 如果函数被剥离且不含 eval() 则不存在 */
         if (b->vardefs)
             atom = b->vardefs[b->arg_count + idx].var_name;
     }
     return JS_ThrowReferenceErrorUninitialized(ctx, atom);
 }
 
+/**
+ * JS_ThrowTypeErrorInvalidClass - 抛出"无效类"类型错误
+ * @ctx: 上下文
+ * @class_id: 类 ID
+ * 返回: JS_EXCEPTION
+ */
 static JSValue JS_ThrowTypeErrorInvalidClass(JSContext *ctx, int class_id)
 {
     JSRuntime *rt = ctx->rt;
@@ -9793,12 +9846,28 @@ static JSValue JS_ThrowTypeErrorInvalidClass(JSContext *ctx, int class_id)
     return JS_ThrowTypeErrorAtom(ctx, "%s object expected", name);
 }
 
+/**
+ * JS_ThrowInterrupted - 抛出中断错误
+ * @ctx: 上下文
+ * 
+ * 说明：设置为不可捕获异常
+ */
 static void JS_ThrowInterrupted(JSContext *ctx)
 {
     JS_ThrowInternalError(ctx, "interrupted");
     JS_SetUncatchableException(ctx, TRUE);
 }
 
+/**
+ * __js_poll_interrupts - 轮询中断（慢速路径）
+ * @ctx: 上下文
+ * 返回: 0 正常，-1 中断
+ * 
+ * 说明：
+ * - 重置中断计数器
+ * - 调用用户中断处理器
+ * - 如果返回非 0 则抛出中断异常
+ */
 static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
@@ -9812,6 +9881,16 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
     return 0;
 }
 
+/**
+ * js_poll_interrupts - 轮询中断（快速路径内联）
+ * @ctx: 上下文
+ * 返回: 0 正常，-1 中断
+ * 
+ * 说明：
+ * - 减少中断计数器
+ * - 归零时调用慢速路径
+ * - 每执行一定数量字节码检查一次中断
+ */
 static inline __exception int js_poll_interrupts(JSContext *ctx)
 {
     if (unlikely(--ctx->interrupt_counter <= 0)) {
@@ -9821,6 +9900,13 @@ static inline __exception int js_poll_interrupts(JSContext *ctx)
     }
 }
 
+/**
+ * JS_SetImmutablePrototype - 设置对象原型不可变
+ * @ctx: 上下文
+ * @obj: 对象 JSValue
+ * 
+ * 说明：用于 Object.freeze 等操作
+ */
 static void JS_SetImmutablePrototype(JSContext *ctx, JSValueConst obj)
 {
     JSObject *p;
@@ -9830,6 +9916,22 @@ static void JS_SetImmutablePrototype(JSContext *ctx, JSValueConst obj)
     p->has_immutable_prototype = TRUE;
 }
 
+/**
+ * JS_SetPrototypeInternal - 设置对象原型（内部函数）
+ * @ctx: 上下文
+ * @obj: 对象 JSValue
+ * @proto_val: 新原型 JSValue（对象或 null）
+ * @throw_flag: 是否抛出异常（FALSE 表示来自 Reflect.setPrototypeOf）
+ * 返回: -1 异常，TRUE/FALSE 成功/失败
+ * 
+ * 说明：
+ * - 验证参数类型
+ * - 处理特殊对象（Proxy 等）
+ * - 检查原型不可变性
+ * - 检查对象可扩展性
+ * - 检测循环原型链
+ * - 更新 Shape 原型
+ */
 /* Return -1 (exception) or TRUE/FALSE. 'throw_flag' = FALSE indicates
    that it is called from Reflect.setPrototypeOf(). */
 static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
@@ -9878,7 +9980,7 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
 
     sh = p->shape;
     if (sh->proto == proto)
-        return TRUE;
+        return TRUE;  // 原型相同，无需修改
     if (unlikely(p->has_immutable_prototype)) {
         if (throw_flag) {
             JS_ThrowTypeError(ctx, "prototype is immutable");
@@ -9896,7 +9998,7 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         }
     }
     if (proto) {
-        /* check if there is a cycle */
+        /* 检查是否有循环 */
         p1 = proto;
         do {
             if (p1 == p) {
@@ -9907,7 +10009,7 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
                     return FALSE;
                 }
             }
-            /* Note: for Proxy objects, proto is NULL */
+            /* 注意：Proxy 对象的原型为 NULL */
             p1 = p1->shape->proto;
         } while (p1 != NULL);
         JS_DupValue(ctx, proto_val);
@@ -9923,12 +10025,27 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
     return TRUE;
 }
 
+/**
+ * JS_SetPrototype - 设置对象原型
+ * @ctx: 上下文
+ * @obj: 对象 JSValue
+ * @proto_val: 新原型 JSValue
+ * 返回: -1 异常，TRUE/FALSE 成功/失败
+ */
 /* return -1 (exception) or TRUE/FALSE */
 int JS_SetPrototype(JSContext *ctx, JSValueConst obj, JSValueConst proto_val)
 {
     return JS_SetPrototypeInternal(ctx, obj, proto_val, TRUE);
 }
 
+/**
+ * JS_GetPrototypePrimitive - 获取原始类型的原型
+ * @ctx: 上下文
+ * @val: JSValue
+ * 返回: 原型 JSValue 或 JS_NULL
+ * 
+ * 说明：仅适用于原始类型（Number、String、Boolean、Symbol、BigInt）
+ */
 /* Only works for primitive types, otherwise return JS_NULL. */
 static JSValueConst JS_GetPrototypePrimitive(JSContext *ctx, JSValueConst val)
 {
@@ -9961,6 +10078,17 @@ static JSValueConst JS_GetPrototypePrimitive(JSContext *ctx, JSValueConst val)
     return val;
 }
 
+/**
+ * JS_GetPrototype - 获取对象原型
+ * @ctx: 上下文
+ * @obj: 对象 JSValue
+ * 返回: 原型对象、JS_NULL 或 JS_EXCEPTION（特殊对象）
+ * 
+ * 说明：
+ * - 对象：返回 Shape 原型
+ * - 原始类型：返回对应包装类型的原型
+ * - 特殊对象：调用 exotic get_prototype 方法
+ */
 /* Return an Object, JS_NULL or JS_EXCEPTION in case of exotic object. */
 JSValue JS_GetPrototype(JSContext *ctx, JSValueConst obj)
 {
@@ -9985,6 +10113,12 @@ JSValue JS_GetPrototype(JSContext *ctx, JSValueConst obj)
     return val;
 }
 
+/**
+ * JS_GetPrototypeFree - 获取原型并释放原对象
+ * @ctx: 上下文
+ * @obj: 对象 JSValue（会被释放）
+ * 返回: 原型对象 JSValue
+ */
 static JSValue JS_GetPrototypeFree(JSContext *ctx, JSValue obj)
 {
     JSValue obj1;
