@@ -7035,6 +7035,11 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     return JS_MKPTR(JS_TAG_OBJECT, p);
 }
 
+/**
+ * get_proto_obj - 获取原型对象
+ * @proto_val: 原型 JSValue
+ * 返回: 对象指针，不是对象返回 NULL
+ */
 static JSObject *get_proto_obj(JSValueConst proto_val)
 {
     if (JS_VALUE_GET_TAG(proto_val) != JS_TAG_OBJECT)
@@ -7043,6 +7048,18 @@ static JSObject *get_proto_obj(JSValueConst proto_val)
         return JS_VALUE_GET_OBJ(proto_val);
 }
 
+/**
+ * JS_NewObjectProtoClass - 创建带原型和类的对象
+ * @ctx: 上下文
+ * @proto_val: 原型 JSValue（必须是对象或 JS_NULL）
+ * @class_id: 类 ID
+ * 返回: 对象 JSValue，失败抛出异常
+ * 
+ * 说明：
+ * - 查找可复用的空 Shape（优化）
+ * - 找不到则创建新 Shape
+ * - 使用 Shape 缓存避免重复创建相同布局
+ */
 /* WARNING: proto must be an object or JS_NULL */
 JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
                                JSClassID class_id)
@@ -7053,7 +7070,7 @@ JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
     proto = get_proto_obj(proto_val);
     sh = find_hashed_shape_proto(ctx->rt, proto);
     if (likely(sh)) {
-        sh = js_dup_shape(sh);
+        sh = js_dup_shape(sh);  // 复用已有 Shape
     } else {
         sh = js_new_shape(ctx, proto);
         if (!sh)
@@ -7062,6 +7079,18 @@ JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
     return JS_NewObjectFromShape(ctx, sh, class_id, NULL);
 }
 
+/**
+ * JS_NewObjectProtoClassAlloc - 创建对象（预分配属性空间）
+ * @ctx: 上下文
+ * @proto_val: 原型 JSValue
+ * @class_id: 类 ID
+ * @n_alloc_props: 预分配的属性数量
+ * 返回: 对象 JSValue
+ * 
+ * 说明：
+ * - Shape 不加入哈希表（用于原型、构造函数等）
+ * - 根据属性数量计算合适的哈希表大小
+ */
 /* WARNING: the shape is not hashed. It is used for objects where
    factorizing the shape is not relevant (prototypes, constructors) */
 static JSValue JS_NewObjectProtoClassAlloc(JSContext *ctx, JSValueConst proto_val,
@@ -7106,6 +7135,15 @@ static JSValue JS_GetObjectData(JSContext *ctx, JSValueConst obj)
 }
 #endif
 
+/**
+ * JS_SetObjectData - 设置对象数据
+ * @ctx: 上下文
+ * @obj: 对象 JSValue
+ * @val: 新值
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：用于包装对象（Number、String、Boolean、Symbol、Date、BigInt）
+ */
 static int JS_SetObjectData(JSContext *ctx, JSValueConst obj, JSValue val)
 {
     JSObject *p;
@@ -7120,9 +7158,7 @@ static int JS_SetObjectData(JSContext *ctx, JSValueConst obj, JSValue val)
         case JS_CLASS_DATE:
         case JS_CLASS_BIG_INT:
             JS_FreeValue(ctx, p->u.object_data);
-            p->u.object_data = val; /* for JS_CLASS_STRING, 'val' must
-                                       be JS_TAG_STRING (and not a
-                                       rope) */
+            p->u.object_data = val; /* 对于 JS_CLASS_STRING，val 必须是 JS_TAG_STRING（不能是绳索） */
             return 0;
         }
     }
@@ -7132,28 +7168,61 @@ static int JS_SetObjectData(JSContext *ctx, JSValueConst obj, JSValue val)
     return -1;
 }
 
+/**
+ * JS_NewObjectClass - 创建指定类的对象
+ * @ctx: 上下文
+ * @class_id: 类 ID
+ * 返回: 对象 JSValue
+ */
 JSValue JS_NewObjectClass(JSContext *ctx, int class_id)
 {
     return JS_NewObjectProtoClass(ctx, ctx->class_proto[class_id], class_id);
 }
 
+/**
+ * JS_NewObjectProto - 创建带指定原型的对象
+ * @ctx: 上下文
+ * @proto: 原型 JSValue
+ * 返回: 对象 JSValue
+ */
 JSValue JS_NewObjectProto(JSContext *ctx, JSValueConst proto)
 {
     return JS_NewObjectProtoClass(ctx, proto, JS_CLASS_OBJECT);
 }
 
+/**
+ * JS_NewArray - 创建数组
+ * @ctx: 上下文
+ * 返回: 数组 JSValue
+ * 
+ * 说明：使用预分配的 array_shape（优化）
+ */
 JSValue JS_NewArray(JSContext *ctx)
 {
     return JS_NewObjectFromShape(ctx, js_dup_shape(ctx->array_shape),
                                  JS_CLASS_ARRAY, NULL);
 }
 
+/**
+ * JS_NewObject - 创建普通对象 {}
+ * @ctx: 上下文
+ * 返回: 对象 JSValue
+ */
 JSValue JS_NewObject(JSContext *ctx)
 {
     /* inline JS_NewObjectClass(ctx, JS_CLASS_OBJECT); */
     return JS_NewObjectProtoClass(ctx, ctx->class_proto[JS_CLASS_OBJECT], JS_CLASS_OBJECT);
 }
 
+/**
+ * js_function_set_properties - 设置函数属性（name 和 length）
+ * @ctx: 上下文
+ * @func_obj: 函数对象
+ * @name: 函数名 Atom
+ * @len: 参数数量（length 属性值）
+ * 
+ * 说明：ES6 特性，length 可配置（与 ES5.1 不兼容）
+ */
 static void js_function_set_properties(JSContext *ctx, JSValueConst func_obj,
                                        JSAtom name, int len)
 {
@@ -7164,6 +7233,11 @@ static void js_function_set_properties(JSContext *ctx, JSValueConst func_obj,
                            JS_AtomToString(ctx, name), JS_PROP_CONFIGURABLE);
 }
 
+/**
+ * js_class_has_bytecode - 检查类是否有字节码
+ * @class_id: 类 ID
+ * 返回: TRUE 有字节码，FALSE 没有
+ */
 static BOOL js_class_has_bytecode(JSClassID class_id)
 {
     return (class_id == JS_CLASS_BYTECODE_FUNCTION ||
@@ -7172,6 +7246,11 @@ static BOOL js_class_has_bytecode(JSClassID class_id)
             class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION);
 }
 
+/**
+ * JS_GetFunctionBytecode - 获取函数字节码
+ * @val: JSValue
+ * 返回: 字节码指针，不是函数或无字节码返回 NULL（不抛异常）
+ */
 /* return NULL without exception if not a function or no bytecode */
 static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
 {
@@ -7184,6 +7263,14 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
     return p->u.func.function_bytecode;
 }
 
+/**
+ * js_method_set_home_object - 设置方法的 home_object（用于 super）
+ * @ctx: 上下文
+ * @func_obj: 函数对象
+ * @home_obj: home 对象
+ * 
+ * 说明：仅当 need_home_object=true 时设置
+ */
 static void js_method_set_home_object(JSContext *ctx, JSValueConst func_obj,
                                       JSValueConst home_obj)
 {
@@ -7209,6 +7296,14 @@ static void js_method_set_home_object(JSContext *ctx, JSValueConst func_obj,
     }
 }
 
+/**
+ * js_get_function_name - 获取函数名字符串
+ * @ctx: 上下文
+ * @name: 函数名 Atom
+ * 返回: 函数名字符串 JSValue
+ * 
+ * 说明：Symbol 名称用 [] 包裹
+ */
 static JSValue js_get_function_name(JSContext *ctx, JSAtom name)
 {
     JSValue name_str;
@@ -7220,6 +7315,20 @@ static JSValue js_get_function_name(JSContext *ctx, JSAtom name)
     return name_str;
 }
 
+/**
+ * js_method_set_properties - 设置方法属性（name 和 home_object）
+ * @ctx: 上下文
+ * @func_obj: 函数对象
+ * @name: 方法名 Atom
+ * @flags: 属性标志（JS_PROP_HAS_GET/SET）
+ * @home_obj: home 对象
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：
+ * - getter 方法名前加 "get "
+ * - setter 方法名前加 "set "
+ * - Symbol 名称用 [] 包裹
+ */
 /* Modify the name of a method according to the atom and
    'flags'. 'flags' is a bitmask of JS_PROP_HAS_GET and
    JS_PROP_HAS_SET. Also set the home object of the method.
@@ -7244,6 +7353,23 @@ static int js_method_set_properties(JSContext *ctx, JSValueConst func_obj,
     return 0;
 }
 
+/**
+ * JS_NewCFunction3 - 创建 C 函数（完整版本）
+ * @ctx: 上下文
+ * @func: C 函数指针
+ * @name: 函数名
+ * @length: 参数数量（length 属性）
+ * @cproto: 函数原型类型
+ * @magic: magic 值（用于区分同名函数）
+ * @proto_val: 原型 JSValue
+ * @n_fields: 预分配的字段数量
+ * 返回: 函数对象 JSValue
+ * 
+ * 说明：
+ * - 设置函数名和 length 属性
+ * - 判断是否是构造函数
+ * - 可预分配额外字段空间
+ */
 /* Note: at least 'length' arguments will be readable in 'argv' */
 static JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
                                 const char *name,
@@ -7283,6 +7409,16 @@ static JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
     return func_obj;
 }
 
+/**
+ * JS_NewCFunction2 - 创建 C 函数
+ * @ctx: 上下文
+ * @func: C 函数指针
+ * @name: 函数名
+ * @length: 参数数量
+ * @cproto: 函数原型类型
+ * @magic: magic 值
+ * 返回: 函数对象 JSValue
+ */
 /* Note: at least 'length' arguments will be readable in 'argv' */
 JSValue JS_NewCFunction2(JSContext *ctx, JSCFunction *func,
                          const char *name,
@@ -7292,14 +7428,25 @@ JSValue JS_NewCFunction2(JSContext *ctx, JSCFunction *func,
                             ctx->function_proto, 0);
 }
 
+/**
+ * JSCFunctionDataRecord - C 函数数据记录
+ * 用于存储带额外数据的 C 函数
+ */
 typedef struct JSCFunctionDataRecord {
-    JSCFunctionData *func;
-    uint8_t length;
-    uint8_t data_len;
-    uint16_t magic;
-    JSValue data[0];
+    JSCFunctionData *func;       // 函数指针
+    uint8_t length;              // 参数数量
+    uint8_t data_len;            // 数据数组长度
+    uint16_t magic;              // magic 值
+    JSValue data[0];             // 数据数组（柔性数组）
 } JSCFunctionDataRecord;
 
+/**
+ * js_c_function_data_finalizer - C 函数数据析构函数
+ * @rt: 运行时
+ * @val: 函数对象 JSValue
+ * 
+ * 说明：释放所有数据元素的引用
+ */
 static void js_c_function_data_finalizer(JSRuntime *rt, JSValue val)
 {
     JSCFunctionDataRecord *s = JS_GetOpaque(val, JS_CLASS_C_FUNCTION_DATA);
@@ -7313,6 +7460,12 @@ static void js_c_function_data_finalizer(JSRuntime *rt, JSValue val)
     }
 }
 
+/**
+ * js_c_function_data_mark - C 函数数据 GC 标记函数
+ * @rt: 运行时
+ * @val: 函数对象 JSValue
+ * @mark_func: 标记函数
+ */
 static void js_c_function_data_mark(JSRuntime *rt, JSValueConst val,
                                     JS_MarkFunc *mark_func)
 {
@@ -7326,6 +7479,18 @@ static void js_c_function_data_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
+/**
+ * js_c_function_data_call - C 函数数据调用函数
+ * @ctx: 上下文
+ * @func_obj: 函数对象
+ * @this_val: this 值
+ * @argc: 参数数量
+ * @argv: 参数数组
+ * @flags: 调用标志
+ * 返回: 函数返回值
+ * 
+ * 说明：参数不足时用 undefined 填充
+ */
 static JSValue js_c_function_data_call(JSContext *ctx, JSValueConst func_obj,
                                        JSValueConst this_val,
                                        int argc, JSValueConst *argv, int flags)
@@ -7348,6 +7513,21 @@ static JSValue js_c_function_data_call(JSContext *ctx, JSValueConst func_obj,
     return s->func(ctx, this_val, argc, arg_buf, s->magic, s->data);
 }
 
+/**
+ * JS_NewCFunctionData - 创建带数据的 C 函数
+ * @ctx: 上下文
+ * @func: 函数指针
+ * @length: 参数数量
+ * @magic: magic 值
+ * @data_len: 数据数量
+ * @data: 数据数组
+ * 返回: 函数对象 JSValue
+ * 
+ * 说明：
+ * - 函数携带额外的数据数组
+ * - 数据数组元素会被引用计数保护
+ * - 用于实现闭包、绑定参数等
+ */
 JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                             int length, int magic, int data_len,
                             JSValueConst *data)
@@ -7377,27 +7557,60 @@ JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
     return func_obj;
 }
 
+/**
+ * js_autoinit_get_realm - 获取自动初始化的 realm
+ * @pr: 属性指针
+ * 返回: 上下文指针
+ */
 static JSContext *js_autoinit_get_realm(JSProperty *pr)
 {
     return (JSContext *)(pr->u.init.realm_and_id & ~3);
 }
 
+/**
+ * js_autoinit_get_id - 获取自动初始化 ID
+ * @pr: 属性指针
+ * 返回: 初始化 ID 枚举值
+ */
 static JSAutoInitIDEnum js_autoinit_get_id(JSProperty *pr)
 {
     return pr->u.init.realm_and_id & 3;
 }
 
+/**
+ * js_autoinit_free - 释放自动初始化属性
+ * @rt: 运行时
+ * @pr: 属性指针
+ */
 static void js_autoinit_free(JSRuntime *rt, JSProperty *pr)
 {
     JS_FreeContext(js_autoinit_get_realm(pr));
 }
 
+/**
+ * js_autoinit_mark - 标记自动初始化属性
+ * @rt: 运行时
+ * @pr: 属性指针
+ * @mark_func: 标记函数
+ */
 static void js_autoinit_mark(JSRuntime *rt, JSProperty *pr,
                              JS_MarkFunc *mark_func)
 {
     mark_func(rt, &js_autoinit_get_realm(pr)->header);
 }
 
+/**
+ * free_property - 释放属性值
+ * @rt: 运行时
+ * @pr: 属性指针
+ * @prop_flags: 属性标志
+ * 
+ * 说明：
+ * - JS_PROP_GETSET: 释放 getter/setter
+ * - JS_PROP_VARREF: 释放变量引用
+ * - JS_PROP_AUTOINIT: 释放自动初始化
+ * - JS_PROP_NORMAL: 释放普通值
+ */
 static void free_property(JSRuntime *rt, JSProperty *pr, int prop_flags)
 {
     if (unlikely(prop_flags & JS_PROP_TMASK)) {
@@ -7416,6 +7629,14 @@ static void free_property(JSRuntime *rt, JSProperty *pr, int prop_flags)
     }
 }
 
+/**
+ * find_own_property1 - 查找自有属性（不返回属性值指针）
+ * @p: 对象
+ * @atom: 属性名 Atom
+ * 返回: Shape 属性指针，未找到返回 NULL
+ * 
+ * 说明：使用哈希表快速查找
+ */
 static force_inline JSShapeProperty *find_own_property1(JSObject *p,
                                                         JSAtom atom)
 {
@@ -7436,6 +7657,15 @@ static force_inline JSShapeProperty *find_own_property1(JSObject *p,
     return NULL;
 }
 
+/**
+ * find_own_property - 查找自有属性（返回属性值指针）
+ * @ppr: 输出参数，返回属性值指针
+ * @p: 对象
+ * @atom: 属性名 Atom
+ * 返回: Shape 属性指针，未找到返回 NULL
+ * 
+ * 说明：同时返回 Shape 属性和对象属性指针
+ */
 static force_inline JSShapeProperty *find_own_property(JSProperty **ppr,
                                                        JSObject *p,
                                                        JSAtom atom)
@@ -7451,7 +7681,7 @@ static force_inline JSShapeProperty *find_own_property(JSProperty **ppr,
         pr = &prop[h - 1];
         if (likely(pr->atom == atom)) {
             *ppr = &p->prop[h - 1];
-            /* the compiler should be able to assume that pr != NULL here */
+            /* 编译器应该能假设这里 pr != NULL */
             return pr;
         }
         h = pr->hash_next;
@@ -7460,11 +7690,30 @@ static force_inline JSShapeProperty *find_own_property(JSProperty **ppr,
     return NULL;
 }
 
+/**
+ * set_cycle_flag - 设置循环标志
+ * @ctx: 上下文
+ * @obj: 对象 JSValue
+ * 
+ * 说明：指示对象可能是函数原型循环的一部分（目前为空实现）
+ */
 /* indicate that the object may be part of a function prototype cycle */
 static void set_cycle_flag(JSContext *ctx, JSValueConst obj)
 {
 }
 
+/**
+ * free_var_ref - 释放变量引用
+ * @rt: 运行时
+ * @var_ref: 变量引用指针
+ * 
+ * 说明：
+ * - 引用计数减一
+ * - 归零时释放
+ * - detached 时释放值
+ * - 否则从栈帧移除
+ * - 异步函数需要特殊处理
+ */
 static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
 {
     if (var_ref) {
@@ -7487,6 +7736,13 @@ static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
     }
 }
 
+/**
+ * js_array_finalizer - 数组析构函数
+ * @rt: 运行时
+ * @val: 数组 JSValue
+ * 
+ * 说明：释放所有数组元素
+ */
 static void js_array_finalizer(JSRuntime *rt, JSValue val)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
