@@ -1594,14 +1594,20 @@ static const JSClassExoticMethods js_arguments_exotic_methods;
 static const JSClassExoticMethods js_string_exotic_methods;
 static const JSClassExoticMethods js_proxy_exotic_methods;
 static const JSClassExoticMethods js_module_ns_exotic_methods;
-static JSClassID js_class_id_alloc = JS_CLASS_INIT_COUNT;
+static JSClassID js_class_id_alloc = JS_CLASS_INIT_COUNT;  // 类 ID 分配计数器
 
+/* ============================================================================
+ * js_trigger_gc 函数
+ * 触发垃圾回收
+ * 当内存分配超过阈值时自动触发 GC
+ * ============================================================================ */
 static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     BOOL force_gc;
 #ifdef FORCE_GC_AT_MALLOC
-    force_gc = TRUE;
+    force_gc = TRUE;  // 调试模式：每次分配都触发 GC
 #else
+    // 当已分配大小 + 新请求大小超过 GC 阈值时触发
     force_gc = ((rt->malloc_state.malloc_size + size) >
                 rt->malloc_gc_threshold);
 #endif
@@ -1611,36 +1617,76 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
                (uint64_t)rt->malloc_state.malloc_size);
 #endif
         JS_RunGC(rt);
+        // 设置新的 GC 阈值为当前大小的 1.5 倍
         rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
             (rt->malloc_state.malloc_size >> 1);
     }
 }
 
+/* ============================================================================
+ * js_malloc_usable_size_unknown 函数
+ * 当平台不支持获取实际分配大小时的默认实现
+ * ============================================================================ */
 static size_t js_malloc_usable_size_unknown(const void *ptr)
 {
     return 0;
 }
 
+/* ============================================================================
+ * 运行时级别的内存分配函数
+ * 这些函数直接在 JSRuntime 级别操作，不抛出异常
+ * ============================================================================ */
+
+/**
+ * js_malloc_rt - 运行时级别分配
+ * @rt: 运行时实例
+ * @size: 分配大小
+ * 返回: 分配的内存指针，失败返回 NULL
+ */
 void *js_malloc_rt(JSRuntime *rt, size_t size)
 {
     return rt->mf.js_malloc(&rt->malloc_state, size);
 }
 
+/**
+ * js_free_rt - 运行时级别释放
+ * @rt: 运行时实例
+ * @ptr: 要释放的内存指针
+ */
 void js_free_rt(JSRuntime *rt, void *ptr)
 {
     rt->mf.js_free(&rt->malloc_state, ptr);
 }
 
+/**
+ * js_realloc_rt - 运行时级别重新分配
+ * @rt: 运行时实例
+ * @ptr: 原内存指针
+ * @size: 新大小
+ * 返回: 重新分配的内存指针，失败返回 NULL
+ */
 void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
 {
     return rt->mf.js_realloc(&rt->malloc_state, ptr, size);
 }
 
+/**
+ * js_malloc_usable_size_rt - 获取运行时分配的实际大小
+ * @rt: 运行时实例
+ * @ptr: 内存指针
+ * 返回: 实际可用的大小
+ */
 size_t js_malloc_usable_size_rt(JSRuntime *rt, const void *ptr)
 {
     return rt->mf.js_malloc_usable_size(ptr);
 }
 
+/**
+ * js_mallocz_rt - 运行时级别分配并清零
+ * @rt: 运行时实例
+ * @size: 分配大小
+ * 返回: 分配的内存指针（已清零），失败返回 NULL
+ */
 void *js_mallocz_rt(JSRuntime *rt, size_t size)
 {
     void *ptr;
@@ -1650,19 +1696,34 @@ void *js_mallocz_rt(JSRuntime *rt, size_t size)
     return memset(ptr, 0, size);
 }
 
-/* Throw out of memory in case of error */
+/* ============================================================================
+ * 上下文级别的内存分配函数
+ * 这些函数在分配失败时会抛出内存不足异常
+ * ============================================================================ */
+
+/**
+ * js_malloc - 上下文级别分配
+ * @ctx: 上下文实例
+ * @size: 分配大小
+ * 返回: 分配的内存指针，失败抛出异常并返回 NULL
+ */
 void *js_malloc(JSContext *ctx, size_t size)
 {
     void *ptr;
     ptr = js_malloc_rt(ctx->rt, size);
     if (unlikely(!ptr)) {
-        JS_ThrowOutOfMemory(ctx);
+        JS_ThrowOutOfMemory(ctx);  // 抛出内存不足异常
         return NULL;
     }
     return ptr;
 }
 
-/* Throw out of memory in case of error */
+/**
+ * js_mallocz - 上下文级别分配并清零
+ * @ctx: 上下文实例
+ * @size: 分配大小
+ * 返回: 分配的内存指针（已清零），失败抛出异常并返回 NULL
+ */
 void *js_mallocz(JSContext *ctx, size_t size)
 {
     void *ptr;
@@ -1674,12 +1735,23 @@ void *js_mallocz(JSContext *ctx, size_t size)
     return ptr;
 }
 
+/**
+ * js_free - 上下文级别释放
+ * @ctx: 上下文实例
+ * @ptr: 要释放的内存指针
+ */
 void js_free(JSContext *ctx, void *ptr)
 {
     js_free_rt(ctx->rt, ptr);
 }
 
-/* Throw out of memory in case of error */
+/**
+ * js_realloc - 上下文级别重新分配
+ * @ctx: 上下文实例
+ * @ptr: 原内存指针
+ * @size: 新大小
+ * 返回: 重新分配的内存指针，失败抛出异常并返回 NULL
+ */
 void *js_realloc(JSContext *ctx, void *ptr, size_t size)
 {
     void *ret;
@@ -1691,7 +1763,16 @@ void *js_realloc(JSContext *ctx, void *ptr, size_t size)
     return ret;
 }
 
-/* store extra allocated size in *pslack if successful */
+/**
+ * js_realloc2 - 上下文级别重新分配并返回空闲空间
+ * @ctx: 上下文实例
+ * @ptr: 原内存指针
+ * @size: 新大小
+ * @pslack: 输出参数，返回额外分配的空闲空间
+ * 返回: 重新分配的内存指针，失败抛出异常并返回 NULL
+ * 
+ * 说明：某些 malloc 实现会分配比请求更大的内存，此函数返回实际空闲空间
+ */
 void *js_realloc2(JSContext *ctx, void *ptr, size_t size, size_t *pslack)
 {
     void *ret;
@@ -1707,12 +1788,24 @@ void *js_realloc2(JSContext *ctx, void *ptr, size_t size, size_t *pslack)
     return ret;
 }
 
+/**
+ * js_malloc_usable_size - 获取上下文分配的实际大小
+ * @ctx: 上下文实例
+ * @ptr: 内存指针
+ * 返回: 实际可用的大小
+ */
 size_t js_malloc_usable_size(JSContext *ctx, const void *ptr)
 {
     return js_malloc_usable_size_rt(ctx->rt, ptr);
 }
 
-/* Throw out of memory exception in case of error */
+/**
+ * js_strndup - 字符串复制（指定长度）
+ * @ctx: 上下文实例
+ * @s: 源字符串
+ * @n: 复制长度
+ * 返回: 新字符串，失败抛出异常并返回 NULL
+ */
 char *js_strndup(JSContext *ctx, const char *s, size_t n)
 {
     char *ptr;
@@ -1724,29 +1817,57 @@ char *js_strndup(JSContext *ctx, const char *s, size_t n)
     return ptr;
 }
 
+/**
+ * js_strdup - 字符串复制
+ * @ctx: 上下文实例
+ * @str: 源字符串
+ * 返回: 新字符串，失败抛出异常并返回 NULL
+ */
 char *js_strdup(JSContext *ctx, const char *str)
 {
     return js_strndup(ctx, str, strlen(str));
 }
 
+/* ============================================================================
+ * js_realloc_array 函数
+ * 重新分配数组，使用 1.5 倍增长策略
+ * @ctx: 上下文
+ * @parray: 数组指针的指针
+ * @elem_size: 元素大小
+ * @psize: 当前大小的指针
+ * @req_size: 请求的大小
+ * 返回: 0 成功，-1 失败
+ * ============================================================================ */
 static no_inline int js_realloc_array(JSContext *ctx, void **parray,
                                       int elem_size, int *psize, int req_size)
 {
     int new_size;
     size_t slack;
     void *new_array;
-    /* XXX: potential arithmetic overflow */
+    /* XXX: 潜在的算术溢出 */
+    // 使用 1.5 倍增长策略，避免频繁重新分配
     new_size = max_int(req_size, *psize * 3 / 2);
     new_array = js_realloc2(ctx, *parray, new_size * elem_size, &slack);
     if (!new_array)
         return -1;
+    // 加上额外分配的空闲空间
     new_size += slack / elem_size;
     *psize = new_size;
     *parray = new_array;
     return 0;
 }
 
-/* resize the array and update its size if req_size > *psize */
+/**
+ * js_resize_array - 调整数组大小
+ * @ctx: 上下文
+ * @parray: 数组指针的指针
+ * @elem_size: 元素大小
+ * @psize: 当前大小的指针
+ * @req_size: 请求的大小
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：仅当请求大小大于当前大小时才重新分配
+ */
 static inline int js_resize_array(JSContext *ctx, void **parray, int elem_size,
                                   int *psize, int req_size)
 {
@@ -1756,63 +1877,130 @@ static inline int js_resize_array(JSContext *ctx, void **parray, int elem_size,
         return 0;
 }
 
+/**
+ * js_dbuf_init - 初始化动态缓冲区
+ * @ctx: 上下文
+ * @s: 动态缓冲区结构
+ * 
+ * 说明：使用 js_realloc_rt 作为重新分配函数
+ */
 static inline void js_dbuf_init(JSContext *ctx, DynBuf *s)
 {
     dbuf_init2(s, ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
 }
 
+/**
+ * js_realloc_bytecode_rt - 字节码重新分配函数
+ * @opaque: 用户数据（JSRuntime）
+ * @ptr: 原指针
+ * @size: 新大小
+ * 返回: 重新分配的指针
+ * 
+ * 说明：限制字节码大小不超过 2GB，避免溢出
+ */
 static void *js_realloc_bytecode_rt(void *opaque, void *ptr, size_t size)
 {
     JSRuntime *rt = opaque;
     if (size > (INT32_MAX / 2)) {
-        /* the bytecode cannot be larger than 2G. Leave some slack to 
-           avoid some overflows. */
+        /* 字节码不能大于 2G。留一些余量以避免溢出。 */
         return NULL;
     } else {
         return rt->mf.js_realloc(&rt->malloc_state, ptr, size);
     }
 }
 
+/**
+ * js_dbuf_bytecode_init - 初始化字节码动态缓冲区
+ * @ctx: 上下文
+ * @s: 动态缓冲区结构
+ * 
+ * 说明：使用 js_realloc_bytecode_rt 作为重新分配函数
+ */
 static inline void js_dbuf_bytecode_init(JSContext *ctx, DynBuf *s)
 {
     dbuf_init2(s, ctx->rt, js_realloc_bytecode_rt);
 }
 
+/* ============================================================================
+ * 辅助函数
+ * ============================================================================ */
+
+/**
+ * is_digit - 判断字符是否是数字
+ * @c: 字符
+ * 返回: TRUE/FALSE
+ */
 static inline int is_digit(int c) {
     return c >= '0' && c <= '9';
 }
 
+/**
+ * string_get - 获取字符串指定位置的字符
+ * @p: 字符串指针
+ * @idx: 索引
+ * 返回: 字符值
+ * 
+ * 说明：根据 is_wide_char 自动选择 8 位或 16 位访问
+ */
 static inline int string_get(const JSString *p, int idx) {
     return p->is_wide_char ? p->u.str16[idx] : p->u.str8[idx];
 }
 
+/* ============================================================================
+ * JSClassShortDef 结构
+ * 类定义的简化版本，用于初始化标准类
+ * ============================================================================ */
 typedef struct JSClassShortDef {
-    JSAtom class_name;
-    JSClassFinalizer *finalizer;
-    JSClassGCMark *gc_mark;
+    JSAtom class_name;               // 类名
+    JSClassFinalizer *finalizer;     // 析构函数
+    JSClassGCMark *gc_mark;          // GC 标记函数
 } JSClassShortDef;
 
+/* ============================================================================
+ * js_std_class_def - 标准类定义表
+ * 定义所有内置类的名称、析构函数和 GC 标记函数
+ * 按 JS_CLASS_* 枚举顺序排列
+ * ============================================================================ */
 static JSClassShortDef const js_std_class_def[] = {
+    // 基础对象类
     { JS_ATOM_Object, NULL, NULL },                             /* JS_CLASS_OBJECT */
     { JS_ATOM_Array, js_array_finalizer, js_array_mark },       /* JS_CLASS_ARRAY */
-    { JS_ATOM_Error, NULL, NULL }, /* JS_CLASS_ERROR */
-    { JS_ATOM_Number, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_NUMBER */
-    { JS_ATOM_String, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_STRING */
-    { JS_ATOM_Boolean, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_BOOLEAN */
-    { JS_ATOM_Symbol, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_SYMBOL */
-    { JS_ATOM_Arguments, js_array_finalizer, js_array_mark },   /* JS_CLASS_ARGUMENTS */
+    { JS_ATOM_Error, NULL, NULL },                              /* JS_CLASS_ERROR */
+    
+    // 包装对象类
+    { JS_ATOM_Number, js_object_data_finalizer, js_object_data_mark },    /* JS_CLASS_NUMBER */
+    { JS_ATOM_String, js_object_data_finalizer, js_object_data_mark },    /* JS_CLASS_STRING */
+    { JS_ATOM_Boolean, js_object_data_finalizer, js_object_data_mark },   /* JS_CLASS_BOOLEAN */
+    { JS_ATOM_Symbol, js_object_data_finalizer, js_object_data_mark },    /* JS_CLASS_SYMBOL */
+    
+    // arguments 对象
+    { JS_ATOM_Arguments, js_array_finalizer, js_array_mark },             /* JS_CLASS_ARGUMENTS */
     { JS_ATOM_Arguments, js_mapped_arguments_finalizer, js_mapped_arguments_mark }, /* JS_CLASS_MAPPED_ARGUMENTS */
-    { JS_ATOM_Date, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_DATE */
+    
+    // Date 对象
+    { JS_ATOM_Date, js_object_data_finalizer, js_object_data_mark },      /* JS_CLASS_DATE */
+    
+    // 模块命名空间
     { JS_ATOM_Object, NULL, NULL },                             /* JS_CLASS_MODULE_NS */
-    { JS_ATOM_Function, js_c_function_finalizer, js_c_function_mark }, /* JS_CLASS_C_FUNCTION */
+    
+    // 函数类
+    { JS_ATOM_Function, js_c_function_finalizer, js_c_function_mark },         /* JS_CLASS_C_FUNCTION */
     { JS_ATOM_Function, js_bytecode_function_finalizer, js_bytecode_function_mark }, /* JS_CLASS_BYTECODE_FUNCTION */
     { JS_ATOM_Function, js_bound_function_finalizer, js_bound_function_mark }, /* JS_CLASS_BOUND_FUNCTION */
     { JS_ATOM_Function, js_c_function_data_finalizer, js_c_function_data_mark }, /* JS_CLASS_C_FUNCTION_DATA */
     { JS_ATOM_GeneratorFunction, js_bytecode_function_finalizer, js_bytecode_function_mark },  /* JS_CLASS_GENERATOR_FUNCTION */
-    { JS_ATOM_ForInIterator, js_for_in_iterator_finalizer, js_for_in_iterator_mark },      /* JS_CLASS_FOR_IN_ITERATOR */
+    
+    // 迭代器
+    { JS_ATOM_ForInIterator, js_for_in_iterator_finalizer, js_for_in_iterator_mark }, /* JS_CLASS_FOR_IN_ITERATOR */
+    
+    // RegExp
     { JS_ATOM_RegExp, js_regexp_finalizer, NULL },                              /* JS_CLASS_REGEXP */
+    
+    // ArrayBuffer 和 SharedArrayBuffer
     { JS_ATOM_ArrayBuffer, js_array_buffer_finalizer, NULL },                   /* JS_CLASS_ARRAY_BUFFER */
     { JS_ATOM_SharedArrayBuffer, js_array_buffer_finalizer, NULL },             /* JS_CLASS_SHARED_ARRAY_BUFFER */
+    
+    // 类型化数组
     { JS_ATOM_Uint8ClampedArray, js_typed_array_finalizer, js_typed_array_mark }, /* JS_CLASS_UINT8C_ARRAY */
     { JS_ATOM_Int8Array, js_typed_array_finalizer, js_typed_array_mark },       /* JS_CLASS_INT8_ARRAY */
     { JS_ATOM_Uint8Array, js_typed_array_finalizer, js_typed_array_mark },      /* JS_CLASS_UINT8_ARRAY */
@@ -1826,11 +2014,17 @@ static JSClassShortDef const js_std_class_def[] = {
     { JS_ATOM_Float32Array, js_typed_array_finalizer, js_typed_array_mark },    /* JS_CLASS_FLOAT32_ARRAY */
     { JS_ATOM_Float64Array, js_typed_array_finalizer, js_typed_array_mark },    /* JS_CLASS_FLOAT64_ARRAY */
     { JS_ATOM_DataView, js_typed_array_finalizer, js_typed_array_mark },        /* JS_CLASS_DATAVIEW */
-    { JS_ATOM_BigInt, js_object_data_finalizer, js_object_data_mark },      /* JS_CLASS_BIG_INT */
+    
+    // BigInt
+    { JS_ATOM_BigInt, js_object_data_finalizer, js_object_data_mark },          /* JS_CLASS_BIG_INT */
+    
+    // Map/Set 集合
     { JS_ATOM_Map, js_map_finalizer, js_map_mark },             /* JS_CLASS_MAP */
     { JS_ATOM_Set, js_map_finalizer, js_map_mark },             /* JS_CLASS_SET */
     { JS_ATOM_WeakMap, js_map_finalizer, js_map_mark },         /* JS_CLASS_WEAKMAP */
     { JS_ATOM_WeakSet, js_map_finalizer, js_map_mark },         /* JS_CLASS_WEAKSET */
+    
+    // 迭代器
     { JS_ATOM_Iterator, NULL, NULL },                           /* JS_CLASS_ITERATOR */
     { JS_ATOM_IteratorConcat, js_iterator_concat_finalizer, js_iterator_concat_mark }, /* JS_CLASS_ITERATOR_CONCAT */
     { JS_ATOM_IteratorHelper, js_iterator_helper_finalizer, js_iterator_helper_mark }, /* JS_CLASS_ITERATOR_HELPER */
@@ -1841,6 +2035,8 @@ static JSClassShortDef const js_std_class_def[] = {
     { JS_ATOM_String_Iterator, js_array_iterator_finalizer, js_array_iterator_mark }, /* JS_CLASS_STRING_ITERATOR */
     { JS_ATOM_RegExp_String_Iterator, js_regexp_string_iterator_finalizer, js_regexp_string_iterator_mark }, /* JS_CLASS_REGEXP_STRING_ITERATOR */
     { JS_ATOM_Generator, js_generator_finalizer, js_generator_mark }, /* JS_CLASS_GENERATOR */
+    
+    // 全局对象
     { JS_ATOM_Object, js_global_object_finalizer, js_global_object_mark }, /* JS_CLASS_GLOBAL_OBJECT */
     { JS_ATOM_Object, NULL, NULL }, /* JS_CLASS_RAWJSON */
 };
