@@ -2202,6 +2202,23 @@ static void js_def_free(JSMallocState *s, void *ptr)
     free(ptr);
 }
 
+/* ============================================================================
+ * 默认内存分配函数实现
+ * 使用系统 malloc/free/realloc，带内存限制功能
+ * ============================================================================ */
+
+/**
+ * js_def_realloc - 默认重新分配函数
+ * @s: 内存分配状态
+ * @ptr: 原指针（NULL 表示新分配）
+ * @size: 新大小（0 表示释放）
+ * 返回: 重新分配的指针，失败返回 NULL
+ * 
+ * 说明：
+ * - ptr=NULL 且 size>0: 相当于 malloc
+ * - ptr!=NULL 且 size=0: 相当于 free
+ * - 检查内存限制
+ */
 static void *js_def_realloc(JSMallocState *s, void *ptr, size_t size)
 {
     size_t old_size;
@@ -2218,6 +2235,7 @@ static void *js_def_realloc(JSMallocState *s, void *ptr, size_t size)
         free(ptr);
         return NULL;
     }
+    // 检查内存限制
     if (s->malloc_size + size - old_size > s->malloc_limit)
         return NULL;
 
@@ -2229,6 +2247,7 @@ static void *js_def_realloc(JSMallocState *s, void *ptr, size_t size)
     return ptr;
 }
 
+/* 默认内存分配函数表 */
 static const JSMallocFunctions def_malloc_funcs = {
     js_def_malloc,
     js_def_free,
@@ -2236,53 +2255,122 @@ static const JSMallocFunctions def_malloc_funcs = {
     js_def_malloc_usable_size,
 };
 
+/**
+ * JS_NewRuntime - 创建新的运行时（使用默认内存分配器）
+ * 返回: JSRuntime 指针，失败返回 NULL
+ * 
+ * 说明：这是最常用的运行时创建函数，使用系统默认 malloc/free
+ */
 JSRuntime *JS_NewRuntime(void)
 {
     return JS_NewRuntime2(&def_malloc_funcs, NULL);
 }
 
+/**
+ * JS_SetMemoryLimit - 设置运行时内存限制
+ * @rt: 运行时实例
+ * @limit: 内存限制（字节），-1 表示无限制
+ * 
+ * 说明：超过限制后 malloc 会失败，触发 GC 或返回 NULL
+ */
 void JS_SetMemoryLimit(JSRuntime *rt, size_t limit)
 {
     rt->malloc_state.malloc_limit = limit;
 }
 
-/* use -1 to disable automatic GC */
+/**
+ * JS_SetGCThreshold - 设置 GC 阈值
+ * @rt: 运行时实例
+ * @gc_threshold: GC 触发阈值（字节），-1 禁用自动 GC
+ * 
+ * 说明：当已分配内存超过此阈值时触发 GC
+ */
 void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold)
 {
     rt->malloc_gc_threshold = gc_threshold;
 }
 
+/* 防止在 QuickJS 代码中使用系统 malloc/free/realloc */
 #define malloc(s) malloc_is_forbidden(s)
 #define free(p) free_is_forbidden(p)
 #define realloc(p,s) realloc_is_forbidden(p,s)
 
+/**
+ * JS_SetInterruptHandler - 设置中断处理器
+ * @rt: 运行时实例
+ * @cb: 中断回调函数（返回非 0 表示需要中断）
+ * @opaque: 用户数据
+ * 
+ * 说明：用于实现执行超时、调试断点等功能。
+ * 每次执行一定数量的字节码后调用此回调。
+ */
 void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
 {
     rt->interrupt_handler = cb;
     rt->interrupt_opaque = opaque;
 }
 
+/**
+ * JS_SetCanBlock - 设置是否可以阻塞
+ * @rt: 运行时实例
+ * @can_block: TRUE 表示允许阻塞（启用 Atomics.wait）
+ * 
+ * 说明：在浏览器环境中通常设置为 FALSE
+ */
 void JS_SetCanBlock(JSRuntime *rt, BOOL can_block)
 {
     rt->can_block = can_block;
 }
 
+/**
+ * JS_SetSharedArrayBufferFunctions - 设置 SharedArrayBuffer 函数
+ * @rt: 运行时实例
+ * @sf: SharedArrayBuffer 函数表
+ * 
+ * 说明：用于自定义 SharedArrayBuffer 的分配/释放行为
+ */
 void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
                                       const JSSharedArrayBufferFunctions *sf)
 {
     rt->sab_funcs = *sf;
 }
 
+/**
+ * JS_SetStripInfo - 设置调试信息剥离标志
+ * @rt: 运行时实例
+ * @flags: 剥离标志（JS_STRIP_SOURCE | JS_STRIP_DEBUG）
+ * 
+ * 说明：用于减少编译后代码的内存占用
+ */
 void JS_SetStripInfo(JSRuntime *rt, int flags)
 {
     rt->strip_flags = flags;
 }
 
+/**
+ * JS_GetStripInfo - 获取调试信息剥离标志
+ * @rt: 运行时实例
+ * 返回: 剥离标志
+ */
 int JS_GetStripInfo(JSRuntime *rt)
 {
     return rt->strip_flags;
 }
 
+/* ============================================================================
+ * Job（微任务）队列管理
+ * 用于实现 Promise 微任务、async/await 等
+ * ============================================================================ */
+
+/**
+ * JS_EnqueueJob2 - 入队 Job（内部版本）
+ * @ctx: 上下文
+ * @job_func: Job 函数
+ * @argc: 参数数量
+ * @argv: 参数数组
+ * @no_exception: 是否不抛出异常（用于内部清理）
+ * 返回: 0 成功，-1 失败
+ */
 static int JS_EnqueueJob2(JSContext *ctx, JSJobFunc *job_func,
                           int argc, JSValueConst *argv, BOOL no_exception)
 {
@@ -2290,39 +2378,62 @@ static int JS_EnqueueJob2(JSContext *ctx, JSJobFunc *job_func,
     JSJobEntry *e;
     int i;
 
+    // 根据 no_exception 选择内存分配函数
     if (no_exception)
         e = js_malloc_rt(ctx->rt, sizeof(*e) + argc * sizeof(JSValue));
     else
         e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
     if (!e)
         return -1;
-    e->realm = JS_DupContext(ctx);
+    e->realm = JS_DupContext(ctx);  // 增加上下文引用
     e->job_func = job_func;
     e->argc = argc;
+    // 复制参数（增加引用计数）
     for(i = 0; i < argc; i++) {
         e->argv[i] = JS_DupValue(ctx, argv[i]);
     }
-    list_add_tail(&e->link, &rt->job_list);
+    list_add_tail(&e->link, &rt->job_list);  // 加入队列尾部
     return 0;
 }
 
-/* return 0 if OK, < 0 if exception */
+/**
+ * JS_EnqueueJob - 入队 Job
+ * @ctx: 上下文
+ * @job_func: Job 函数
+ * @argc: 参数数量
+ * @argv: 参数数组
+ * 返回: 0 成功，-1 失败（抛出异常）
+ * 
+ * 说明：用于将微任务加入队列，在下一个事件循环执行
+ */
 int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                   int argc, JSValueConst *argv)
 {
     return JS_EnqueueJob2(ctx, job_func, argc, argv, FALSE);
 }
 
+/**
+ * JS_IsJobPending - 检查是否有待处理的 Job
+ * @rt: 运行时实例
+ * 返回: TRUE 有待处理的 Job，FALSE 无
+ */
 BOOL JS_IsJobPending(JSRuntime *rt)
 {
     return !list_empty(&rt->job_list);
 }
 
-/* return < 0 if exception, 0 if no job pending, 1 if a job was
-   executed successfully. The context of the job is stored in '*pctx'
-   if pctx != NULL. It may be NULL if the context was already
-   destroyed or if no job was pending. The 'pctx' parameter is now
-   absolete. */
+/**
+ * JS_ExecutePendingJob - 执行待处理的 Job
+ * @rt: 运行时实例
+ * @pctx: 输出参数，返回 Job 所属的上下文（可为 NULL）
+ * 返回: <0 异常，0 无 Job，1 成功执行
+ * 
+ * 说明：
+ * - 执行队列中的第一个 Job
+ * - 执行后从队列中移除
+ * - 如果上下文引用计数为 1，*pctx 设为 NULL（上下文将被销毁）
+ * - pctx 参数现已废弃，但保留以兼容旧代码
+ */
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
 {
     JSContext *ctx;
@@ -2336,11 +2447,12 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
         return 0;
     }
 
-    /* get the first pending job and execute it */
+    /* 获取并执行第一个待处理的 Job */
     e = list_entry(rt->job_list.next, JSJobEntry, link);
-    list_del(&e->link);
+    list_del(&e->link);  // 从队列移除
     ctx = e->realm;
-    res = e->job_func(ctx, e->argc, (JSValueConst *)e->argv);
+    res = e->job_func(ctx, e->argc, (JSValueConst *)e->argv);  // 执行 Job
+    // 释放参数
     for(i = 0; i < e->argc; i++)
         JS_FreeValue(ctx, e->argv[i]);
     if (JS_IsException(res))
@@ -2348,14 +2460,14 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     else
         ret = 1;
     JS_FreeValue(ctx, res);
-    js_free(ctx, e);
+    js_free(ctx, e);  // 释放 Job 条目
     if (pctx) {
         if (ctx->header.ref_count > 1)
-            *pctx = ctx;
+            *pctx = ctx;  // 上下文仍被引用
         else
-            *pctx = NULL;
+            *pctx = NULL;  // 上下文将被销毁
     }
-    JS_FreeContext(ctx);
+    JS_FreeContext(ctx);  // 减少上下文引用
     return ret;
 }
 
