@@ -4180,11 +4180,28 @@ JSValue JS_AtomToValue(JSContext *ctx, JSAtom atom)
     return __JS_AtomToValue(ctx, atom, FALSE);
 }
 
+/**
+ * JS_AtomToString - 将 Atom 转换为字符串 JSValue
+ * @ctx: 上下文
+ * @atom: Atom 值
+ * 返回: 字符串 JSValue
+ * 
+ * 说明：强制转换为字符串，即使是 Symbol
+ */
 JSValue JS_AtomToString(JSContext *ctx, JSAtom atom)
 {
     return __JS_AtomToValue(ctx, atom, TRUE);
 }
 
+/**
+ * JS_AtomIsArrayIndex - 检查 Atom 是否是数组索引
+ * @ctx: 上下文
+ * @pval: 输出参数，返回索引值
+ * @atom: Atom 值
+ * 返回: TRUE 是数组索引（0 <= index <= 2^32-2），FALSE 不是
+ * 
+ * 说明：用于优化数组属性访问
+ */
 /* return TRUE if the atom is an array index (i.e. 0 <= index <=
    2^32-2 and return its value */
 static BOOL JS_AtomIsArrayIndex(JSContext *ctx, uint32_t *pval, JSAtom atom)
@@ -4210,6 +4227,15 @@ static BOOL JS_AtomIsArrayIndex(JSContext *ctx, uint32_t *pval, JSAtom atom)
     }
 }
 
+/**
+ * JS_AtomIsNumericIndex1 - 检查 Atom 是否是数字索引（返回 JSValue）
+ * @ctx: 上下文
+ * @atom: Atom 值
+ * 返回: 数字 JSValue、JS_UNDEFINED（不是数字）、JS_EXCEPTION（异常）
+ * 
+ * 说明：实现 ECMA CanonicalNumericIndexString 原始操作
+ * 对于常见值（-0、Infinity、NaN）有快速路径
+ */
 /* This test must be fast if atom is not a numeric index (e.g. a
    method name). Return JS_UNDEFINED if not a numeric
    index. JS_EXCEPTION can also be returned. */
@@ -4227,6 +4253,7 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
     p1 = rt->atom_array[atom];
     if (p1->atom_type != JS_ATOM_TYPE_STRING)
         return JS_UNDEFINED;
+    // 快速路径：常见数字值
     switch(atom) {
     case JS_ATOM_minus_zero:
         return __JS_NewFloat64(ctx, -0.0);
@@ -4264,6 +4291,12 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
     }
 }
 
+/**
+ * JS_AtomIsNumericIndex - 检查 Atom 是否是数字索引
+ * @ctx: 上下文
+ * @atom: Atom 值
+ * 返回: -1 异常，TRUE/FALSE
+ */
 /* return -1 if exception or TRUE/FALSE */
 static int JS_AtomIsNumericIndex(JSContext *ctx, JSAtom atom)
 {
@@ -4277,18 +4310,38 @@ static int JS_AtomIsNumericIndex(JSContext *ctx, JSAtom atom)
     return TRUE;
 }
 
+/**
+ * JS_FreeAtom - 释放 Atom（上下文级别）
+ * @ctx: 上下文
+ * @v: Atom 值
+ * 
+ * 说明：常量 Atom 不需要释放
+ */
 void JS_FreeAtom(JSContext *ctx, JSAtom v)
 {
     if (!__JS_AtomIsConst(v))
         __JS_FreeAtom(ctx->rt, v);
 }
 
+/**
+ * JS_FreeAtomRT - 释放 Atom（运行时级别）
+ * @rt: 运行时
+ * @v: Atom 值
+ */
 void JS_FreeAtomRT(JSRuntime *rt, JSAtom v)
 {
     if (!__JS_AtomIsConst(v))
         __JS_FreeAtom(rt, v);
 }
 
+/**
+ * JS_AtomSymbolHasDescription - 检查 Symbol 是否有字符串描述
+ * @ctx: 上下文
+ * @v: Atom 值
+ * 返回: TRUE 有描述，FALSE 无描述
+ * 
+ * 说明：私有 Symbol（#field）没有描述
+ */
 /* return TRUE if 'v' is a symbol with a string description */
 static BOOL JS_AtomSymbolHasDescription(JSContext *ctx, JSAtom v)
 {
@@ -4305,6 +4358,15 @@ static BOOL JS_AtomSymbolHasDescription(JSContext *ctx, JSAtom v)
             !(p->len == 0 && p->is_wide_char != 0));
 }
 
+/**
+ * JS_AtomToCStringLen - 将 Atom 转换为 C 字符串
+ * @ctx: 上下文
+ * @plen: 输出参数，返回长度
+ * @atom: Atom 值
+ * 返回: C 字符串（用 JS_FreeCString 释放）
+ * 
+ * 说明：返回的字符串需要调用 JS_FreeCString 释放
+ */
 /* free with JS_FreeCString() */
 const char *JS_AtomToCStringLen(JSContext *ctx, size_t *plen, JSAtom atom)
 {
@@ -4322,6 +4384,15 @@ const char *JS_AtomToCStringLen(JSContext *ctx, size_t *plen, JSAtom atom)
     return cstr;
 }
 
+/**
+ * js_atom_concat_str - 连接 Atom 和字符串
+ * @ctx: 上下文
+ * @name: Atom 名
+ * @str1: 要连接的字符串
+ * 返回: 新的 Atom，失败返回 JS_ATOM_NULL
+ * 
+ * 说明：用于生成私有字段名等
+ */
 /* return a string atom containing name concatenated with str1 */
 static JSAtom js_atom_concat_str(JSContext *ctx, JSAtom name, const char *str1)
 {
@@ -4355,6 +4426,13 @@ static JSAtom js_atom_concat_str(JSContext *ctx, JSAtom name, const char *str1)
     return JS_ATOM_NULL;
 }
 
+/**
+ * js_atom_concat_num - 连接 Atom 和数字
+ * @ctx: 上下文
+ * @name: Atom 名
+ * @n: 数字
+ * 返回: 新的 Atom
+ */
 static JSAtom js_atom_concat_num(JSContext *ctx, JSAtom name, uint32_t n)
 {
     char buf[16];
@@ -4364,17 +4442,31 @@ static JSAtom js_atom_concat_num(JSContext *ctx, JSAtom name, uint32_t n)
     return js_atom_concat_str(ctx, name, buf);
 }
 
+/**
+ * JS_IsEmptyString - 检查是否是空字符串
+ * @v: JSValue
+ * 返回: TRUE 是空字符串，FALSE 不是
+ */
 static inline BOOL JS_IsEmptyString(JSValueConst v)
 {
     return JS_VALUE_GET_TAG(v) == JS_TAG_STRING && JS_VALUE_GET_STRING(v)->len == 0;
 }
 
-/* JSClass support */
+/* ============================================================================
+ * JSClass 支持
+ * ============================================================================ */
 
 #ifdef CONFIG_ATOMICS
 static pthread_mutex_t js_class_id_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
+/**
+ * JS_NewClassID - 分配新的类 ID
+ * @pclass_id: 输入/输出参数，如果为 0 则分配新 ID
+ * 返回: 类 ID
+ * 
+ * 说明：线程安全（使用互斥锁）
+ */
 /* a new class ID is allocated if *pclass_id != 0 */
 JSClassID JS_NewClassID(JSClassID *pclass_id)
 {
@@ -4393,6 +4485,11 @@ JSClassID JS_NewClassID(JSClassID *pclass_id)
     return class_id;
 }
 
+/**
+ * JS_GetClassID - 获取对象的类 ID
+ * @v: JSValue
+ * 返回: 类 ID，不是对象返回 JS_INVALID_CLASS_ID
+ */
 JSClassID JS_GetClassID(JSValue v)
 {
     JSObject *p;
@@ -4402,12 +4499,31 @@ JSClassID JS_GetClassID(JSValue v)
     return p->class_id;
 }
 
+/**
+ * JS_IsRegisteredClass - 检查类是否已注册
+ * @rt: 运行时
+ * @class_id: 类 ID
+ * 返回: TRUE 已注册，FALSE 未注册
+ */
 BOOL JS_IsRegisteredClass(JSRuntime *rt, JSClassID class_id)
 {
     return (class_id < rt->class_count &&
             rt->class_array[class_id].class_id != 0);
 }
 
+/**
+ * JS_NewClass1 - 创建新的对象内部类（内部函数）
+ * @rt: 运行时
+ * @class_id: 类 ID
+ * @class_def: 类定义
+ * @name: 类名 Atom
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：
+ * - 如果类 ID 超出范围，扩展类数组
+ * - 重新分配所有上下文的类原型数组
+ * - 初始化类定义
+ */
 /* create a new object internal class. Return -1 if error, 0 if
    OK. The finalizer can be NULL if none is needed. */
 static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
@@ -4423,11 +4539,12 @@ static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
         rt->class_array[class_id].class_id != 0)
         return -1;
 
+    // 扩展类数组
     if (class_id >= rt->class_count) {
         new_size = max_int(JS_CLASS_INIT_COUNT,
                            max_int(class_id + 1, rt->class_count * 3 / 2));
 
-        /* reallocate the context class prototype array, if any */
+        /* 重新分配所有上下文的类原型数组 */
         list_for_each(el, &rt->context_list) {
             JSContext *ctx = list_entry(el, JSContext, link);
             JSValue *new_tab;
@@ -4439,7 +4556,7 @@ static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
                 new_tab[i] = JS_NULL;
             ctx->class_proto = new_tab;
         }
-        /* reallocate the class array */
+        /* 重新分配类数组 */
         new_class_array = js_realloc_rt(rt, rt->class_array,
                                         sizeof(JSClass) * new_size);
         if (!new_class_array)
@@ -4459,6 +4576,17 @@ static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
     return 0;
 }
 
+/**
+ * JS_NewClass - 创建新的对象内部类
+ * @rt: 运行时
+ * @class_id: 类 ID
+ * @class_def: 类定义
+ * 返回: 0 成功，-1 失败
+ * 
+ * 说明：
+ * - 查找或创建类名 Atom
+ * - 调用 JS_NewClass1 注册类
+ */
 int JS_NewClass(JSRuntime *rt, JSClassID class_id, const JSClassDef *class_def)
 {
     int ret, len;
@@ -4476,6 +4604,17 @@ int JS_NewClass(JSRuntime *rt, JSClassID class_id, const JSClassDef *class_def)
     return ret;
 }
 
+/* ============================================================================
+ * 字符串创建函数
+ * ============================================================================ */
+
+/**
+ * js_new_string8_len - 创建 8 位字符串
+ * @ctx: 上下文
+ * @buf: 缓冲区
+ * @len: 长度
+ * 返回: 字符串 JSValue
+ */
 static JSValue js_new_string8_len(JSContext *ctx, const char *buf, int len)
 {
     JSString *str;
@@ -4491,11 +4630,24 @@ static JSValue js_new_string8_len(JSContext *ctx, const char *buf, int len)
     return JS_MKPTR(JS_TAG_STRING, str);
 }
 
+/**
+ * js_new_string8 - 创建 8 位字符串（零终止）
+ * @ctx: 上下文
+ * @buf: 缓冲区
+ * 返回: 字符串 JSValue
+ */
 static JSValue js_new_string8(JSContext *ctx, const char *buf)
 {
     return js_new_string8_len(ctx, buf, strlen(buf));
 }
 
+/**
+ * js_new_string16_len - 创建 16 位字符串
+ * @ctx: 上下文
+ * @buf: 缓冲区
+ * @len: 长度
+ * 返回: 字符串 JSValue
+ */
 static JSValue js_new_string16_len(JSContext *ctx, const uint16_t *buf, int len)
 {
     JSString *str;
