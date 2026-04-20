@@ -550,130 +550,166 @@ struct JSContext {
     void *user_opaque;                 // 用户自定义数据
 };
 
+/* ============================================================================
+ * JSFloat64Union 联合体
+ * 用于在 double 和 uint64_t 之间转换，常用于 NaN-boxing 实现
+ * ============================================================================ */
 typedef union JSFloat64Union {
-    double d;
-    uint64_t u64;
-    uint32_t u32[2];
+    double d;           // 双精度浮点数
+    uint64_t u64;       // 64 位整数（用于位操作）
+    uint32_t u32[2];    // 两个 32 位整数
 } JSFloat64Union;
 
+/* ============================================================================
+ * Atom 类型枚举
+ * Atom 是内部化的字符串，用于高效的属性名和标识符存储
+ * ============================================================================ */
 enum {
-    JS_ATOM_TYPE_STRING = 1,
-    JS_ATOM_TYPE_GLOBAL_SYMBOL,
-    JS_ATOM_TYPE_SYMBOL,
-    JS_ATOM_TYPE_PRIVATE,
+    JS_ATOM_TYPE_STRING = 1,       // 普通字符串
+    JS_ATOM_TYPE_GLOBAL_SYMBOL,    // 全局 Symbol
+    JS_ATOM_TYPE_SYMBOL,           // Symbol
+    JS_ATOM_TYPE_PRIVATE,          // 私有字段（#xxx）
 };
 
 typedef enum {
-    JS_ATOM_KIND_STRING,
-    JS_ATOM_KIND_SYMBOL,
-    JS_ATOM_KIND_PRIVATE,
+    JS_ATOM_KIND_STRING,           // 字符串类型
+    JS_ATOM_KIND_SYMBOL,           // Symbol 类型
+    JS_ATOM_KIND_PRIVATE,          // 私有类型
 } JSAtomKindEnum;
 
-#define JS_ATOM_HASH_MASK  ((1 << 30) - 1)
-#define JS_ATOM_HASH_PRIVATE JS_ATOM_HASH_MASK
+#define JS_ATOM_HASH_MASK  ((1 << 30) - 1)  // Atom 哈希掩码（30 位）
+#define JS_ATOM_HASH_PRIVATE JS_ATOM_HASH_MASK  // 私有字段的特殊哈希值
 
+/* ============================================================================
+ * JSString 结构
+ * 字符串内部表示，支持 8 位和 16 位字符编码
+ * 使用引用计数管理内存
+ * ============================================================================ */
 struct JSString {
-    JSRefCountHeader header; /* must come first, 32-bit */
-    uint32_t len : 31;
-    uint8_t is_wide_char : 1; /* 0 = 8 bits, 1 = 16 bits characters */
-    /* for JS_ATOM_TYPE_SYMBOL: hash = weakref_count, atom_type = 3,
-       for JS_ATOM_TYPE_PRIVATE: hash = JS_ATOM_HASH_PRIVATE, atom_type = 3
-       XXX: could change encoding to have one more bit in hash */
-    uint32_t hash : 30;
-    uint8_t atom_type : 2; /* != 0 if atom, JS_ATOM_TYPE_x */
-    uint32_t hash_next; /* atom_index for JS_ATOM_TYPE_SYMBOL */
+    JSRefCountHeader header;       // 引用计数头（必须放在第一个，32 位）
+    uint32_t len : 31;             // 字符串长度（31 位）
+    uint8_t is_wide_char : 1;      // 字符宽度：0=8 位，1=16 位
+    /* 对于 JS_ATOM_TYPE_SYMBOL: hash = weakref_count, atom_type = 3
+       对于 JS_ATOM_TYPE_PRIVATE: hash = JS_ATOM_HASH_PRIVATE, atom_type = 3
+       XXX: 可以改变编码以在 hash 中多一位 */
+    uint32_t hash : 30;            // 哈希值（30 位）
+    uint8_t atom_type : 2;         // Atom 类型（!= 0 表示是 atom）
+    uint32_t hash_next;            // 哈希链下一个元素的 atom_index（用于 JS_ATOM_TYPE_SYMBOL）
 #ifdef DUMP_LEAKS
-    struct list_head link; /* string list */
+    struct list_head link;         // 字符串列表（用于泄漏检测）
 #endif
     union {
-        uint8_t str8[0]; /* 8 bit strings will get an extra null terminator */
-        uint16_t str16[0];
+        uint8_t str8[0];           // 8 位字符串（会有额外的 null 终止符）
+        uint16_t str16[0];         // 16 位字符串
     } u;
 };
 
+/* ============================================================================
+ * JSStringRope 结构
+ * 绳索字符串，用于高效的大字符串拼接
+ * 使用二叉树结构，避免频繁的内存复制
+ * ============================================================================ */
 typedef struct JSStringRope {
-    JSRefCountHeader header; /* must come first, 32-bit */
-    uint32_t len;
-    uint8_t is_wide_char; /* 0 = 8 bits, 1 = 16 bits characters */
-    uint8_t depth; /* max depth of the rope tree */
-    /* XXX: could reduce memory usage by using a direct pointer with
-       bit 0 to select rope or string */
-    JSValue left;
-    JSValue right; /* might be the empty string */
+    JSRefCountHeader header;       // 引用计数头（必须放在第一个，32 位）
+    uint32_t len;                  // 字符串总长度
+    uint8_t is_wide_char;          // 字符宽度：0=8 位，1=16 位
+    uint8_t depth;                 // 绳索树的最大深度
+    /* XXX: 可以通过使用带位 0 的直接指针来选择 rope 或 string，以减少内存使用 */
+    JSValue left;                  // 左子树
+    JSValue right;                 // 右子树（可能是空字符串）
 } JSStringRope;
 
+/* ============================================================================
+ * JSClosureTypeEnum 枚举
+ * 闭包变量类型，用于捕获父作用域的变量
+ * ============================================================================ */
 typedef enum {
-    JS_CLOSURE_LOCAL, /* 'var_idx' is the index of a local variable in the parent function */
-    JS_CLOSURE_ARG, /* 'var_idx' is the index of a argument variable in the parent function */
-    JS_CLOSURE_REF, /* 'var_idx' is the index of a closure variable in the parent function */
-    JS_CLOSURE_GLOBAL_REF, /* 'var_idx' in the index of a closure
-                              variable in the parent function
-                              referencing a global variable */
-    JS_CLOSURE_GLOBAL_DECL, /* global variable declaration (eval code only) */
-    JS_CLOSURE_GLOBAL, /* global variable (eval code only) */
-    JS_CLOSURE_MODULE_DECL, /* definition of a module variable (eval code only) */
-    JS_CLOSURE_MODULE_IMPORT, /* definition of a module import (eval code only) */ 
+    JS_CLOSURE_LOCAL,              // 父函数的局部变量
+    JS_CLOSURE_ARG,                // 父函数的参数变量
+    JS_CLOSURE_REF,                // 父函数的闭包变量
+    JS_CLOSURE_GLOBAL_REF,         // 引用全局变量的闭包变量
+    JS_CLOSURE_GLOBAL_DECL,        // 全局变量声明（仅 eval 代码）
+    JS_CLOSURE_GLOBAL,             // 全局变量（仅 eval 代码）
+    JS_CLOSURE_MODULE_DECL,        // 模块变量定义（仅 eval 代码）
+    JS_CLOSURE_MODULE_IMPORT,      // 模块导入定义（仅 eval 代码）
 } JSClosureTypeEnum;
 
+/* ============================================================================
+ * JSClosureVar 结构
+ * 闭包变量定义，记录函数捕获的外部变量信息
+ * ============================================================================ */
 typedef struct JSClosureVar {
-    JSClosureTypeEnum closure_type : 3;
-    uint8_t is_lexical : 1; /* lexical variable */
-    uint8_t is_const : 1; /* const variable (is_lexical = 1 if is_const = 1 */
-    uint8_t var_kind : 4; /* see JSVarKindEnum */
-    uint16_t var_idx; /* is_local = TRUE: index to a normal variable of the
-                    parent function. otherwise: index to a closure
-                    variable of the parent function */
-    JSAtom var_name;
+    JSClosureTypeEnum closure_type : 3;  // 闭包类型
+    uint8_t is_lexical : 1;              // 是否是词法变量（let/const）
+    uint8_t is_const : 1;                // 是否是 const 变量（如果是 const，则 is_lexical = 1）
+    uint8_t var_kind : 4;                // 变量类型（见 JSVarKindEnum）
+    uint16_t var_idx;                    // 变量索引：
+                                         // is_local = TRUE: 父函数普通变量的索引
+                                         // 否则：父函数闭包变量的索引
+    JSAtom var_name;                     // 变量名
 } JSClosureVar;
 
-#define ARG_SCOPE_INDEX 1
-#define ARG_SCOPE_END (-2)
+#define ARG_SCOPE_INDEX 1      // 参数作用域索引
+#define ARG_SCOPE_END (-2)     // 参数作用域结束标记
 
+/* ============================================================================
+ * JSVarKindEnum 枚举
+ * 变量类型枚举，用于区分不同种类的变量
+ * ============================================================================ */
 typedef enum {
-    /* XXX: add more variable kinds here instead of using bit fields */
-    JS_VAR_NORMAL,
-    JS_VAR_FUNCTION_DECL, /* lexical var with function declaration */
-    JS_VAR_NEW_FUNCTION_DECL, /* lexical var with async/generator
-                                 function declaration */
-    JS_VAR_CATCH,
-    JS_VAR_FUNCTION_NAME, /* function expression name */
-    JS_VAR_PRIVATE_FIELD,
-    JS_VAR_PRIVATE_METHOD,
-    JS_VAR_PRIVATE_GETTER,
-    JS_VAR_PRIVATE_SETTER, /* must come after JS_VAR_PRIVATE_GETTER */
-    JS_VAR_PRIVATE_GETTER_SETTER, /* must come after JS_VAR_PRIVATE_SETTER */
-    JS_VAR_GLOBAL_FUNCTION_DECL, /* global function definition, only in JSVarDef */
+    /* XXX: 应该在这里添加更多变量类型，而不是使用位域 */
+    JS_VAR_NORMAL,                  // 普通变量（var）
+    JS_VAR_FUNCTION_DECL,           // 词法变量 + 函数声明
+    JS_VAR_NEW_FUNCTION_DECL,       // 词法变量 + async/generator 函数声明
+    JS_VAR_CATCH,                   // catch 块变量
+    JS_VAR_FUNCTION_NAME,           // 函数表达式名称
+    JS_VAR_PRIVATE_FIELD,           // 私有字段（#field）
+    JS_VAR_PRIVATE_METHOD,          // 私有方法（#method()）
+    JS_VAR_PRIVATE_GETTER,          // 私有 getter
+    JS_VAR_PRIVATE_SETTER,          // 私有 setter（必须在 JS_VAR_PRIVATE_GETTER 之后）
+    JS_VAR_PRIVATE_GETTER_SETTER,   // 私有 getter+setter（必须在 JS_VAR_PRIVATE_SETTER 之后）
+    JS_VAR_GLOBAL_FUNCTION_DECL,    // 全局函数定义（仅在 JSVarDef 中）
 } JSVarKindEnum;
 
+/* ============================================================================
+ * JSBytecodeVarDef 结构
+ * 字节码变量定义，存储编译后函数的变量信息
+ * ============================================================================ */
 typedef struct JSBytecodeVarDef {
-    JSAtom var_name;
-    /* index into JSFunctionBytecode.vars of the next variable in the same or
-       enclosing lexical scope
-    */
-    int scope_next; /* XXX: store on 16 bits */
-    uint8_t is_const : 1;
-    uint8_t is_lexical : 1;
-    uint8_t is_captured : 1; /* XXX: could remove and use a var_ref_idx value */
-    uint8_t has_scope: 1; /* true if JSVarDef.scope_level != 0 */
-    uint8_t var_kind : 4; /* see JSVarKindEnum */
-    /* If is_captured = TRUE, provides, the index of the corresponding
-       JSVarRef on stack. It would be more compact to have a separate
-       table with the corresponding inverted table but it requires
-       more modifications in the code. */
-    uint16_t var_ref_idx;
+    JSAtom var_name;               // 变量名
+    /* 指向 JSFunctionBytecode.vars 中下一个变量的索引，
+       该变量在相同或外层词法作用域中 */
+    int scope_next;                // XXX: 应该用 16 位存储
+    uint8_t is_const : 1;          // 是否是 const
+    uint8_t is_lexical : 1;        // 是否是词法变量（let/const）
+    uint8_t is_captured : 1;       // 是否被闭包捕获
+                                   // XXX: 可以移除并使用 var_ref_idx
+    uint8_t has_scope: 1;          // 如果 JSVarDef.scope_level != 0 则为 TRUE
+    uint8_t var_kind : 4;          // 变量类型（见 JSVarKindEnum）
+    /* 如果 is_captured = TRUE，提供栈上对应 JSVarRef 的索引。
+       使用单独的倒排表会更紧凑，但需要更多代码修改。 */
+    uint16_t var_ref_idx;          // 变量引用索引
 } JSBytecodeVarDef;
 
-/* for the encoding of the pc2line table */
-#define PC2LINE_BASE     (-1)
-#define PC2LINE_RANGE    5
-#define PC2LINE_OP_FIRST 1
-#define PC2LINE_DIFF_PC_MAX ((255 - PC2LINE_OP_FIRST) / PC2LINE_RANGE)
+/* ============================================================================
+ * PC2Line 表编码常量
+ * 用于将字节码程序计数器（PC）映射到源代码行号
+ * 使用差分编码以节省空间
+ * ============================================================================ */
+#define PC2LINE_BASE     (-1)                          // 基础行号偏移
+#define PC2LINE_RANGE    5                             // 编码范围
+#define PC2LINE_OP_FIRST 1                             // 第一个操作码
+#define PC2LINE_DIFF_PC_MAX ((255 - PC2LINE_OP_FIRST) / PC2LINE_RANGE)  // 最大 PC 差值
 
+/* ============================================================================
+ * JSFunctionKindEnum 枚举
+ * 函数类型枚举
+ * ============================================================================ */
 typedef enum JSFunctionKindEnum {
-    JS_FUNC_NORMAL = 0,
-    JS_FUNC_GENERATOR = (1 << 0),
-    JS_FUNC_ASYNC = (1 << 1),
-    JS_FUNC_ASYNC_GENERATOR = (JS_FUNC_GENERATOR | JS_FUNC_ASYNC),
+    JS_FUNC_NORMAL = 0,                    // 普通函数
+    JS_FUNC_GENERATOR = (1 << 0),          // Generator 函数（function*）
+    JS_FUNC_ASYNC = (1 << 1),              // 异步函数（async）
+    JS_FUNC_ASYNC_GENERATOR = (JS_FUNC_GENERATOR | JS_FUNC_ASYNC),  // 异步 Generator
 } JSFunctionKindEnum;
 
 /* ============================================================================
@@ -727,157 +763,233 @@ typedef struct JSFunctionBytecode {
     } debug;
 } JSFunctionBytecode;
 
+/* ============================================================================
+ * JSBoundFunction 结构
+ * 绑定函数，用于实现 Function.prototype.bind
+ * 存储绑定的 this 值和预置参数
+ * ============================================================================ */
 typedef struct JSBoundFunction {
-    JSValue func_obj;
-    JSValue this_val;
-    int argc;
-    JSValue argv[0];
+    JSValue func_obj;      // 被绑定的函数对象
+    JSValue this_val;      // 绑定的 this 值
+    int argc;              // 预置参数数量
+    JSValue argv[0];       // 预置参数数组（柔性数组）
 } JSBoundFunction;
 
+/* ============================================================================
+ * JSIteratorKindEnum 枚举
+ * 迭代器类型，用于 for...of、Object.entries 等
+ * ============================================================================ */
 typedef enum JSIteratorKindEnum {
-    JS_ITERATOR_KIND_KEY,
-    JS_ITERATOR_KIND_VALUE,
-    JS_ITERATOR_KIND_KEY_AND_VALUE,
+    JS_ITERATOR_KIND_KEY,           // 只返回键（如 Object.keys）
+    JS_ITERATOR_KIND_VALUE,         // 只返回值（如 Object.values）
+    JS_ITERATOR_KIND_KEY_AND_VALUE, // 返回键值对（如 Object.entries）
 } JSIteratorKindEnum;
 
+/* ============================================================================
+ * JSForInIterator 结构
+ * for-in 迭代器，用于遍历对象的可枚举属性
+ * ============================================================================ */
 typedef struct JSForInIterator {
-    JSValue obj;
-    uint32_t idx;
-    uint32_t atom_count;
-    uint8_t in_prototype_chain;
-    uint8_t is_array;
-    JSPropertyEnum *tab_atom; /* is_array = FALSE */
+    JSValue obj;                   // 被遍历的对象
+    uint32_t idx;                  // 当前索引
+    uint32_t atom_count;           // 属性数量
+    uint8_t in_prototype_chain;    // 是否在原型链中
+    uint8_t is_array;              // 是否是数组
+    JSPropertyEnum *tab_atom;      // 属性名数组（is_array = FALSE 时使用）
 } JSForInIterator;
 
+/* ============================================================================
+ * JSRegExp 结构
+ * 正则表达式对象内部表示
+ * ============================================================================ */
 typedef struct JSRegExp {
-    JSString *pattern;
-    JSString *bytecode; /* also contains the flags */
+    JSString *pattern;             // 正则表达式模式
+    JSString *bytecode;            // 编译后的字节码（也包含标志）
 } JSRegExp;
 
+/* ============================================================================
+ * JSProxyData 结构
+ * Proxy 代理对象的数据
+ * ============================================================================ */
 typedef struct JSProxyData {
-    JSValue target;
-    JSValue handler;
-    uint8_t is_func;
-    uint8_t is_revoked;
+    JSValue target;                // 目标对象
+    JSValue handler;               // 处理器对象
+    uint8_t is_func;               // 是否是函数代理
+    uint8_t is_revoked;            // 是否已被撤销
 } JSProxyData;
 
+/* ============================================================================
+ * JSArrayBuffer 结构
+ * ArrayBuffer 对象，表示二进制数据缓冲区
+ * 是 TypedArray 和 DataView 的底层存储
+ * ============================================================================ */
 typedef struct JSArrayBuffer {
-    int byte_length; /* 0 if detached */
-    int max_byte_length; /* -1 if not resizable; >= byte_length otherwise */
-    uint8_t detached;
-    uint8_t shared; /* if shared, the array buffer cannot be detached */
-    uint8_t *data; /* NULL if detached */
-    struct list_head array_list;
-    void *opaque;
-    JSFreeArrayBufferDataFunc *free_func;
+    int byte_length;               // 字节长度（0 表示已分离）
+    int max_byte_length;           // 最大字节长度（-1 表示不可调整大小；否则 >= byte_length）
+    uint8_t detached;              // 是否已分离
+    uint8_t shared;                // 是否是 SharedArrayBuffer（如果是，则不能分离）
+    uint8_t *data;                 // 数据指针（分离后为 NULL）
+    struct list_head array_list;   // 链接到使用该 ArrayBuffer 的 TypedArray 列表
+    void *opaque;                  // 用户自定义数据
+    JSFreeArrayBufferDataFunc *free_func;  // 释放函数
 } JSArrayBuffer;
 
+/* ============================================================================
+ * JSTypedArray 结构
+ * 类型化数组视图，提供对 ArrayBuffer 的类型化访问
+ * 包括 Int8Array、Uint8Array、Float32Array 等
+ * ============================================================================ */
 typedef struct JSTypedArray {
-    struct list_head link; /* link to arraybuffer */
-    JSObject *obj; /* back pointer to the TypedArray/DataView object */
-    JSObject *buffer; /* based array buffer */
-    uint32_t offset; /* byte offset in the array buffer */
-    uint32_t length; /* byte length in the array buffer */
-    BOOL track_rab; /* auto-track length of backing array buffer */
+    struct list_head link;         // 链接到 ArrayBuffer 的 array_list
+    JSObject *obj;                 // 指回 TypedArray/DataView 对象
+    JSObject *buffer;              // 底层 ArrayBuffer
+    uint32_t offset;               // 在 ArrayBuffer 中的字节偏移
+    uint32_t length;               // 在 ArrayBuffer 中的字节长度
+    BOOL track_rab;                // 是否自动跟踪底层 ArrayBuffer 的长度
 } JSTypedArray;
 
+/* ============================================================================
+ * JSGlobalObject 结构
+ * 全局对象（globalThis）的内部表示
+ * ============================================================================ */
 typedef struct JSGlobalObject {
-    JSValue uninitialized_vars; /* hidden object containing the list of uninitialized variables */
+    JSValue uninitialized_vars;    // 隐藏对象，包含未初始化变量的列表
 } JSGlobalObject;
 
+/* ============================================================================
+ * JSAsyncFunctionState 结构
+ * 异步函数状态，用于实现 async/await
+ * 保存异步函数挂起时的执行状态
+ * ============================================================================ */
 typedef struct JSAsyncFunctionState {
-    JSGCObjectHeader header;
-    JSValue this_val; /* 'this' argument */
-    int argc; /* number of function arguments */
-    BOOL throw_flag; /* used to throw an exception in JS_CallInternal() */
-    BOOL is_completed; /* TRUE if the function has returned. The stack
-                          frame is no longer valid */
-    JSValue resolving_funcs[2]; /* only used in JS async functions */
-    JSStackFrame frame;
-    /* arg_buf, var_buf, stack_buf and var_refs follow */
+    JSGCObjectHeader header;       // GC 对象头
+    JSValue this_val;              // this 参数
+    int argc;                      // 函数参数数量
+    BOOL throw_flag;               // 用于在 JS_CallInternal() 中抛出异常
+    BOOL is_completed;             // 函数是否已返回。如果是，栈帧不再有效
+    JSValue resolving_funcs[2];    // Promise 解决函数（仅 JS 异步函数使用）
+    JSStackFrame frame;            // 栈帧
+    /* 后面跟着 arg_buf、var_buf、stack_buf 和 var_refs */
 } JSAsyncFunctionState;
 
+/* ============================================================================
+ * JSOverloadableOperatorEnum 枚举
+ * 可重载操作符枚举，用于实现运算符重载（如 Symbol.toPrimitive）
+ * ============================================================================ */
 typedef enum {
-   /* binary operators */
-   JS_OVOP_ADD,
-   JS_OVOP_SUB,
-   JS_OVOP_MUL,
-   JS_OVOP_DIV,
-   JS_OVOP_MOD,
-   JS_OVOP_POW,
-   JS_OVOP_OR,
-   JS_OVOP_AND,
-   JS_OVOP_XOR,
-   JS_OVOP_SHL,
-   JS_OVOP_SAR,
-   JS_OVOP_SHR,
-   JS_OVOP_EQ,
-   JS_OVOP_LESS,
+   /* 二元操作符 */
+   JS_OVOP_ADD,       // 加法 (+)
+   JS_OVOP_SUB,       // 减法 (-)
+   JS_OVOP_MUL,       // 乘法 (*)
+   JS_OVOP_DIV,       // 除法 (/)
+   JS_OVOP_MOD,       // 取模 (%)
+   JS_OVOP_POW,       // 幂运算 (**)
+   JS_OVOP_OR,        // 逻辑或 (||)
+   JS_OVOP_AND,       // 逻辑与 (&&)
+   JS_OVOP_XOR,       // 异或 (^)
+   JS_OVOP_SHL,       // 左移 (<<)
+   JS_OVOP_SAR,       // 算术右移 (>>)
+   JS_OVOP_SHR,       // 逻辑右移 (>>>)
+   JS_OVOP_EQ,        // 相等 (==)
+   JS_OVOP_LESS,      // 小于 (<)
 
-   JS_OVOP_BINARY_COUNT,
-   /* unary operators */
-   JS_OVOP_POS = JS_OVOP_BINARY_COUNT,
-   JS_OVOP_NEG,
-   JS_OVOP_INC,
-   JS_OVOP_DEC,
-   JS_OVOP_NOT,
+   JS_OVOP_BINARY_COUNT,  // 二元操作符数量
+   
+   /* 一元操作符 */
+   JS_OVOP_POS = JS_OVOP_BINARY_COUNT,  // 正号 (+)
+   JS_OVOP_NEG,       // 负号 (-)
+   JS_OVOP_INC,       // 自增 (++)
+   JS_OVOP_DEC,       // 自减 (--)
+   JS_OVOP_NOT,       // 逻辑非 (!)
 
-   JS_OVOP_COUNT,
+   JS_OVOP_COUNT,     // 操作符总数
 } JSOverloadableOperatorEnum;
 
+/* ============================================================================
+ * JSBinaryOperatorDefEntry 结构
+ * 二元操作符定义条目
+ * ============================================================================ */
 typedef struct {
-    uint32_t operator_index;
-    JSObject *ops[JS_OVOP_BINARY_COUNT]; /* self operators */
+    uint32_t operator_index;         // 操作符索引
+    JSObject *ops[JS_OVOP_BINARY_COUNT];  // 自身操作符数组
 } JSBinaryOperatorDefEntry;
 
+/* ============================================================================
+ * JSBinaryOperatorDef 结构
+ * 二元操作符定义
+ * ============================================================================ */
 typedef struct {
-    int count;
-    JSBinaryOperatorDefEntry *tab;
+    int count;                       // 操作符数量
+    JSBinaryOperatorDefEntry *tab;   // 操作符表
 } JSBinaryOperatorDef;
 
+/* ============================================================================
+ * JSOperatorSetData 结构
+ * 操作符集合数据，用于实现运算符重载
+ * ============================================================================ */
 typedef struct {
-    uint32_t operator_counter;
-    BOOL is_primitive; /* OperatorSet for a primitive type */
-    /* NULL if no operator is defined */
-    JSObject *self_ops[JS_OVOP_COUNT]; /* self operators */
-    JSBinaryOperatorDef left;
-    JSBinaryOperatorDef right;
+    uint32_t operator_counter;       // 操作符计数器
+    BOOL is_primitive;               // 是否是原始类型的 OperatorSet
+    /* 如果未定义操作符则为 NULL */
+    JSObject *self_ops[JS_OVOP_COUNT];  // 自身操作符数组
+    JSBinaryOperatorDef left;        // 左操作符定义
+    JSBinaryOperatorDef right;       // 右操作符定义
 } JSOperatorSetData;
 
+/* ============================================================================
+ * JSReqModuleEntry 结构
+ * 模块请求条目，表示一个 import 语句
+ * ============================================================================ */
 typedef struct JSReqModuleEntry {
-    JSAtom module_name;
-    JSModuleDef *module; /* used using resolution */
-    JSValue attributes; /* JS_UNDEFINED or an object contains the attributes as key/value */
+    JSAtom module_name;              // 模块名
+    JSModuleDef *module;             // 解析后的模块（使用解析）
+    JSValue attributes;              // 导入属性（JS_UNDEFINED 或包含键/值的对象）
 } JSReqModuleEntry;
 
+/* ============================================================================
+ * JSExportTypeEnum 枚举
+ * 导出类型枚举
+ * ============================================================================ */
 typedef enum JSExportTypeEnum {
-    JS_EXPORT_TYPE_LOCAL,
-    JS_EXPORT_TYPE_INDIRECT,
+    JS_EXPORT_TYPE_LOCAL,          // 本地导出
+    JS_EXPORT_TYPE_INDIRECT,       // 间接导出（export ... from）
 } JSExportTypeEnum;
 
+/* ============================================================================
+ * JSExportEntry 结构
+ * 导出条目，表示一个 export 语句
+ * ============================================================================ */
 typedef struct JSExportEntry {
     union {
         struct {
-            int var_idx; /* closure variable index */
-            JSVarRef *var_ref; /* if != NULL, reference to the variable */
-        } local; /* for local export */
-        int req_module_idx; /* module for indirect export */
+            int var_idx;           // 闭包变量索引
+            JSVarRef *var_ref;     // 如果不为 NULL，指向变量的引用
+        } local;                   // 本地导出
+        int req_module_idx;        // 间接导出的模块索引
     } u;
-    JSExportTypeEnum export_type;
-    JSAtom local_name; /* '*' if export ns from. not used for local
-                          export after compilation */
-    JSAtom export_name; /* exported variable name */
+    JSExportTypeEnum export_type;  // 导出类型
+    JSAtom local_name;             // 本地名（如果是 export ns from 则为 '*'。
+                                   // 编译后不用于本地导出）
+    JSAtom export_name;            // 导出的变量名
 } JSExportEntry;
 
+/* ============================================================================
+ * JSStarExportEntry 结构
+ * 星号导出条目（export * from）
+ * ============================================================================ */
 typedef struct JSStarExportEntry {
-    int req_module_idx; /* in req_module_entries */
+    int req_module_idx;            // 在 req_module_entries 中的索引
 } JSStarExportEntry;
 
+/* ============================================================================
+ * JSImportEntry 结构
+ * 导入条目，表示一个 import 语句
+ * ============================================================================ */
 typedef struct JSImportEntry {
-    int var_idx; /* closure variable index */
-    BOOL is_star; /* import_name = '*' is a valid import name, so need a flag */
-    JSAtom import_name;
-    int req_module_idx; /* in req_module_entries */
+    int var_idx;                   // 闭包变量索引
+    BOOL is_star;                  // 是否是星号导入（import_name = '*' 是有效的导入名，所以需要标志）
+    JSAtom import_name;            // 导入名
+    int req_module_idx;            // 在 req_module_entries 中的索引
 } JSImportEntry;
 
 typedef enum {
@@ -954,56 +1066,73 @@ struct JSModuleDef {
     JSValue private_value;                    // C 模块的私有值
 };
 
+/* ============================================================================
+ * JSJobEntry 结构
+ * Job（微任务）条目，用于实现 Promise 微任务队列
+ * ============================================================================ */
 typedef struct JSJobEntry {
-    struct list_head link;
-    JSContext *realm;
-    JSJobFunc *job_func;
-    int argc;
-    JSValue argv[0];
+    struct list_head link;         // 链接到 JSRuntime.job_list
+    JSContext *realm;              // 所属上下文
+    JSJobFunc *job_func;           // Job 函数
+    int argc;                      // 参数数量
+    JSValue argv[0];               // 参数数组（柔性数组）
 } JSJobEntry;
 
+/* ============================================================================
+ * JSProperty 结构
+ * 对象属性，支持多种属性类型（普通值、getter/setter、变量引用、自动初始化）
+ * ============================================================================ */
 typedef struct JSProperty {
     union {
-        JSValue value;      /* JS_PROP_NORMAL */
-        struct {            /* JS_PROP_GETSET */
-            JSObject *getter; /* NULL if undefined */
-            JSObject *setter; /* NULL if undefined */
+        JSValue value;             // 普通属性值（JS_PROP_NORMAL）
+        struct {                   // getter/setter 属性（JS_PROP_GETSET）
+            JSObject *getter;      // getter 函数（未定义时为 NULL）
+            JSObject *setter;      // setter 函数（未定义时为 NULL）
         } getset;
-        JSVarRef *var_ref;  /* JS_PROP_VARREF */
-        struct {            /* JS_PROP_AUTOINIT */
-            /* in order to use only 2 pointers, we compress the realm
-               and the init function pointer */
-            uintptr_t realm_and_id; /* realm and init_id (JS_AUTOINIT_ID_x)
-                                       in the 2 low bits */
-            void *opaque;
+        JSVarRef *var_ref;         // 变量引用（JS_PROP_VARREF）
+        struct {                   // 自动初始化（JS_PROP_AUTOINIT）
+            /* 为了只使用 2 个指针，我们压缩 realm 和初始化函数指针 */
+            uintptr_t realm_and_id;  // realm 和 init_id（JS_AUTOINIT_ID_x），低 2 位存储 init_id
+            void *opaque;            // 不透明指针
         } init;
     } u;
 } JSProperty;
 
-#define JS_PROP_INITIAL_SIZE 2
-#define JS_PROP_INITIAL_HASH_SIZE 4 /* must be a power of two */
+#define JS_PROP_INITIAL_SIZE 2           // 初始属性大小
+#define JS_PROP_INITIAL_HASH_SIZE 4      // 初始哈希大小（必须是 2 的幂）
 
+/* ============================================================================
+ * JSShapeProperty 结构
+ * Shape 属性，用于形状哈希表
+ * Shape 是对象布局的模板，包含属性名和标志
+ * ============================================================================ */
 typedef struct JSShapeProperty {
-    uint32_t hash_next : 26; /* 0 if last in list */
-    uint32_t flags : 6;   /* JS_PROP_XXX */
-    JSAtom atom; /* JS_ATOM_NULL = free property entry */
+    uint32_t hash_next : 26;     // 哈希链下一个元素（0 表示列表末尾）
+    uint32_t flags : 6;          // 属性标志（JS_PROP_XXX）
+    JSAtom atom;                 // 属性名（JS_ATOM_NULL = 空闲属性条目）
 } JSShapeProperty;
 
+/* ============================================================================
+ * JSShape 结构
+ * Shape（形状）是对象布局的模板
+ * 包含原型和属性名 + 标志，用于优化对象内存布局
+ * 相同 Shape 的对象可以共享内存布局，节省内存
+ * ============================================================================ */
 struct JSShape {
-    /* hash table of size hash_mask + 1 before the start of the
-       structure (see prop_hash_end()). */
-    JSGCObjectHeader header;
-    /* true if the shape is inserted in the shape hash table. If not,
-       JSShape.hash is not valid */
-    uint8_t is_hashed;
-    uint32_t hash; /* current hash value */
-    uint32_t prop_hash_mask;
-    int prop_size; /* allocated properties */
-    int prop_count; /* include deleted properties */
-    int deleted_prop_count;
-    JSShape *shape_hash_next; /* in JSRuntime.shape_hash[h] list */
-    JSObject *proto;
-    JSShapeProperty prop[0]; /* prop_size elements */
+    /* 结构开始前有大小为 hash_mask + 1 的哈希表（见 prop_hash_end()） */
+    JSGCObjectHeader header;       // GC 对象头
+    
+    /* 如果 shape 已插入 shape 哈希表则为 TRUE。
+       如果不是，JSShape.hash 无效 */
+    uint8_t is_hashed;             // 是否已哈希
+    uint32_t hash;                 // 当前哈希值
+    uint32_t prop_hash_mask;       // 属性哈希掩码
+    int prop_size;                 // 已分配的属性数量
+    int prop_count;                // 属性数量（包括已删除的）
+    int deleted_prop_count;        // 已删除的属性数量
+    JSShape *shape_hash_next;      // 在 JSRuntime.shape_hash[h] 链表中的下一个
+    JSObject *proto;               // 原型对象
+    JSShapeProperty prop[0];       // 属性数组（prop_size 个元素，柔性数组）
 };
 
 /* ============================================================================
@@ -1109,43 +1238,62 @@ struct JSObject {
     } u;
 };
 
+/* ============================================================================
+ * JSMapRecord 结构
+ * Map/Set 记录，存储键值对
+ * 用于实现 Map、Set、WeakMap、WeakSet
+ * ============================================================================ */
 typedef struct JSMapRecord {
-    int ref_count; /* used during enumeration to avoid freeing the record */
-    BOOL empty : 8; /* TRUE if the record is deleted */
-    struct list_head link;
-    struct JSMapRecord *hash_next;
-    JSValue key;
-    JSValue value;
+    int ref_count;                 // 引用计数（枚举期间使用，避免释放记录）
+    BOOL empty : 8;                // 如果记录已删除则为 TRUE
+    struct list_head link;         // 链接到 JSMapState.records
+    struct JSMapRecord *hash_next; // 哈希链下一个元素
+    JSValue key;                   // 键
+    JSValue value;                 // 值
 } JSMapRecord;
 
+/* ============================================================================
+ * JSMapState 结构
+ * Map/Set 状态，存储 Map/Set 的内部数据
+ * ============================================================================ */
 typedef struct JSMapState {
-    BOOL is_weak; /* TRUE if WeakSet/WeakMap */
-    struct list_head records; /* list of JSMapRecord.link */
-    uint32_t record_count;
-    JSMapRecord **hash_table;
-    int hash_bits;
-    uint32_t hash_size; /* = 2 ^ hash_bits */
-    uint32_t record_count_threshold; /* count at which a hash table
-                                        resize is needed */
-    JSWeakRefHeader weakref_header; /* only used if is_weak = TRUE */
+    BOOL is_weak;                  // 如果是 WeakSet/WeakMap 则为 TRUE
+    struct list_head records;      // JSMapRecord 链表
+    uint32_t record_count;         // 记录数量
+    JSMapRecord **hash_table;      // 哈希表
+    int hash_bits;                 // 哈希位数
+    uint32_t hash_size;            // 哈希表大小（= 2 ^ hash_bits）
+    uint32_t record_count_threshold;  // 需要调整哈希表大小的记录数量阈值
+    JSWeakRefHeader weakref_header;  // WeakRef 头（仅 is_weak = TRUE 时使用）
 } JSMapState;
 
+/* ============================================================================
+ * Atom 枚举
+ * 预定义的 Atom（内部化字符串），用于高效的标识符存储
+ * 通过 quickjs-atom.h 生成所有内置标识符
+ * ============================================================================ */
 enum {
-    __JS_ATOM_NULL = JS_ATOM_NULL,
-#define DEF(name, str) JS_ATOM_ ## name,
+    __JS_ATOM_NULL = JS_ATOM_NULL,   // 空 Atom
+#define DEF(name, str) JS_ATOM_ ## name,  // 为每个 atom 定义枚举值
 #include "quickjs-atom.h"
 #undef DEF
-    JS_ATOM_END,
+    JS_ATOM_END,                     // Atom 数量
 };
-#define JS_ATOM_LAST_KEYWORD JS_ATOM_super
-#define JS_ATOM_LAST_STRICT_KEYWORD JS_ATOM_yield
+#define JS_ATOM_LAST_KEYWORD JS_ATOM_super           // 最后一个关键字
+#define JS_ATOM_LAST_STRICT_KEYWORD JS_ATOM_yield    // 最后一个严格模式关键字
 
+/* Atom 初始化字符串表（用 null 分隔的字符串数组） */
 static const char js_atom_init[] =
 #define DEF(name, str) str "\0"
 #include "quickjs-atom.h"
 #undef DEF
 ;
 
+/* ============================================================================
+ * OPCodeFormat 枚举
+ * 操作码格式枚举，定义字节码的编码格式
+ * 通过 quickjs-opcode.h 生成所有操作码格式
+ * ============================================================================ */
 typedef enum OPCodeFormat {
 #define FMT(f) OP_FMT_ ## f,
 #define DEF(id, size, n_pop, n_push, f)
@@ -1154,26 +1302,32 @@ typedef enum OPCodeFormat {
 #undef FMT
 } OPCodeFormat;
 
+/* ============================================================================
+ * OPCodeEnum 枚举
+ * 操作码枚举，定义所有字节码指令
+ * QuickJS 使用栈式虚拟机，每个操作码指定弹出和压入的栈元素数量
+ * ============================================================================ */
 enum OPCodeEnum {
 #define FMT(f)
-#define DEF(id, size, n_pop, n_push, f) OP_ ## id,
-#define def(id, size, n_pop, n_push, f)
+#define DEF(id, size, n_pop, n_push, f) OP_ ## id,  // 标准操作码
+#define def(id, size, n_pop, n_push, f)             // 短操作码（略）
 #include "quickjs-opcode.h"
 #undef def
 #undef DEF
 #undef FMT
-    OP_COUNT, /* excluding temporary opcodes */
-    /* temporary opcodes : overlap with the short opcodes */
-    OP_TEMP_START = OP_nop + 1,
+    OP_COUNT,                    // 操作码数量（不包括临时操作码）
+    
+    /* 临时操作码：与短操作码重叠 */
+    OP_TEMP_START = OP_nop + 1,  // 临时操作码开始
     OP___dummy = OP_TEMP_START - 1,
 #define FMT(f)
 #define DEF(id, size, n_pop, n_push, f)
-#define def(id, size, n_pop, n_push, f) OP_ ## id,
+#define def(id, size, n_pop, n_push, f) OP_ ## id,  // 短操作码
 #include "quickjs-opcode.h"
 #undef def
 #undef DEF
 #undef FMT
-    OP_TEMP_END,
+    OP_TEMP_END,                 // 临时操作码结束
 };
 
 static int JS_InitAtoms(JSRuntime *rt);
