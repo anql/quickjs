@@ -10127,6 +10127,19 @@ static JSValue JS_GetPrototypeFree(JSContext *ctx, JSValue obj)
     return obj1;
 }
 
+/**
+ * JS_OrdinaryIsInstanceOf - 普通对象的 instanceof 检查
+ * @ctx: 上下文
+ * @val: 要检查的值
+ * @obj: 构造函数对象
+ * 返回: TRUE(是实例)/FALSE(不是)/-1(异常)
+ * 
+ * 说明：
+ * - 检查 val 是否在 obj 的原型链上
+ * - 处理 BoundFunction 的特殊情况
+ * - 对于 exotic 对象使用慢速路径遍历原型链
+ * - 检查中断以避免无限循环
+ */
 /* return TRUE, FALSE or (-1) in case of exception */
 static int JS_OrdinaryIsInstanceOf(JSContext *ctx, JSValueConst val,
                                    JSValueConst obj)
@@ -10201,6 +10214,18 @@ done:
     return ret;
 }
 
+/**
+ * JS_IsInstanceOf - instanceof 运算符实现
+ * @ctx: 上下文
+ * @val: 要检查的值
+ * @obj: 构造函数
+ * 返回: TRUE/FALSE/-1(异常)
+ * 
+ * 说明：
+ * - 优先使用 Symbol.hasInstance 方法（如果存在）
+ * - 回退到普通原型链检查
+ * - 验证右操作数是否为有效对象/函数
+ */
 /* return TRUE, FALSE or (-1) in case of exception */
 int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj)
 {
@@ -10226,15 +10251,40 @@ int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj)
     return JS_OrdinaryIsInstanceOf(ctx, val, obj);
 }
 
+/**
+ * JSAutoInitFunc - 自动初始化属性函数类型
+ * 用于延迟初始化对象属性（如原型、模块命名空间等）
+ */
 /* return the value associated to the autoinit property or an exception */
 typedef JSValue JSAutoInitFunc(JSContext *ctx, JSObject *p, JSAtom atom, void *opaque);
 
+/**
+ * js_autoinit_func_table - 自动初始化函数表
+ * 索引对应 JSAutoInitIDEnum 枚举值
+ */
 static JSAutoInitFunc *js_autoinit_func_table[] = {
     js_instantiate_prototype, /* JS_AUTOINIT_ID_PROTOTYPE */
     js_module_ns_autoinit, /* JS_AUTOINIT_ID_MODULE_NS */
     JS_InstantiateFunctionListItem2, /* JS_AUTOINIT_ID_PROP */
 };
 
+/**
+ * JS_AutoInitProperty - 自动初始化属性
+ * @ctx: 上下文
+ * @p: 对象
+ * @prop: 属性名
+ * @pr: 属性指针
+ * @prs: Shape 属性指针
+ * 返回：0 成功，-1 失败
+ * 
+ * 说明：
+ * - 用于延迟初始化特殊属性（原型、模块命名空间、全局变量）
+ * - 调用对应的初始化函数
+ * - 根据初始化结果设置属性类型（VARREF 或普通值）
+ * - 全局对象使用变量引用，其他对象直接存储值
+ * 
+ * 警告：'prs' 在调用后可能被重新分配
+ */
 /* warning: 'prs' is reallocated after it */
 static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
                                JSProperty *pr, JSShapeProperty *prs)
@@ -10279,6 +10329,23 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     return 0;
 }
 
+/**
+ * JS_GetPropertyInternal - 内部属性获取函数（核心实现）
+ * @ctx: 上下文
+ * @obj: 对象 JSValue
+ * @prop: 属性名 Atom
+ * @this_obj: this 绑定对象（用于 getter 调用）
+ * @throw_ref_error: 是否抛出引用错误
+ * 返回：属性值 JSValue 或 JS_UNDEFINED/JS_EXCEPTION
+ * 
+ * 说明：
+ * - 处理原始类型（null/undefined/string）的属性访问
+ * - 字符串支持整数索引访问字符和 length 属性
+ * - 沿原型链查找属性
+ * - 支持 getter/setter、变量引用、自动初始化等特殊属性
+ * - 处理 exotic 对象的自定义行为
+ * - 快速数组优化路径
+ */
 JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                JSAtom prop, JSValueConst this_obj,
                                BOOL throw_ref_error)
@@ -10339,9 +10406,11 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
     for(;;) {
         prs = find_own_property(&pr, p, prop);
         if (prs) {
-            /* found */
+            /* found - 在对象自身找到属性 */
             if (unlikely(prs->flags & JS_PROP_TMASK)) {
+                /* 特殊属性类型处理 */
                 if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+                    /* getter/setter 属性 */
                     if (unlikely(!pr->u.getset.getter)) {
                         return JS_UNDEFINED;
                     } else {
@@ -10351,23 +10420,27 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                         return JS_CallFree(ctx, func, this_obj, 0, NULL);
                     }
                 } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
+                    /* 变量引用属性（用于全局对象等） */
                     JSValue val = *pr->u.var_ref->pvalue;
                     if (unlikely(JS_IsUninitialized(val)))
                         return JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
                     return JS_DupValue(ctx, val);
                 } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+                    /* 自动初始化属性（延迟初始化） */
                     /* Instantiate property and retry */
                     if (JS_AutoInitProperty(ctx, p, prop, pr, prs))
                         return JS_EXCEPTION;
                     continue;
                 }
             } else {
+                /* 普通值属性 */
                 return JS_DupValue(ctx, pr->u.value);
             }
         }
         if (unlikely(p->is_exotic)) {
-            /* exotic behaviors */
+            /* exotic behaviors - 特殊对象行为（Proxy、TypedArray 等） */
             if (p->fast_array) {
+                /* 快速数组优化路径 */
                 if (__JS_AtomIsTaggedInt(prop)) {
                     uint32_t idx = __JS_AtomToUInt32(prop);
                     if (idx < p->u.array.count) {
@@ -10388,6 +10461,7 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                     }
                 }
             } else {
+                /* 使用 exotic 方法的对象 */
                 const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
                 if (em) {
                     if (em->get_property) {
@@ -10424,10 +10498,12 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                 }
             }
         }
+        /* 沿原型链继续查找 */
         p = p->shape->proto;
         if (!p)
             break;
     }
+    /* 未找到属性 */
     if (unlikely(throw_ref_error)) {
         return JS_ThrowReferenceErrorNotDefined(ctx, prop);
     } else {
@@ -10435,12 +10511,32 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
     }
 }
 
+/**
+ * JS_ThrowTypeErrorPrivateNotFound - 抛出私有字段不存在错误
+ * @ctx: 上下文
+ * @atom: 私有字段名
+ * 返回：JS_EXCEPTION
+ */
 static JSValue JS_ThrowTypeErrorPrivateNotFound(JSContext *ctx, JSAtom atom)
 {
     return JS_ThrowTypeErrorAtom(ctx, "private class field '%s' does not exist",
                                  atom);
 }
 
+/**
+ * JS_DefinePrivateField - 定义私有类字段
+ * @ctx: 上下文
+ * @obj: 对象
+ * @name: 字段名（Symbol）
+ * @val: 字段值
+ * 返回：0 成功，-1 失败
+ * 
+ * 说明：
+ * - 私有字段使用 Symbol 作为键
+ * - 可在不可扩展对象或 Proxy 上添加
+ * - 如果字段已存在则抛出错误
+ * - 属性标志：Configurable + Writable + Enumerable
+ */
 /* Private fields can be added even on non extensible objects or
    Proxies */
 static int JS_DefinePrivateField(JSContext *ctx, JSValueConst obj,
@@ -10478,6 +10574,17 @@ static int JS_DefinePrivateField(JSContext *ctx, JSValueConst obj,
     return 0;
 }
 
+/**
+ * JS_GetPrivateField - 获取私有类字段
+ * @ctx: 上下文
+ * @obj: 对象
+ * @name: 字段名（Symbol）
+ * 返回：字段值 JSValue 或 JS_EXCEPTION
+ * 
+ * 说明：
+ * - 验证对象和字段名类型
+ * - 查找私有字段，不存在则抛出错误
+ */
 static JSValue JS_GetPrivateField(JSContext *ctx, JSValueConst obj,
                                   JSValueConst name)
 {
@@ -10501,6 +10608,19 @@ static JSValue JS_GetPrivateField(JSContext *ctx, JSValueConst obj,
     return JS_DupValue(ctx, pr->u.value);
 }
 
+/**
+ * JS_SetPrivateField - 设置私有类字段
+ * @ctx: 上下文
+ * @obj: 对象
+ * @name: 字段名（Symbol）
+ * @val: 新值
+ * 返回：0 成功，-1 失败
+ * 
+ * 说明：
+ * - 验证对象和字段名类型
+ * - 查找私有字段，不存在则抛出错误
+ * - 使用 set_value 更新字段值（处理引用计数）
+ */
 static int JS_SetPrivateField(JSContext *ctx, JSValueConst obj,
                               JSValueConst name, JSValue val)
 {
@@ -10531,6 +10651,19 @@ static int JS_SetPrivateField(JSContext *ctx, JSValueConst obj,
     return 0;
 }
 
+/**
+ * JS_AddBrand - 添加私有 brand 字段（用于 super 调用检查）
+ * @ctx: 上下文
+ * @obj: 要添加 brand 的对象（可为 null）
+ * @home_obj: 包含 brand 定义的对象
+ * 返回：0 成功，-1 失败
+ * 
+ * 说明：
+ * - 在 home_obj 上创建 brand symbol（如果不存在）
+ * - 在 obj 上添加 brand 标记（表示可以访问私有方法）
+ * - 用于实现 class 的 super 调用权限检查
+ * - brand 是一个私有 symbol，存储在 Private_brand 属性下
+ */
 /* add a private brand field to 'home_obj' if not already present and
    if obj is != null add a private brand to it */
 static int JS_AddBrand(JSContext *ctx, JSValueConst obj, JSValueConst home_obj)
@@ -10582,6 +10715,19 @@ static int JS_AddBrand(JSContext *ctx, JSValueConst obj, JSValueConst home_obj)
     return 0;
 }
 
+/**
+ * JS_CheckBrand - 检查 brand 权限（super 调用验证）
+ * @ctx: 上下文
+ * @obj: 要检查的对象
+ * @func: 函数对象
+ * 返回：TRUE(有权限)/FALSE(无权限)/-1(异常)
+ * 
+ * 说明：
+ * - 获取 func 的 home_object（定义该方法的类）
+ * - 从 home_object 获取 brand symbol
+ * - 检查 obj 是否包含该 brand（表示有权限调用私有方法）
+ * - 用于实现 class 中 super 方法的访问控制
+ */
 /* return a boolean telling if the brand of the home object of 'func'
    is present on 'obj' or -1 in case of exception */
 static int JS_CheckBrand(JSContext *ctx, JSValueConst obj, JSValueConst func)
@@ -10655,6 +10801,14 @@ static int num_keys_cmp(const void *p1, const void *p2, void *opaque)
         return 1;
 }
 
+/**
+ * JS_FreePropertyEnum - 释放属性枚举数组
+ * @ctx: 上下文
+ * @tab: 属性枚举数组
+ * @len: 数组长度
+ * 
+ * 说明：释放数组本身及其中所有 Atom 的引用
+ */
 void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab, uint32_t len)
 {
     uint32_t i;
@@ -10665,6 +10819,31 @@ void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab, uint32_t len)
     }
 }
 
+/**
+ * JS_GetOwnPropertyNamesInternal - 获取对象自身属性名（内部实现）
+ * @ctx: 上下文
+ * @ptab: 输出属性枚举数组
+ * @plen: 输出数组长度
+ * @p: 对象
+ * @flags: 标志位（JS_GPN_*）
+ * 返回：0 成功，-1 异常
+ * 
+ * 说明：
+ * - 返回对象自身的属性名（不含原型链）
+ * - 按类型分组：数字键 -> 字符串键 -> Symbol 键 -> exotic 键
+ * - 数字键按数值排序
+ * - 支持枚举过滤（JS_GPN_ENUM_ONLY）
+ * - 支持类型过滤（STRING/SYMBOL 掩码）
+ * - 处理 exotic 对象的自定义属性枚举
+ * - 处理快速数组和字符串对象的特殊情况
+ * 
+ * flags 位定义：
+ * - bit 0: JS_ATOM_KIND_STRING
+ * - bit 1: JS_ATOM_KIND_SYMBOL
+ * - JS_GPN_ENUM_ONLY: 仅返回可枚举属性
+ * - JS_GPN_STRING_MASK: 包含字符串键
+ * - JS_GPN_SYMBOL_MASK: 包含 Symbol 键
+ */
 /* return < 0 in case if exception, 0 if OK. ptab and its atoms must
    be freed by the user. */
 static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
@@ -10687,6 +10866,7 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     *ptab = NULL;
     *plen = 0;
 
+    /* 第一阶段：计算需要返回的属性数量 */
     /* compute the number of returned properties */
     num_keys_count = 0;
     str_keys_count = 0;
@@ -10712,12 +10892,13 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                         return -1;
                     }
                 }
+                /* 按类型分类计数 */
                 if (JS_AtomIsArrayIndex(ctx, &num_key, atom)) {
-                    num_keys_count++;
+                    num_keys_count++;  /* 数字键（数组索引） */
                 } else if (kind == JS_ATOM_KIND_STRING) {
-                    str_keys_count++;
+                    str_keys_count++;  /* 字符串键 */
                 } else {
-                    sym_keys_count++;
+                    sym_keys_count++;  /* Symbol 键 */
                 }
             }
         }
@@ -10768,8 +10949,10 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
         }
     }
 
+    /* 第二阶段：填充属性名数组 */
     /* fill them */
 
+    /* 计算总数并检查溢出 */
     atom_count = num_keys_count + str_keys_count;
     if (atom_count < str_keys_count)
         goto add_overflow;
@@ -10792,12 +10975,15 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
         return -1;
     }
 
+    /* 初始化各类键的起始索引 */
+    /* 布局：[数字键][字符串键][Symbol 键][exotic 键] */
     num_index = 0;
     str_index = num_keys_count;
     sym_index = str_index + str_keys_count;
 
-    num_sorted = TRUE;
+    num_sorted = TRUE;  /* 标记数字键是否已排序 */
     sh = p->shape;
+    /* 遍历 shape 属性，填充到对应位置 */
     for(i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
         atom = prs->atom;
         if (atom != JS_ATOM_NULL) {
@@ -10807,7 +10993,7 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                 ((flags >> kind) & 1) != 0) {
                 if (JS_AtomIsArrayIndex(ctx, &num_key, atom)) {
                     j = num_index++;
-                    num_sorted = FALSE;
+                    num_sorted = FALSE;  /* 发现未排序的数字键 */
                 } else if (kind == JS_ATOM_KIND_STRING) {
                     j = str_index++;
                 } else {
@@ -10821,12 +11007,15 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
 
     if (p->is_exotic) {
         int len;
+        /* 处理 exotic 对象的特殊情况 */
         if (p->fast_array) {
+            /* 快速数组：添加数组元素索引 */
             if (flags & JS_GPN_STRING_MASK) {
                 len = p->u.array.count;
                 goto add_array_keys;
             }
         } else if (p->class_id == JS_CLASS_STRING) {
+            /* String 对象：添加字符索引 */
             if (flags & JS_GPN_STRING_MASK) {
                 len = js_string_obj_get_length(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
             add_array_keys:
@@ -10841,6 +11030,7 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
                 }
             }
         } else {
+            /* 其他 exotic 对象：使用自定义的属性名列表 */
             /* Note: exotic keys are not reordered and comes after the object own properties. */
             for(i = 0; i < exotic_count; i++) {
                 atom = tab_exotic[i].atom;
@@ -10859,10 +11049,12 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
         }
     }
 
+    /* 验证索引一致性 */
     assert(num_index == num_keys_count);
     assert(str_index == num_keys_count + str_keys_count);
     assert(sym_index == atom_count);
 
+    /* 对数字键进行排序（ECMA 要求数字键按升序排列） */
     if (num_keys_count != 0 && !num_sorted) {
         rqsort(tab_atom, num_keys_count, sizeof(tab_atom[0]), num_keys_cmp,
                ctx);
@@ -10872,6 +11064,20 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     return 0;
 }
 
+/**
+ * JS_GetOwnPropertyNames - 获取对象自身属性名（公开 API）
+ * @ctx: 上下文
+ * @ptab: 输出属性枚举数组
+ * @plen: 输出数组长度
+ * @obj: 对象 JSValue
+ * @flags: 标志位
+ * 返回：0 成功，-1 异常
+ * 
+ * 说明：
+ * - 验证对象类型
+ * - 调用内部实现函数
+ * - 返回的属性名需要用户调用 JS_FreePropertyEnum 释放
+ */
 int JS_GetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab,
                            uint32_t *plen, JSValueConst obj, int flags)
 {
@@ -10883,6 +11089,22 @@ int JS_GetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab,
                                           JS_VALUE_GET_OBJ(obj), flags);
 }
 
+/**
+ * JS_GetOwnPropertyInternal - 获取自身属性描述符（内部实现）
+ * @ctx: 上下文
+ * @desc: 输出属性描述符（可为 NULL）
+ * @p: 对象
+ * @prop: 属性名
+ * 返回：-1(异常)/FALSE(不存在)/TRUE(存在)
+ * 
+ * 说明：
+ * - 查找对象自身的属性（不含原型链）
+ * - 填充属性描述符（flags、getter、setter、value）
+ * - 处理特殊属性类型（GETSET、VARREF、AUTOINIT）
+ * - 处理 exotic 对象的自定义行为
+ * - 对于 VARREF，检查是否已初始化
+ * - 对于 AUTOINIT，延迟初始化直到实际访问
+ */
 /* Return -1 if exception,
    FALSE if the property does not exist, TRUE if it exists. If TRUE is
    returned, the property descriptor 'desc' is filled present. */
@@ -10896,11 +11118,13 @@ retry:
     prs = find_own_property(&pr, p, prop);
     if (prs) {
         if (desc) {
+            /* 填充属性描述符 */
             desc->flags = prs->flags & JS_PROP_C_W_E;
             desc->getter = JS_UNDEFINED;
             desc->setter = JS_UNDEFINED;
             desc->value = JS_UNDEFINED;
             if (unlikely(prs->flags & JS_PROP_TMASK)) {
+                /* 特殊属性类型处理 */
                 if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
                     desc->flags |= JS_PROP_GETSET;
                     if (pr->u.getset.getter)
@@ -10974,6 +11198,17 @@ int JS_GetOwnProperty(JSContext *ctx, JSPropertyDescriptor *desc,
     return JS_GetOwnPropertyInternal(ctx, desc, JS_VALUE_GET_OBJ(obj), prop);
 }
 
+/**
+ * JS_IsExtensible - 检查对象是否可扩展
+ * @ctx: 上下文
+ * @obj: 对象
+ * 返回：TRUE(可扩展)/FALSE(不可扩展)/-1(异常)
+ * 
+ * 说明：
+ * - 非对象返回 FALSE
+ * - exotic 对象使用自定义的 is_extensible 方法
+ * - 普通对象返回 extensible 标志
+ */
 /* return -1 if exception (exotic object only) or TRUE/FALSE */
 int JS_IsExtensible(JSContext *ctx, JSValueConst obj)
 {
@@ -10991,6 +11226,18 @@ int JS_IsExtensible(JSContext *ctx, JSValueConst obj)
     return p->extensible;
 }
 
+/**
+ * JS_PreventExtensions - 阻止对象扩展
+ * @ctx: 上下文
+ * @obj: 对象
+ * 返回：TRUE(成功)/FALSE(失败)/-1(异常)
+ * 
+ * 说明：
+ * - 设置对象的 extensible 标志为 FALSE
+ * - exotic 对象使用自定义的 prevent_extensions 方法
+ * - TypedArray 如果是 resizable 则返回 FALSE
+ * - Object.preventExtensions() 的底层实现
+ */
 /* return -1 if exception (exotic object only) or TRUE/FALSE */
 int JS_PreventExtensions(JSContext *ctx, JSValueConst obj)
 {
@@ -11021,6 +11268,19 @@ int JS_PreventExtensions(JSContext *ctx, JSValueConst obj)
     return TRUE;
 }
 
+/**
+ * JS_HasProperty - 检查对象是否有某属性（沿原型链）
+ * @ctx: 上下文
+ * @obj: 对象
+ * @prop: 属性名
+ * 返回：TRUE(有)/FALSE(无)/-1(异常)
+ * 
+ * 说明：
+ * - 沿原型链查找属性
+ * - exotic 对象使用自定义的 has_property 方法
+ * - TypedArray 对数字索引有特殊处理
+ * - in 运算符的底层实现
+ */
 /* return -1 if exception otherwise TRUE or FALSE */
 int JS_HasProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
 {
@@ -11057,6 +11317,7 @@ int JS_HasProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
                 return FALSE;
             }
         }
+        /* 沿原型链继续查找 */
         p = p->shape->proto;
         if (!p)
             break;
@@ -11064,6 +11325,14 @@ int JS_HasProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
     return FALSE;
 }
 
+/**
+ * js_symbol_to_atom - Symbol 转 Atom
+ * @ctx: 上下文
+ * @val: Symbol JSValue
+ * 返回：对应的 Atom
+ * 
+ * 说明：从 Symbol 提取 Atom 索引（要求 val 必须是 Symbol）
+ */
 /* val must be a symbol */
 static JSAtom js_symbol_to_atom(JSContext *ctx, JSValue val)
 {
@@ -11071,6 +11340,18 @@ static JSAtom js_symbol_to_atom(JSContext *ctx, JSValue val)
     return js_get_atom_index(ctx->rt, p);
 }
 
+/**
+ * JS_ValueToAtom - JSValue 转 Atom
+ * @ctx: 上下文
+ * @val: JSValue
+ * 返回：Atom 或 JS_ATOM_NULL（异常）
+ * 
+ * 说明：
+ * - 整数：快速路径，直接转换为 Atom
+ * - Symbol：提取 Atom 索引并增加引用
+ * - 其他：先转换为 PropertyKey（字符串或 Symbol），再转 Atom
+ * - 用于对象属性访问的键转换
+ */
 /* return JS_ATOM_NULL in case of exception */
 JSAtom JS_ValueToAtom(JSContext *ctx, JSValueConst val)
 {
@@ -11098,6 +11379,21 @@ JSAtom JS_ValueToAtom(JSContext *ctx, JSValueConst val)
     return atom;
 }
 
+/**
+ * JS_GetPropertyValue - 获取属性值（支持快速路径优化）
+ * @ctx: 上下文
+ * @this_obj: 对象
+ * @prop: 属性名（JSValue）
+ * 返回：属性值 JSValue
+ * 
+ * 说明：
+ * - 快速路径：对象 + 整数索引，直接访问数组元素
+ * - 支持所有 TypedArray 类型的快速访问
+ * - 慢速路径：通用属性访问流程
+ *   - 先 ToObject 再 ToPropertyKey
+ *   - 处理 null/undefined 错误
+ *   - 转换为 Atom 后调用 JS_GetProperty
+ */
 static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                                    JSValue prop)
 {
@@ -11215,6 +11511,17 @@ static int JS_TryGetPropertyInt64(JSContext *ctx, JSValueConst obj, int64_t idx,
     return present;
 }
 
+/**
+ * JS_GetPropertyInt64 - 获取 64 位整数索引的属性
+ * @ctx: 上下文
+ * @obj: 对象
+ * @idx: 64 位整数索引
+ * 返回：属性值 JSValue
+ * 
+ * 说明：
+ * - 小索引使用快速路径（JS_GetPropertyValue）
+ * - 大索引创建 Atom 后调用 JS_GetProperty
+ */
 static JSValue JS_GetPropertyInt64(JSContext *ctx, JSValueConst obj, int64_t idx)
 {
     JSAtom prop;
@@ -11233,6 +11540,15 @@ static JSValue JS_GetPropertyInt64(JSContext *ctx, JSValueConst obj, int64_t idx
     return val;
 }
 
+/**
+ * JS_GetPropertyStr - 通过字符串获取属性
+ * @ctx: 上下文
+ * @this_obj: 对象
+ * @prop: 属性名（C 字符串）
+ * 返回：属性值 JSValue
+ * 
+ * 说明：便捷函数，将字符串转为 Atom 后调用 JS_GetProperty
+ */
 JSValue JS_GetPropertyStr(JSContext *ctx, JSValueConst this_obj,
                           const char *prop)
 {
@@ -11246,6 +11562,23 @@ JSValue JS_GetPropertyStr(JSContext *ctx, JSValueConst this_obj,
     return ret;
 }
 
+/**
+ * add_property - 向对象添加新属性
+ * @ctx: 上下文
+ * @p: 对象
+ * @prop: 属性名 Atom
+ * @prop_flags: 属性标志
+ * 返回：新属性指针，NULL 表示内存错误
+ * 
+ * 说明：
+ * - 添加属性到对象的 shape
+ * - 处理标准数组原型的特殊标志更新
+ * - 使用 shape 共享优化（查找匹配的现有 shape）
+ * - 如果 shape 被共享则克隆
+ * - 注意：属性值未初始化，调用者需自行设置
+ * 
+ * 注意：property value is not initialized. Return NULL if memory error.
+ */
 /* Note: the property value is not initialized. Return NULL if memory
    error. */
 static JSProperty *add_property(JSContext *ctx,
@@ -11254,7 +11587,7 @@ static JSProperty *add_property(JSContext *ctx,
     JSShape *sh, *new_sh;
 
     if (unlikely(__JS_AtomIsTaggedInt(prop))) {
-        /* update is_std_array_prototype */
+        /* update is_std_array_prototype - 处理整数属性名（数组索引） */
         if (unlikely(p->is_std_array_prototype)) {
             p->is_std_array_prototype = FALSE;
         } else if (unlikely(p->has_immutable_prototype)) {
@@ -11276,7 +11609,7 @@ static JSProperty *add_property(JSContext *ctx,
     }
     sh = p->shape;
     if (sh->is_hashed) {
-        /* try to find an existing shape */
+        /* try to find an existing shape - 查找匹配的现有 shape（优化） */
         new_sh = find_hashed_shape_prop(ctx->rt, sh, prop, prop_flags);
         if (new_sh) {
             /* matching shape found: use it */
@@ -11293,7 +11626,7 @@ static JSProperty *add_property(JSContext *ctx,
             js_free_shape(ctx->rt, sh);
             return &p->prop[new_sh->prop_count - 1];
         } else if (sh->header.ref_count != 1) {
-            /* if the shape is shared, clone it */
+            /* if the shape is shared, clone it - shape 被共享则克隆 */
             new_sh = js_clone_shape(ctx, sh);
             if (!new_sh)
                 return NULL;
@@ -11310,6 +11643,22 @@ static JSProperty *add_property(JSContext *ctx,
     return &p->prop[p->shape->prop_count - 1];
 }
 
+/**
+ * convert_fast_array_to_array - 快速数组转为普通数组
+ * @ctx: 上下文
+ * @p: 对象（必须是 Array/Arguments/MappedArguments）
+ * 返回：0 成功，-1 内存错误
+ * 
+ * 说明：
+ * - 将快速数组存储转为普通属性存储
+ * - 为每个数组元素创建属性
+ * - MappedArguments 使用 VARREF 属性类型
+ * - 释放快速数组内存，清除 fast_array 标志
+ * 
+ * can be called on JS_CLASS_ARRAY, JS_CLASS_ARGUMENTS or
+   JS_CLASS_MAPPED_ARGUMENTS objects. return < 0 if memory alloc
+   error.
+ */
 /* can be called on JS_CLASS_ARRAY, JS_CLASS_ARGUMENTS or
    JS_CLASS_MAPPED_ARGUMENTS objects. return < 0 if memory alloc
    error. */
@@ -11357,6 +11706,19 @@ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
     return 0;
 }
 
+/**
+ * remove_global_object_property - 移除全局对象属性（变量引用处理）
+ * @ctx: 上下文
+ * @p: 全局对象
+ * @prs: Shape 属性
+ * @pr: 属性
+ * 返回：0 成功，-1 失败
+ * 
+ * 说明：
+ * - 当删除全局对象的变量引用属性时调用
+ * - 如果 var_ref 被多处引用，移动到 uninitialized_vars
+ * - 重置变量为未初始化状态
+ */
 static int remove_global_object_property(JSContext *ctx, JSObject *p,
                                          JSShapeProperty *prs, JSProperty *pr)
 {
@@ -11380,6 +11742,22 @@ static int remove_global_object_property(JSContext *ctx, JSObject *p,
     return 0;
 }
 
+/**
+ * delete_property - 删除对象属性
+ * @ctx: 上下文
+ * @p: 对象
+ * @atom: 属性名
+ * 返回：TRUE(成功)/FALSE(不可配置)/-1(异常)
+ * 
+ * 说明：
+ * - 使用哈希查找属性
+ * - 检查属性是否可配置（configurable）
+ * - 从 shape 中移除属性，更新哈希链
+ * - 全局对象的 VARREF 属性特殊处理
+ * - 快速数组优化：最后一个元素直接删除
+ * - 删除比例过高时压缩属性
+ * - exotic 对象使用自定义 delete_property 方法
+ */
 static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
 {
     JSShape *sh;
@@ -11390,7 +11768,7 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
 
  redo:
     sh = p->shape;
-    h1 = atom & sh->prop_hash_mask;
+    h1 = atom & sh->prop_hash_mask;  /* 计算哈希桶索引 */
     h = prop_hash_end(sh)[-h1 - 1];
     prop = get_shape_prop(sh);
     lpr = NULL;
@@ -11398,16 +11776,16 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
     while (h != 0) {
         pr = &prop[h - 1];
         if (likely(pr->atom == atom)) {
-            /* found ! */
+            /* found ! - 找到属性 */
             if (!(pr->flags & JS_PROP_CONFIGURABLE))
-                return FALSE;
+                return FALSE;  /* 不可配置，删除失败 */
             /* realloc the shape if needed */
             if (lpr)
                 lpr_idx = lpr - get_shape_prop(sh);
             if (js_shape_prepare_update(ctx, p, &pr))
                 return -1;
             sh = p->shape;
-            /* remove property */
+            /* remove property - 从哈希链中移除 */
             if (lpr) {
                 lpr = get_shape_prop(sh) + lpr_idx;
                 lpr->hash_next = pr->hash_next;
@@ -11429,7 +11807,7 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
             pr->atom = JS_ATOM_NULL;
             pr1->u.value = JS_UNDEFINED;
 
-            /* compact the properties if too many deleted properties */
+            /* compact the properties if too many deleted properties - 压缩属性 */
             if (sh->deleted_prop_count >= 8 &&
                 sh->deleted_prop_count >= ((unsigned)sh->prop_count / 2)) {
                 compact_properties(ctx, p);
@@ -11450,6 +11828,7 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
                     p->class_id == JS_CLASS_MAPPED_ARGUMENTS) {
                     /* Special case deleting the last element of a fast Array */
                     if (idx == p->u.array.count - 1) {
+                        /* 删除最后一个元素：直接释放并减少计数 */
                         if (p->class_id == JS_CLASS_MAPPED_ARGUMENTS) {
                             free_var_ref(ctx->rt, p->u.array.u.var_refs[idx]);
                         } else {
@@ -11458,6 +11837,7 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
                         p->u.array.count = idx;
                         return TRUE;
                     }
+                    /* 删除中间元素：转为普通数组后重试 */
                     if (convert_fast_array_to_array(ctx, p))
                         return -1;
                     goto redo;
@@ -11472,10 +11852,24 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
             }
         }
     }
-    /* not found */
+    /* not found - 未找到也返回 TRUE（幂等） */
     return TRUE;
 }
 
+/**
+ * call_setter - 调用 setter 函数
+ * @ctx: 上下文
+ * @setter: setter 函数对象
+ * @this_obj: this 绑定对象
+ * @val: 要设置的值
+ * @flags: 标志位
+ * 返回：TRUE(成功)/FALSE(静默失败)/-1(异常)
+ * 
+ * 说明：
+ * - 调用 setter 函数设置属性值
+ * - 无 setter 时根据 flags 决定抛出错误或静默失败
+ * - 严格模式下无 setter 抛出错误
+ */
 static int call_setter(JSContext *ctx, JSObject *setter,
                        JSValueConst this_obj, JSValue val, int flags)
 {
@@ -11501,6 +11895,21 @@ static int call_setter(JSContext *ctx, JSObject *setter,
     }
 }
 
+/**
+ * set_array_length - 设置数组 length 属性
+ * @ctx: 上下文
+ * @p: 数组对象
+ * @val: 新 length 值
+ * @flags: 标志位
+ * 返回：TRUE(成功)/FALSE(失败)/-1(异常)
+ * 
+ * 说明：
+ * - 缩小数组时删除多余元素
+ * - 快速数组：直接释放元素并更新计数
+ * - 普通数组：遍历删除超出索引的元素
+ * - 检查 length 是否可写
+ * - 处理不可配置元素的边界情况
+ */
 /* set the array length and remove the array elements if necessary. */
 static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
                             int flags)
@@ -11517,6 +11926,7 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
         return JS_ThrowTypeErrorReadOnly(ctx, flags, JS_ATOM_length);
 
     if (likely(p->fast_array)) {
+        /* 快速数组：直接截断 */
         uint32_t old_len = p->u.array.count;
         if (len < old_len) {
             for(i = len; i < old_len; i++) {
@@ -11526,6 +11936,7 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
         }
         p->prop[0].u.value = JS_NewUint32(ctx, len);
     } else {
+        /* 普通数组：需要删除超出新长度的元素 */
         /* Note: length is always a uint32 because the object is an
            array */
         JS_ToUint32(ctx, &cur_len, p->prop[0].u.value);
@@ -11534,9 +11945,10 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
             JSShape *sh;
             JSShapeProperty *pr;
 
-            d = cur_len - len;
+            d = cur_len - len;  /* 需要删除的元素数量 */
             sh = p->shape;
             if (d <= sh->prop_count) {
+                /* 删除的元素较少：从后往前逐个删除 */
                 JSAtom atom;
 
                 /* faster to iterate */
@@ -11547,14 +11959,13 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
                     if (unlikely(!ret)) {
                         /* unlikely case: property is not
                            configurable */
-                        break;
+                        break;  /* 遇到不可配置元素，停止删除 */
                     }
                     cur_len--;
                 }
             } else {
-                /* faster to iterate thru all the properties. Need two
-                   passes in case one of the property is not
-                   configurable */
+                /* 删除的元素较多：遍历所有属性，两遍扫描 */
+                /* 第一遍：确定实际能删除到的最小长度 */
                 cur_len = len;
                 for(i = 0, pr = get_shape_prop(sh); i < sh->prop_count;
                     i++, pr++) {
@@ -11562,11 +11973,12 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
                         JS_AtomIsArrayIndex(ctx, &idx, pr->atom)) {
                         if (idx >= cur_len &&
                             !(pr->flags & JS_PROP_CONFIGURABLE)) {
-                            cur_len = idx + 1;
+                            cur_len = idx + 1;  /* 更新为不可配置元素后的位置 */
                         }
                     }
                 }
 
+                /* 第二遍：删除超出 cur_len 的所有元素 */
                 for(i = 0, pr = get_shape_prop(sh); i < sh->prop_count;
                     i++, pr++) {
                     if (pr->atom != JS_ATOM_NULL &&
@@ -11592,6 +12004,17 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
     return TRUE;
 }
 
+/**
+ * expand_fast_array - 扩展快速数组容量
+ * @ctx: 上下文
+ * @p: 数组对象
+ * @new_len: 新长度
+ * 返回：0 成功，-1 失败
+ * 
+ * 说明：
+ * - 按 1.5 倍增长策略扩展容量
+ * - 使用 js_realloc2 获取额外 slack 空间
+ */
 /* return -1 if exception */
 static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
 {
@@ -11609,6 +12032,20 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
     return 0;
 }
 
+/**
+ * add_fast_array_element - 向快速数组添加元素
+ * @ctx: 上下文
+ * @p: 数组对象（必须是 JS_CLASS_ARRAY、fast_array=TRUE、extensible=TRUE）
+ * @val: 元素值（所有权转移）
+ * @flags: 标志位
+ * 返回：TRUE(成功)/-1(失败)
+ * 
+ * 说明：
+ * - 在数组末尾添加元素
+ * - 更新 length 属性（如果需要）
+ * - 容量不足时自动扩展
+ * - 前置条件：p 必须是快速数组且可扩展
+ */
 /* Preconditions: 'p' must be of class JS_CLASS_ARRAY, p->fast_array =
    TRUE and p->extensible = TRUE */
 static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
@@ -11631,6 +12068,7 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
         }
     }
     if (unlikely(new_len > p->u.array.u1.size)) {
+        /* 容量不足，扩展数组 */
         if (expand_fast_array(ctx, p, new_len)) {
             JS_FreeValue(ctx, val);
             return -1;
@@ -11641,6 +12079,17 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
     return TRUE;
 }
 
+/**
+ * js_allocate_fast_array - 分配新的快速数组
+ * @ctx: 上下文
+ * @len: 数组长度（64 位整数）
+ * 返回：数组 JSValue 或 JS_EXCEPTION
+ * 
+ * 说明：
+ * - 创建初始化为 JS_UNDEFINED 的快速数组
+ * - 最大长度 2^31-1
+ * - 预分配容量并设置 length 属性
+ */
 /* Allocate a new fast array initialized to JS_UNDEFINED. Its maximum
    size is 2^31-1 elements. For convenience, 'len' is a 64 bit
    integer. */
@@ -11670,6 +12119,17 @@ static JSValue js_allocate_fast_array(JSContext *ctx, int64_t len)
     return arr;
 }
 
+/**
+ * js_create_array - 创建数组并填充元素
+ * @ctx: 上下文
+ * @len: 数组长度
+ * @tab: 元素数组
+ * 返回：数组 JSValue 或 JS_EXCEPTION
+ * 
+ * 说明：
+ * - 创建快速数组并复制元素（增加引用计数）
+ * - 设置 length 属性
+ */
 static JSValue js_create_array(JSContext *ctx, int len, JSValueConst *tab)
 {
     JSValue obj;
@@ -11694,6 +12154,18 @@ static JSValue js_create_array(JSContext *ctx, int len, JSValueConst *tab)
     return obj;
 }
 
+/**
+ * js_create_array_free - 创建数组并转移元素所有权
+ * @ctx: 上下文
+ * @len: 数组长度
+ * @tab: 元素数组（所有权转移，失败时需释放）
+ * 返回：数组 JSValue 或 JS_EXCEPTION
+ * 
+ * 说明：
+ * - 与 js_create_array 类似，但不增加引用计数（直接转移所有权）
+ * - 失败时需要释放剩余元素
+ * - 用于优化，避免不必要的引用计数操作
+ */
 static JSValue js_create_array_free(JSContext *ctx, int len, JSValue *tab)
 {
     JSValue obj;
@@ -11721,6 +12193,13 @@ static JSValue js_create_array_free(JSContext *ctx, int len, JSValue *tab)
     return obj;
 }
 
+/**
+ * js_free_desc - 释放属性描述符
+ * @ctx: 上下文
+ * @desc: 属性描述符
+ * 
+ * 说明：释放描述符中的所有 JSValue（getter、setter、value）
+ */
 static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc)
 {
     JS_FreeValue(ctx, desc->getter);
@@ -11728,6 +12207,26 @@ static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc)
     JS_FreeValue(ctx, desc->value);
 }
 
+/**
+ * JS_SetPropertyInternal - 设置属性（核心内部实现）
+ * @ctx: 上下文
+ * @obj: 要设置属性的对象
+ * @prop: 属性名 Atom
+ * @val: 属性值（所有权转移给函数）
+ * @this_obj: receiver 对象（用于 setter 调用）
+ * @flags: 标志位（JS_PROP_THROW / JS_PROP_THROW_STRICT）
+ * 返回：TRUE(成功)/FALSE(失败)/-1(异常)
+ * 
+ * 说明：
+ * - 核心属性设置逻辑，处理所有边界情况
+ * - 支持原型链查找 setter
+ * - 处理各种特殊属性类型（GETSET、VARREF、AUTOINIT、LENGTH）
+ * - 处理 exotic 对象（TypedArray、Proxy 等）
+ * - 支持快速数组优化
+ * - 严格模式下错误抛出
+ * 
+ * 注意：val 会被函数释放（无论成功失败）
+ */
 /* return -1 in case of exception or TRUE or FALSE. Warning: 'val' is
    freed by the function. 'flags' is a bitmask of JS_PROP_THROW and
    JS_PROP_THROW_STRICT. 'this_obj' is the receiver. If obj !=
@@ -11746,6 +12245,7 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
 #endif
     tag = JS_VALUE_GET_TAG(this_obj);
     if (unlikely(tag != JS_TAG_OBJECT)) {
+        /* this_obj 不是对象：处理 null/undefined 或原始类型 */
         if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
             p = NULL;
             p1 = JS_VALUE_GET_OBJ(obj);
@@ -11774,22 +12274,27 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
             goto retry2;
     }
 
+    /* 快速路径：obj == this_obj 时的优化 */
     /* fast path if obj == this_obj */
  retry:
     prs = find_own_property(&pr, p1, prop);
     if (prs) {
+        /* 找到自身属性，根据类型处理 */
         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
-            /* fast case */
+            /* fast case - 普通可写属性，直接设置值 */
             set_value(ctx, &pr->u.value, val);
             return TRUE;
         } else if (prs->flags & JS_PROP_LENGTH) {
+            /* 数组 length 属性，特殊处理 */
             assert(p->class_id == JS_CLASS_ARRAY);
             assert(prop == JS_ATOM_length);
             return set_array_length(ctx, p, val, flags);
         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+            /* getter/setter 属性，调用 setter */
             return call_setter(ctx, pr->u.getset.setter, this_obj, val, flags);
         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
+            /* 变量引用属性（全局变量、模块命名空间） */
             /* XXX: already use var_ref->is_const. Cannot simplify use the
                writable flag for JS_CLASS_MODULE_NS. */
             if (p->class_id == JS_CLASS_MODULE_NS || pr->u.var_ref->is_const)
@@ -11797,6 +12302,7 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
             set_value(ctx, pr->u.var_ref->pvalue, val);
             return TRUE;
         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+            /* 自动初始化属性，先初始化再重试 */
             /* Instantiate property and retry (potentially useless) */
             if (JS_AutoInitProperty(ctx, p, prop, pr, prs)) {
                 JS_FreeValue(ctx, val);
@@ -11804,16 +12310,21 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
             }
             goto retry;
         } else {
+            /* 其他情况：只读属性 */
             goto read_only_prop;
         }
     }
 
+    /* 沿原型链查找 setter 或处理 exotic 对象 */
     for(;;) {
         if (p1->is_exotic) {
+            /* exotic 对象特殊处理 */
             if (p1->fast_array) {
+                /* 快速数组：检查整数索引 */
                 if (__JS_AtomIsTaggedInt(prop)) {
                     uint32_t idx = __JS_AtomToUInt32(prop);
                     if (idx < p1->u.array.count) {
+                        /* 索引在范围内 */
                         if (unlikely(p == p1))
                             return JS_SetPropertyValue(ctx, this_obj, JS_NewInt32(ctx, idx), val, flags);
                         else
@@ -11824,6 +12335,7 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                     }
                 } else if (p1->class_id >= JS_CLASS_UINT8C_ARRAY &&
                            p1->class_id <= JS_CLASS_FLOAT64_ARRAY) {
+                    /* TypedArray：检查是否为数字索引 */
                     ret = JS_AtomIsNumericIndex(ctx, prop);
                     if (ret != 0) {
                         if (ret < 0) {
@@ -11832,7 +12344,7 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                         }
                     typed_array_oob:
                         if (p == p1) {
-                            /* must convert the argument even if out of bound access */
+                            /* must convert the argument even if out of bound access - 越界访问也要转换 */
                             if (p1->class_id == JS_CLASS_BIG_INT64_ARRAY ||
                                 p1->class_id == JS_CLASS_BIG_UINT64_ARRAY) {
                                 int64_t v;
@@ -11851,6 +12363,7 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                     }
                 }
             } else {
+                /* 其他 exotic 对象：使用自定义方法 */
                 const JSClassExoticMethods *em = ctx->rt->class_array[p1->class_id].exotic;
                 if (em) {
                     JSValue obj1;
@@ -11875,6 +12388,7 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                         }
                         if (ret) {
                             if (desc.flags & JS_PROP_GETSET) {
+                                /* getter/setter 属性 */
                                 JSObject *setter;
                                 if (JS_IsUndefined(desc.setter))
                                     setter = NULL;
@@ -11885,6 +12399,7 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                 JS_FreeValue(ctx, desc.setter);
                                 return ret;
                             } else {
+                                /* 普通值属性 */
                                 JS_FreeValue(ctx, desc.value);
                                 if (!(desc.flags & JS_PROP_WRITABLE))
                                     goto read_only_prop;
@@ -11903,12 +12418,14 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                 }
             }
         }
+        /* 沿原型链继续查找 */
         p1 = p1->shape->proto;
     prototype_lookup:
         if (!p1)
             break;
 
     retry2:
+        /* 在原型上查找属性 */
         prs = find_own_property(&pr, p1, prop);
         if (prs) {
             if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
@@ -11926,6 +12443,7 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
         }
     }
 
+    /* 未找到 setter，需要创建新属性 */
     if (unlikely(!p)) {
         JS_FreeValue(ctx, val);
         return JS_ThrowTypeErrorOrFalse(ctx, flags, "not an object");
@@ -11937,12 +12455,13 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
     }
 
     if (likely(p == JS_VALUE_GET_OBJ(obj))) {
+        /* 在对象自身上创建属性 */
         if (p->is_exotic) {
             if (p->class_id == JS_CLASS_ARRAY && p->fast_array &&
                 __JS_AtomIsTaggedInt(prop)) {
                 uint32_t idx = __JS_AtomToUInt32(prop);
                 if (idx == p->u.array.count) {
-                    /* fast case */
+                    /* fast case - 在快速数组末尾添加元素 */
                     return add_fast_array_element(ctx, p, val, flags);
                 } else {
                     goto generic_create_prop;
@@ -11953,6 +12472,7 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
         } else {
             if (unlikely(p->class_id == JS_CLASS_GLOBAL_OBJECT))
                 goto generic_create_prop;
+            /* 普通对象：直接添加属性 */
             pr = add_property(ctx, p, prop, JS_PROP_C_W_E);
             if (unlikely(!pr)) {
                 JS_FreeValue(ctx, val);
@@ -11963,12 +12483,14 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
         }
     } else {
         /* generic case: modify the property in this_obj if it already exists */
+        /* 通用情况：在 this_obj 上修改或创建属性 */
         ret = JS_GetOwnPropertyInternal(ctx, &desc, p, prop);
         if (ret < 0) {
             JS_FreeValue(ctx, val);
             return ret;
         }
         if (ret) {
+            /* 属性已存在 */
             if (desc.flags & JS_PROP_GETSET) {
                 JS_FreeValue(ctx, desc.getter);
                 JS_FreeValue(ctx, desc.setter);
@@ -11990,6 +12512,7 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
             return ret;
         } else {
         generic_create_prop:
+            /* 创建新属性 */
             ret = JS_CreateProperty(ctx, p, prop, val, JS_UNDEFINED, JS_UNDEFINED,
                                     flags |
                                     JS_PROP_HAS_VALUE |
@@ -12003,6 +12526,16 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
     }
 }
 
+/**
+ * can_extend_fast_array - 检查快速数组是否可直接扩展
+ * @p: 数组对象
+ * 返回：TRUE(可直接扩展)/FALSE(需要额外检查)
+ * 
+ * 说明：
+ * - 检查对象是否可扩展
+ * - 检查原型是否为标准数组原型
+ * - 用于优化数组 push 操作
+ */
 /* return true if an element can be added to a fast array without further tests */
 static force_inline BOOL can_extend_fast_array(JSObject *p)
 {
@@ -12015,6 +12548,21 @@ static force_inline BOOL can_extend_fast_array(JSObject *p)
     return proto->is_std_array_prototype;
 }
 
+/**
+ * JS_SetPropertyValue - 设置属性值（支持快速路径）
+ * @ctx: 上下文
+ * @this_obj: 对象
+ * @prop: 属性名（JSValue）
+ * @val: 属性值
+ * @flags: 标志位
+ * 返回：TRUE(成功)/FALSE(失败)/-1(异常)
+ * 
+ * 说明：
+ * - 快速路径：对象 + 整数索引，直接访问
+ * - 支持所有 TypedArray 类型的类型转换和边界检查
+ * - 数组越界访问：TypedArray 静默失败，普通数组转慢速路径
+ * - 慢速路径：转换为 Atom 后调用 JS_SetPropertyInternal
+ */
 /* flags can be JS_PROP_THROW or JS_PROP_THROW_STRICT */
 static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                                JSValue prop, JSValue val, int flags)
@@ -12038,7 +12586,7 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                              !can_extend_fast_array(p))) {
                     goto slow_path;
                 }
-                /* add element */
+                /* add element - 在末尾添加元素 */
                 return add_fast_array_element(ctx, p, val, flags);
             }
             set_value(ctx, &p->u.array.u.values[idx], val);
@@ -12117,7 +12665,7 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                 return -1;
             if (unlikely(idx >= (uint32_t)p->u.array.count)) {
             ta_out_of_bound:
-                return TRUE;
+                return TRUE;  /* TypedArray 越界访问静默失败 */
             }
             p->u.array.u.double_ptr[idx] = d;
             break;
@@ -12129,6 +12677,7 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         JSAtom atom;
         int ret;
     slow_path:
+        /* 慢速路径：通用属性设置 */
         atom = JS_ValueToAtom(ctx, prop);
         JS_FreeValue(ctx, prop);
         if (unlikely(atom == JS_ATOM_NULL)) {
@@ -12141,6 +12690,14 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
     }
 }
 
+/**
+ * JS_SetPropertyUint32 - 设置 32 位整数索引属性
+ * @ctx: 上下文
+ * @this_obj: 对象
+ * @idx: 索引
+ * @val: 值
+ * 返回：TRUE/FALSE/-1(异常)
+ */
 int JS_SetPropertyUint32(JSContext *ctx, JSValueConst this_obj,
                          uint32_t idx, JSValue val)
 {
@@ -12148,6 +12705,16 @@ int JS_SetPropertyUint32(JSContext *ctx, JSValueConst this_obj,
                                JS_PROP_THROW);
 }
 
+/**
+ * JS_SetPropertyInt64 - 设置 64 位整数索引属性
+ * @ctx: 上下文
+ * @this_obj: 对象
+ * @idx: 64 位索引
+ * @val: 值
+ * 返回：TRUE/FALSE/-1(异常)
+ * 
+ * 说明：小索引使用快速路径，大索引创建 Atom 后调用 JS_SetProperty
+ */
 int JS_SetPropertyInt64(JSContext *ctx, JSValueConst this_obj,
                         int64_t idx, JSValue val)
 {
@@ -12169,6 +12736,14 @@ int JS_SetPropertyInt64(JSContext *ctx, JSValueConst this_obj,
     return res;
 }
 
+/**
+ * JS_SetPropertyStr - 通过字符串设置属性
+ * @ctx: 上下文
+ * @this_obj: 对象
+ * @prop: 属性名（C 字符串）
+ * @val: 值
+ * 返回：TRUE/FALSE/-1(异常)
+ */
 int JS_SetPropertyStr(JSContext *ctx, JSValueConst this_obj,
                       const char *prop, JSValue val)
 {
@@ -12184,6 +12759,17 @@ int JS_SetPropertyStr(JSContext *ctx, JSValueConst this_obj,
     return ret;
 }
 
+/**
+ * get_prop_flags - 计算属性标志
+ * @flags: 输入标志
+ * @def_flags: 默认标志
+ * 返回：组合后的属性标志
+ * 
+ * 说明：
+ * - JS_PROP_HAS_x 标志强制使用对应值
+ * - 否则使用 def_flags 中的默认值
+ * - 用于 Object.defineProperty 的属性标志计算
+ */
 /* compute the property flags. For each flag: (JS_PROP_HAS_x forces
    it, otherwise def_flags is used)
    Note: makes assumption about the bit pattern of the flags
@@ -12195,6 +12781,25 @@ static int get_prop_flags(int flags, int def_flags)
     return (flags & mask) | (def_flags & ~mask);
 }
 
+/**
+ * JS_CreateProperty - 创建对象属性
+ * @ctx: 上下文
+ * @p: 对象
+ * @prop: 属性名
+ * @val: 属性值
+ * @getter: getter 函数（可选）
+ * @setter: setter 函数（可选）
+ * @flags: 属性标志
+ * 返回：TRUE(成功)/FALSE(失败)/-1(异常)
+ * 
+ * 说明：
+ * - 创建新属性或修改 exotic 对象的现有属性
+ * - 处理快速数组优化（末尾添加元素）
+ * - 处理 TypedArray（禁止创建数字索引属性）
+ * - 处理全局对象（使用变量引用）
+ * - 处理 getter/setter 属性
+ * - 检查对象可扩展性
+ */
 static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                              JSAtom prop, JSValueConst val,
                              JSValueConst getter, JSValueConst setter,
@@ -12214,6 +12819,7 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                 if (__JS_AtomIsTaggedInt(prop)) {
                     idx = __JS_AtomToUInt32(prop);
                     if (idx == p->u.array.count) {
+                        /* 在快速数组末尾添加元素 */
                         if (!p->extensible)
                             goto not_extensible;
                         if (flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET))
@@ -12227,7 +12833,7 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                         goto convert_to_array;
                     }
                 } else if (JS_AtomIsArrayIndex(ctx, &idx, prop)) {
-                    /* convert the fast array to normal array */
+                    /* convert the fast array to normal array - 转为普通数组 */
                 convert_to_array:
                     if (convert_fast_array_to_array(ctx, p))
                         return -1;
@@ -12237,7 +12843,7 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                 JSProperty *plen;
                 JSShapeProperty *pslen;
             generic_array:
-                /* update the length field */
+                /* update the length field - 更新数组 length */
                 plen = &p->prop[0];
                 JS_ToUint32(ctx, &len, plen->u.value);
                 if ((idx + 1) > len) {
@@ -12252,6 +12858,7 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
             }
         } else if (p->class_id >= JS_CLASS_UINT8C_ARRAY &&
                    p->class_id <= JS_CLASS_FLOAT64_ARRAY) {
+            /* TypedArray：禁止创建数字索引属性 */
             ret = JS_AtomIsNumericIndex(ctx, prop);
             if (ret != 0) {
                 if (ret < 0)
@@ -12282,11 +12889,13 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
     var_ref = NULL;
     delete_obj = NULL;
     if (flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) {
+        /* getter/setter 属性 */
         prop_flags = (flags & (JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE)) |
             JS_PROP_GETSET;
     } else {
         prop_flags = flags & JS_PROP_C_W_E;
         if (p->class_id == JS_CLASS_GLOBAL_OBJECT) {
+            /* 全局对象使用变量引用 */
             JSObject *p1 = JS_VALUE_GET_OBJ(p->u.global_object.uninitialized_vars);
             JSShapeProperty *prs1;
             JSProperty *pr1;
@@ -12311,6 +12920,7 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
         return -1;
     }
     if (flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) {
+        /* 设置 getter/setter */
         pr->u.getset.getter = NULL;
         if ((flags & JS_PROP_HAS_GET) && JS_IsFunction(ctx, getter)) {
             pr->u.getset.getter =
@@ -12322,6 +12932,7 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                 JS_VALUE_GET_OBJ(JS_DupValue(ctx, setter));
         }
     } else if (p->class_id == JS_CLASS_GLOBAL_OBJECT) {
+        /* 全局对象：使用变量引用存储值 */
         if (delete_obj)
             delete_property(ctx, delete_obj, prop);
         pr->u.var_ref = var_ref;
@@ -12331,6 +12942,7 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
             *var_ref->pvalue = JS_UNDEFINED;
         }
     } else {
+        /* 普通对象：直接存储值 */
         if (flags & JS_PROP_HAS_VALUE) {
             pr->u.value = JS_DupValue(ctx, val);
         } else {
@@ -12340,36 +12952,61 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
     return TRUE;
 }
 
+/**
+ * check_define_prop_flags - 检查 Object.defineProperty 的标志合法性
+ * @prop_flags: 当前属性标志
+ * @flags: 新标志
+ * 返回：TRUE(合法)/FALSE(非法)
+ * 
+ * 说明：
+ * - 不可配置属性不能变为可配置
+ * - 不可配置属性的 enumerable 不能改变
+ * - 不可配置且不可写的属性不能变为可写
+ * - accessor 和 data property 不能混用
+ */
 /* return FALSE if not OK */
 static BOOL check_define_prop_flags(int prop_flags, int flags)
 {
     BOOL has_accessor, is_getset;
 
     if (!(prop_flags & JS_PROP_CONFIGURABLE)) {
+        /* 不可配置属性：限制更多 */
         if ((flags & (JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE)) ==
             (JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE)) {
-            return FALSE;
+            return FALSE;  /* 不能变为可配置 */
         }
         if ((flags & JS_PROP_HAS_ENUMERABLE) &&
             (flags & JS_PROP_ENUMERABLE) != (prop_flags & JS_PROP_ENUMERABLE))
-            return FALSE;
+            return FALSE;  /* enumerable 不能改变 */
         if (flags & (JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE |
                      JS_PROP_HAS_GET | JS_PROP_HAS_SET)) {
             has_accessor = ((flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) != 0);
             is_getset = ((prop_flags & JS_PROP_TMASK) == JS_PROP_GETSET);
             if (has_accessor != is_getset)
-                return FALSE;
+                return FALSE;  /* accessor 和 data property 不能混用 */
             if (!is_getset && !(prop_flags & JS_PROP_WRITABLE)) {
                 /* not writable: cannot set the writable bit */
                 if ((flags & (JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE)) ==
                     (JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE))
-                    return FALSE;
+                    return FALSE;  /* 不可写属性不能变为可写 */
             }
         }
     }
     return TRUE;
 }
 
+/**
+ * js_shape_prepare_update - 准备修改 shape（确保可安全修改）
+ * @ctx: 上下文
+ * @p: 对象
+ * @pprs: Shape 属性指针（可选）
+ * 返回：0 成功，-1 失败
+ * 
+ * 说明：
+ * - 如果 shape 被共享（ref_count > 1），则克隆
+ * - 如果 shape 已哈希，从哈希表移除
+ * - 确保修改不会影响其他共享该 shape 的对象
+ */
 /* ensure that the shape can be safely modified */
 static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                                    JSShapeProperty **pprs)
@@ -12380,6 +13017,7 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
     sh = p->shape;
     if (sh->is_hashed) {
         if (sh->header.ref_count != 1) {
+            /* shape 被共享：克隆一份 */
             if (pprs)
                 idx = *pprs - get_shape_prop(sh);
             /* clone the shape (the resulting one is no longer hashed) */
@@ -12391,6 +13029,7 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
             if (pprs)
                 *pprs = get_shape_prop(sh) + idx;
         } else {
+            /* shape 未被共享：从哈希表移除 */
             js_shape_hash_unlink(ctx->rt, sh);
             sh->is_hashed = FALSE;
         }
@@ -12398,6 +13037,16 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
     return 0;
 }
 
+/**
+ * js_update_property_flags - 更新属性标志
+ * @ctx: 上下文
+ * @p: 对象
+ * @pprs: Shape 属性指针
+ * @flags: 新标志
+ * 返回：0 成功，-1 失败
+ * 
+ * 说明：仅在标志改变时更新，先调用 js_shape_prepare_update 确保安全
+ */
 static int js_update_property_flags(JSContext *ctx, JSObject *p,
                                     JSShapeProperty **pprs, int flags)
 {
@@ -12409,6 +13058,31 @@ static int js_update_property_flags(JSContext *ctx, JSObject *p,
     return 0;
 }
 
+/**
+ * JS_DefineProperty - 定义对象属性（Object.defineProperty 底层实现）
+ * @ctx: 上下文
+ * @this_obj: 对象
+ * @prop: 属性名
+ * @val: 属性值
+ * @getter: getter 函数
+ * @setter: setter 函数
+ * @flags: 标志位
+ * 返回：TRUE(成功)/FALSE(失败)/-1(异常)
+ * 
+ * 允许的 flags：
+ * - JS_PROP_CONFIGURABLE, JS_PROP_WRITABLE, JS_PROP_ENUMERABLE
+ * - JS_PROP_HAS_GET, JS_PROP_HAS_SET, JS_PROP_HAS_VALUE
+ * - JS_PROP_HAS_CONFIGURABLE, JS_PROP_HAS_WRITABLE, JS_PROP_HAS_ENUMERABLE
+ * - JS_PROP_THROW, JS_PROP_NO_EXOTIC
+ * 
+ * 说明：
+ * - 定义新属性或修改现有属性
+ * - 处理 Array length 特殊逻辑
+ * - 检查属性标志合法性（不可配置属性的限制）
+ * - 支持 getter/setter 与 data property 互相转换
+ * - 处理 VARREF（全局变量、模块命名空间）
+ * - 处理快速数组元素
+ */
 /* allowed flags:
    JS_PROP_CONFIGURABLE, JS_PROP_WRITABLE, JS_PROP_ENUMERABLE
    JS_PROP_HAS_GET, JS_PROP_HAS_SET, JS_PROP_HAS_VALUE,
@@ -12437,8 +13111,10 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
  redo_prop_update:
     prs = find_own_property(&pr, p, prop);
     if (prs) {
+        /* 属性已存在，处理特殊情况 */
         /* the range of the Array length property is always tested before */
         if ((prs->flags & JS_PROP_LENGTH) && (flags & JS_PROP_HAS_VALUE)) {
+            /* Array length 特殊处理：先转换为有效的数组长度 */
             uint32_t array_length;
             if (JS_ToArrayLengthFree(ctx, &array_length,
                                      JS_DupValue(ctx, val), FALSE)) {
@@ -12450,14 +13126,14 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
             prs = find_own_property(&pr, p, prop);
             assert(prs != NULL);
         }
-        /* property already exists */
+        /* property already exists - 属性已存在 */
         if (!check_define_prop_flags(prs->flags, flags)) {
         not_configurable:
             return JS_ThrowTypeErrorOrFalse(ctx, flags, "property is not configurable");
         }
 
         if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
-            /* Instantiate property and retry */
+            /* Instantiate property and retry - 自动初始化属性 */
             if (JS_AutoInitProperty(ctx, p, prop, pr, prs))
                 return -1;
             goto redo_prop_update;
@@ -12466,6 +13142,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
         if (flags & (JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE |
                      JS_PROP_HAS_GET | JS_PROP_HAS_SET)) {
             if (flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) {
+                /* 设置 getter/setter */
                 JSObject *new_getter, *new_setter;
 
                 if (JS_IsFunction(ctx, getter)) {
@@ -12480,6 +13157,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                 }
 
                 if ((prs->flags & JS_PROP_TMASK) != JS_PROP_GETSET) {
+                    /* 从 data property 转换为 getter/setter */
                     if (js_shape_prepare_update(ctx, p, &prs))
                         return -1;
                     /* convert to getset */
@@ -12498,6 +13176,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                     pr->u.getset.getter = NULL;
                     pr->u.getset.setter = NULL;
                 } else {
+                    /* 已是 getter/setter，检查不可配置属性的限制 */
                     if (!(prs->flags & JS_PROP_CONFIGURABLE)) {
                         if ((flags & JS_PROP_HAS_GET) &&
                             new_getter != pr->u.getset.getter) {
@@ -12524,8 +13203,9 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                     pr->u.getset.setter = new_setter;
                 }
             } else {
+                /* 设置值或 writable 标志（data property） */
                 if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
-                    /* convert to data descriptor */
+                    /* convert to data descriptor - 从 getter/setter 转为 data property */
                     JSVarRef *var_ref;
                     if (unlikely(p->class_id == JS_CLASS_GLOBAL_OBJECT)) {
                         var_ref = js_global_object_find_uninitialized_var(ctx, p, prop, FALSE);
@@ -12554,8 +13234,10 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                 } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
                     /* Note: JS_PROP_VARREF is always writable */
                 } else {
+                    /* 普通 data property */
                     if ((prs->flags & (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0 &&
                         (flags & JS_PROP_HAS_VALUE)) {
+                        /* 不可配置且不可写：值必须相同 */
                         if (!js_same_value(ctx, val, pr->u.value)) {
                             goto not_configurable;
                         } else {
@@ -12564,6 +13246,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                     }
                 }
                 if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
+                    /* VARREF 属性（全局变量、模块命名空间） */
                     if (flags & JS_PROP_HAS_VALUE) {
                         if (p->class_id == JS_CLASS_MODULE_NS) {
                             /* JS_PROP_WRITABLE is always true for variable
@@ -12578,6 +13261,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                         }
                     }
                     if ((flags & (JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE)) == JS_PROP_HAS_WRITABLE) {
+                        /* 设置 writable = false */
                         JSValue val1;
                         if (p->class_id == JS_CLASS_MODULE_NS) {
                             return JS_ThrowTypeErrorOrFalse(ctx, flags, "module namespace properties have writable = false");
@@ -12597,6 +13281,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                         }
                     }
                 } else if (prs->flags & JS_PROP_LENGTH) {
+                    /* Array length 属性特殊处理 */
                     if (flags & JS_PROP_HAS_VALUE) {
                         /* Note: no JS code is executable because
                            'val' is guaranted to be a Uint32 */
@@ -12618,6 +13303,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                     }
                     return res;
                 } else {
+                    /* 普通 data property 更新值 */
                     if (flags & JS_PROP_HAS_VALUE) {
                         JS_FreeValue(ctx, pr->u.value);
                         pr->u.value = JS_DupValue(ctx, val);
@@ -12631,6 +13317,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                 }
             }
         }
+        /* 更新 configurable 和 enumerable 标志 */
         mask = 0;
         if (flags & JS_PROP_HAS_CONFIGURABLE)
             mask |= JS_PROP_CONFIGURABLE;
@@ -12642,19 +13329,23 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
         return TRUE;
     }
 
-    /* handle modification of fast array elements */
+    /* 属性不存在，需要创建新属性 */
+    /* handle modification of fast array elements - 处理快速数组元素修改 */
     if (p->fast_array) {
         uint32_t idx;
         uint32_t prop_flags;
         if (p->class_id == JS_CLASS_ARRAY) {
+            /* 普通数组的快速路径 */
             if (__JS_AtomIsTaggedInt(prop)) {
                 idx = __JS_AtomToUInt32(prop);
                 if (idx < p->u.array.count) {
+                    /* 索引在范围内 */
                     prop_flags = get_prop_flags(flags, JS_PROP_C_W_E);
                     if (prop_flags != JS_PROP_C_W_E)
                         goto convert_to_slow_array;
                     if (flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) {
                     convert_to_slow_array:
+                        /* 需要转为普通数组（getter/setter 不能用于快速数组） */
                         if (convert_fast_array_to_array(ctx, p))
                             return -1;
                         else
@@ -12668,11 +13359,12 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
             }
         } else if (p->class_id >= JS_CLASS_UINT8C_ARRAY &&
                    p->class_id <= JS_CLASS_FLOAT64_ARRAY) {
+            /* TypedArray 特殊处理 */
             JSValue num;
             int ret;
 
             if (!__JS_AtomIsTaggedInt(prop)) {
-                /* slow path with to handle all numeric indexes */
+                /* slow path with to handle all numeric indexes - 处理所有数字索引 */
                 num = JS_AtomIsNumericIndex1(ctx, prop);
                 if (JS_IsUndefined(num))
                     goto typed_array_done;
@@ -12714,9 +13406,25 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
         }
     }
 
+    /* 最终调用 JS_CreateProperty 创建属性 */
     return JS_CreateProperty(ctx, p, prop, val, getter, setter, flags);
 }
 
+/**
+ * JS_DefineAutoInitProperty - 定义自动初始化属性
+ * @ctx: 上下文
+ * @this_obj: 对象
+ * @prop: 属性名
+ * @id: 自动初始化类型 ID
+ * @opaque: 不透明数据
+ * @flags: 标志位
+ * 返回：TRUE(成功)/FALSE(失败)/-1(异常)
+ * 
+ * 说明：
+ * - 创建 JS_PROP_AUTOINIT 类型属性
+ * - 属性值延迟初始化，首次访问时调用初始化函数
+ * - 用于原型、模块命名空间等特殊属性
+ */
 static int JS_DefineAutoInitProperty(JSContext *ctx, JSValueConst this_obj,
                                      JSAtom prop, JSAutoInitIDEnum id,
                                      void *opaque, int flags)
@@ -12730,23 +13438,34 @@ static int JS_DefineAutoInitProperty(JSContext *ctx, JSValueConst this_obj,
     p = JS_VALUE_GET_OBJ(this_obj);
 
     if (find_own_property(&pr, p, prop)) {
-        /* property already exists */
+        /* property already exists - 属性已存在，错误 */
         abort();
         return FALSE;
     }
 
-    /* Specialized CreateProperty */
+    /* Specialized CreateProperty - 创建 AUTOINIT 属性 */
     pr = add_property(ctx, p, prop, (flags & JS_PROP_C_W_E) | JS_PROP_AUTOINIT);
     if (unlikely(!pr))
         return -1;
     pr->u.init.realm_and_id = (uintptr_t)JS_DupContext(ctx);
     assert((pr->u.init.realm_and_id & 3) == 0);
     assert(id <= 3);
-    pr->u.init.realm_and_id |= id;
+    pr->u.init.realm_and_id |= id;  /* 编码 ID 到低 2 位 */
     pr->u.init.opaque = opaque;
     return TRUE;
 }
 
+/**
+ * JS_DefinePropertyValue - 定义属性值（便捷函数）
+ * @ctx: 上下文
+ * @this_obj: 对象
+ * @prop: 属性名
+ * @val: 属性值
+ * @flags: 标志位
+ * 返回：TRUE/FALSE/-1(异常)
+ * 
+ * 说明：设置默认标志（C_W_E + HAS_VALUE），自动释放 val
+ */
 /* shortcut to add or redefine a new property value */
 int JS_DefinePropertyValue(JSContext *ctx, JSValueConst this_obj,
                            JSAtom prop, JSValue val, int flags)
@@ -12758,6 +13477,17 @@ int JS_DefinePropertyValue(JSContext *ctx, JSValueConst this_obj,
     return ret;
 }
 
+/**
+ * JS_DefinePropertyValueValue - 定义属性值（JSValue 版本）
+ * @ctx: 上下文
+ * @this_obj: 对象
+ * @prop: 属性名（JSValue）
+ * @val: 属性值
+ * @flags: 标志位
+ * 返回：TRUE/FALSE/-1(异常)
+ * 
+ * 说明：将 JSValue 转为 Atom 后调用 JS_DefinePropertyValue
+ */
 int JS_DefinePropertyValueValue(JSContext *ctx, JSValueConst this_obj,
                                 JSValue prop, JSValue val, int flags)
 {
@@ -12774,6 +13504,9 @@ int JS_DefinePropertyValueValue(JSContext *ctx, JSValueConst this_obj,
     return ret;
 }
 
+/**
+ * JS_DefinePropertyValueUint32 - 定义 32 位整数索引属性
+ */
 int JS_DefinePropertyValueUint32(JSContext *ctx, JSValueConst this_obj,
                                  uint32_t idx, JSValue val, int flags)
 {
@@ -12781,6 +13514,9 @@ int JS_DefinePropertyValueUint32(JSContext *ctx, JSValueConst this_obj,
                                        val, flags);
 }
 
+/**
+ * JS_DefinePropertyValueInt64 - 定义 64 位整数索引属性
+ */
 int JS_DefinePropertyValueInt64(JSContext *ctx, JSValueConst this_obj,
                                 int64_t idx, JSValue val, int flags)
 {
@@ -12788,6 +13524,9 @@ int JS_DefinePropertyValueInt64(JSContext *ctx, JSValueConst this_obj,
                                        val, flags);
 }
 
+/**
+ * JS_DefinePropertyValueStr - 通过字符串定义属性
+ */
 int JS_DefinePropertyValueStr(JSContext *ctx, JSValueConst this_obj,
                               const char *prop, JSValue val, int flags)
 {
@@ -12803,6 +13542,18 @@ int JS_DefinePropertyValueStr(JSContext *ctx, JSValueConst this_obj,
     return ret;
 }
 
+/**
+ * JS_DefinePropertyGetSet - 定义 getter/setter（便捷函数）
+ * @ctx: 上下文
+ * @this_obj: 对象
+ * @prop: 属性名
+ * @getter: getter 函数
+ * @setter: setter 函数
+ * @flags: 标志位
+ * 返回：TRUE/FALSE/-1(异常)
+ * 
+ * 说明：设置默认标志（HAS_GET | HAS_SET | CONFIGURABLE | ENUMERABLE）
+ */
 /* shortcut to add getter & setter */
 int JS_DefinePropertyGetSet(JSContext *ctx, JSValueConst this_obj,
                             JSAtom prop, JSValue getter, JSValue setter,
@@ -12817,6 +13568,9 @@ int JS_DefinePropertyGetSet(JSContext *ctx, JSValueConst this_obj,
     return ret;
 }
 
+/**
+ * JS_CreateDataPropertyUint32 - 创建 32 位 data property
+ */
 static int JS_CreateDataPropertyUint32(JSContext *ctx, JSValueConst this_obj,
                                        int64_t idx, JSValue val, int flags)
 {
@@ -12826,6 +13580,14 @@ static int JS_CreateDataPropertyUint32(JSContext *ctx, JSValueConst this_obj,
 }
 
 
+/**
+ * js_object_has_name - 检查对象是否有非空 name 属性
+ * @ctx: 上下文
+ * @obj: 对象
+ * 返回：TRUE(有)/FALSE(无)
+ * 
+ * 说明：用于函数对象，检查是否已有 name 属性
+ */
 /* return TRUE if 'obj' has a non empty 'name' string */
 static BOOL js_object_has_name(JSContext *ctx, JSValueConst obj)
 {
@@ -12846,6 +13608,16 @@ static BOOL js_object_has_name(JSContext *ctx, JSValueConst obj)
     return (p->len != 0);
 }
 
+/**
+ * JS_DefineObjectName - 为对象定义 name 属性
+ * @ctx: 上下文
+ * @obj: 对象
+ * @name: 名称 Atom
+ * @flags: 标志位
+ * 返回：0 成功，-1 失败
+ * 
+ * 说明：仅当对象没有 name 属性时才添加
+ */
 static int JS_DefineObjectName(JSContext *ctx, JSValueConst obj,
                                JSAtom name, int flags)
 {
@@ -12858,6 +13630,14 @@ static int JS_DefineObjectName(JSContext *ctx, JSValueConst obj,
     return 0;
 }
 
+/**
+ * JS_DefineObjectNameComputed - 为对象定义计算 name 属性
+ * @ctx: 上下文
+ * @obj: 对象
+ * @str: 名称字符串
+ * @flags: 标志位
+ * 返回：0 成功，-1 失败
+ */
 static int JS_DefineObjectNameComputed(JSContext *ctx, JSValueConst obj,
                                        JSValueConst str, int flags)
 {
@@ -12878,14 +13658,34 @@ static int JS_DefineObjectNameComputed(JSContext *ctx, JSValueConst obj,
     return 0;
 }
 
+/**
+ * 全局变量定义标志
+ * DEFINE_GLOBAL_LEX_VAR: 词法变量（let/const）
+ * DEFINE_GLOBAL_FUNC_VAR: 函数声明变量
+ */
 #define DEFINE_GLOBAL_LEX_VAR (1 << 7)
 #define DEFINE_GLOBAL_FUNC_VAR (1 << 6)
 
+/**
+ * JS_ThrowSyntaxErrorVarRedeclaration - 抛出变量重声明错误
+ */
 static JSValue JS_ThrowSyntaxErrorVarRedeclaration(JSContext *ctx, JSAtom prop)
 {
     return JS_ThrowSyntaxErrorAtom(ctx, "redeclaration of '%s'", prop);
 }
 
+/**
+ * JS_CheckDefineGlobalVar - 检查全局变量定义合法性
+ * @ctx: 上下文
+ * @prop: 变量名
+ * @flags: 标志（0 / DEFINE_GLOBAL_LEX_VAR / DEFINE_GLOBAL_FUNC_VAR）
+ * 返回：TRUE(合法)/FALSE(非法)
+ * 
+ * 说明：
+ * - 词法变量（let/const）：不能重声明不可配置属性
+ * - 函数声明：有一定灵活性，但有限制
+ * - var 声明：最宽松
+ */
 /* flags is 0, DEFINE_GLOBAL_LEX_VAR or DEFINE_GLOBAL_FUNC_VAR */
 /* XXX: could support exotic global object. */
 static int JS_CheckDefineGlobalVar(JSContext *ctx, JSAtom prop, int flags)
@@ -12897,12 +13697,15 @@ static int JS_CheckDefineGlobalVar(JSContext *ctx, JSAtom prop, int flags)
     prs = find_own_property1(p, prop);
     /* XXX: should handle JS_PROP_AUTOINIT */
     if (flags & DEFINE_GLOBAL_LEX_VAR) {
+        /* let/const：不能重声明不可配置属性 */
         if (prs && !(prs->flags & JS_PROP_CONFIGURABLE))
             goto fail_redeclaration;
     } else {
+        /* var 或函数声明 */
         if (!prs && !p->extensible)
             goto define_error;
         if (flags & DEFINE_GLOBAL_FUNC_VAR) {
+            /* 函数声明：更严格的检查 */
             if (prs) {
                 if (!(prs->flags & JS_PROP_CONFIGURABLE) &&
                     ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET ||
@@ -12916,7 +13719,7 @@ static int JS_CheckDefineGlobalVar(JSContext *ctx, JSAtom prop, int flags)
             }
         }
     }
-    /* check if there already is a lexical declaration */
+    /* check if there already is a lexical declaration - 检查是否已有词法声明 */
     p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
     prs = find_own_property1(p, prop);
     if (prs) {
@@ -12927,6 +13730,18 @@ static int JS_CheckDefineGlobalVar(JSContext *ctx, JSAtom prop, int flags)
     return 0;
 }
 
+/**
+ * JS_GetGlobalVarRef - 获取全局变量引用
+ * @ctx: 上下文
+ * @prop: 变量名
+ * @sp: 输出数组 [对象，属性名]
+ * 返回：0 成功，-1 异常
+ * 
+ * 说明：
+ * - 先在 global_var_obj 查找词法变量
+ * - 未找到则在 global_obj 查找普通属性
+ * - 返回引用对象和属性名，用于后续 get_var_ref/put_var_ref 操作
+ */
 /* construct a reference to a global variable */
 static int JS_GetGlobalVarRef(JSContext *ctx, JSAtom prop, JSValue *sp)
 {
@@ -12938,6 +13753,7 @@ static int JS_GetGlobalVarRef(JSContext *ctx, JSAtom prop, JSValue *sp)
     p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
     prs = find_own_property(&pr, p, prop);
     if (prs) {
+        /* 词法变量（let/const/class） */
         /* XXX: conformance: do these tests in
            OP_put_var_ref/OP_get_var_ref ? */
         if (unlikely(JS_IsUninitialized(*pr->u.var_ref->pvalue))) {
@@ -12949,6 +13765,7 @@ static int JS_GetGlobalVarRef(JSContext *ctx, JSAtom prop, JSValue *sp)
         }
         sp[0] = JS_DupValue(ctx, ctx->global_var_obj);
     } else {
+        /* 普通全局属性（var 声明） */
         int ret;
         ret = JS_HasProperty(ctx, ctx->global_obj, prop);
         if (ret < 0)
@@ -12963,6 +13780,17 @@ static int JS_GetGlobalVarRef(JSContext *ctx, JSAtom prop, JSValue *sp)
     return 0;
 }
 
+/**
+ * JS_DeleteGlobalVar - 删除全局变量
+ * @ctx: 上下文
+ * @prop: 变量名
+ * 返回：TRUE(成功)/FALSE(不可删除)/-1(异常)
+ * 
+ * 说明：
+ * - 实现 DeleteBinding 语义
+ * - 词法变量（let/const/class）不可删除
+ * - var 声明和普通属性可以删除
+ */
 /* return -1, FALSE or TRUE */
 static int JS_DeleteGlobalVar(JSContext *ctx, JSAtom prop)
 {
@@ -12975,7 +13803,7 @@ static int JS_DeleteGlobalVar(JSContext *ctx, JSAtom prop)
     p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
     prs = find_own_property(&pr, p, prop);
     if (prs)
-        return FALSE; /* lexical variables cannot be deleted */
+        return FALSE; /* lexical variables cannot be deleted - 词法变量不可删除 */
     ret = JS_HasProperty(ctx, ctx->global_obj, prop);
     if (ret < 0)
         return -1;
@@ -12986,6 +13814,19 @@ static int JS_DeleteGlobalVar(JSContext *ctx, JSAtom prop)
     }
 }
 
+/**
+ * JS_DeleteProperty - 删除对象属性（delete 运算符实现）
+ * @ctx: 上下文
+ * @obj: 对象
+ * @prop: 属性名
+ * @flags: 标志位（0 / JS_PROP_THROW / JS_PROP_THROW_STRICT）
+ * 返回：TRUE(成功)/FALSE(不可配置)/-1(异常)
+ * 
+ * 说明：
+ * - 先 ToObject 转换
+ * - 调用 delete_property 删除
+ * - 严格模式下失败抛出错误
+ */
 /* return -1, FALSE or TRUE. return FALSE if not configurable or
    invalid object. return -1 in case of exception.
    flags can be 0, JS_PROP_THROW or JS_PROP_THROW_STRICT */
@@ -13011,6 +13852,9 @@ int JS_DeleteProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, int flags)
     return FALSE;
 }
 
+/**
+ * JS_DeletePropertyInt64 - 删除 64 位整数索引属性
+ */
 int JS_DeletePropertyInt64(JSContext *ctx, JSValueConst obj, int64_t idx, int flags)
 {
     JSAtom prop;
@@ -13028,6 +13872,17 @@ int JS_DeletePropertyInt64(JSContext *ctx, JSValueConst obj, int64_t idx, int fl
     return res;
 }
 
+/**
+ * JS_IsFunction - 检查是否为函数
+ * @ctx: 上下文
+ * @val: JSValue
+ * 返回：TRUE(是函数)/FALSE(不是)
+ * 
+ * 说明：
+ * - 字节码函数：TRUE
+ * - Proxy：检查 is_func 标志
+ * - 其他：检查 class 是否有 call 方法
+ */
 BOOL JS_IsFunction(JSContext *ctx, JSValueConst val)
 {
     JSObject *p;
@@ -13044,6 +13899,9 @@ BOOL JS_IsFunction(JSContext *ctx, JSValueConst val)
     }
 }
 
+/**
+ * JS_IsCFunction - 检查是否为特定 C 函数
+ */
 BOOL JS_IsCFunction(JSContext *ctx, JSValueConst val, JSCFunction *func, int magic)
 {
     JSObject *p;
@@ -13056,6 +13914,9 @@ BOOL JS_IsCFunction(JSContext *ctx, JSValueConst val, JSCFunction *func, int mag
         return FALSE;
 }
 
+/**
+ * JS_IsConstructor - 检查是否为构造函数
+ */
 BOOL JS_IsConstructor(JSContext *ctx, JSValueConst val)
 {
     JSObject *p;
@@ -13065,6 +13926,9 @@ BOOL JS_IsConstructor(JSContext *ctx, JSValueConst val)
     return p->is_constructor;
 }
 
+/**
+ * JS_SetConstructorBit - 设置构造函数标志
+ */
 BOOL JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, BOOL val)
 {
     JSObject *p;
@@ -13075,6 +13939,9 @@ BOOL JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, BOOL val)
     return TRUE;
 }
 
+/**
+ * JS_IsError - 检查是否为 Error 对象
+ */
 BOOL JS_IsError(JSContext *ctx, JSValueConst val)
 {
     JSObject *p;
@@ -13084,12 +13951,26 @@ BOOL JS_IsError(JSContext *ctx, JSValueConst val)
     return (p->class_id == JS_CLASS_ERROR);
 }
 
+/**
+ * JS_SetUncatchableException - 设置异常为不可捕获
+ * @ctx: 上下文
+ * @flag: 标志
+ * 
+ * 说明：必须在 JS_Throw() 后调用，用于实现某些不可捕获的异常
+ */
 /* must be called after JS_Throw() */
 void JS_SetUncatchableException(JSContext *ctx, BOOL flag)
 {
     ctx->rt->current_exception_is_uncatchable = flag;
 }
 
+/**
+ * JS_SetOpaque - 设置对象不透明数据
+ * @obj: 对象
+ * @opaque: 不透明指针
+ * 
+ * 说明：用于在 JS 对象中存储自定义 C 数据
+ */
 void JS_SetOpaque(JSValue obj, void *opaque)
 {
    JSObject *p;
@@ -13099,6 +13980,14 @@ void JS_SetOpaque(JSValue obj, void *opaque)
     }
 }
 
+/**
+ * JS_GetOpaque - 获取对象不透明数据（类型检查）
+ * @obj: 对象
+ * @class_id: 期望的类 ID
+ * 返回：不透明指针，NULL 表示类型不匹配或非对象
+ * 
+ * 说明：用于安全地获取自定义 C 数据，验证类 ID
+ */
 /* return NULL if not an object of class class_id */
 void *JS_GetOpaque(JSValueConst obj, JSClassID class_id)
 {
@@ -13111,6 +14000,15 @@ void *JS_GetOpaque(JSValueConst obj, JSClassID class_id)
     return p->u.opaque;
 }
 
+/**
+ * JS_GetOpaque2 - 获取对象不透明数据（抛出异常）
+ * @ctx: 上下文
+ * @obj: 对象
+ * @class_id: 期望的类 ID
+ * 返回：不透明指针，NULL 并抛出异常
+ * 
+ * 说明：与 JS_GetOpaque 类似，但失败时抛出 TypeError
+ */
 void *JS_GetOpaque2(JSContext *ctx, JSValueConst obj, JSClassID class_id)
 {
     void *p = JS_GetOpaque(obj, class_id);
@@ -13120,6 +14018,12 @@ void *JS_GetOpaque2(JSContext *ctx, JSValueConst obj, JSClassID class_id)
     return p;
 }
 
+/**
+ * JS_GetAnyOpaque - 获取任意对象的不透明数据
+ * @obj: 对象
+ * @class_id: 输出类 ID
+ * 返回：不透明指针，*class_id 设置为实际类 ID
+ */
 void *JS_GetAnyOpaque(JSValueConst obj, JSClassID *class_id)
 {
     JSObject *p;
@@ -13132,6 +14036,25 @@ void *JS_GetAnyOpaque(JSValueConst obj, JSClassID *class_id)
     return p->u.opaque;
 }
 
+/**
+ * JS_ToPrimitiveFree - 将对象转换为原始类型（核心实现）
+ * @ctx: 上下文
+ * @val: JSValue（会被释放）
+ * @hint: 转换提示（HINT_STRING/HINT_NUMBER/HINT_NONE）
+ * 返回：原始类型 JSValue 或 JS_EXCEPTION
+ * 
+ * 说明：实现 ECMA ToPrimitive 抽象操作
+ * 1. 非对象直接返回
+ * 2. 优先使用 Symbol.toPrimitive 方法（如果存在）
+ * 3. 否则尝试 toString/valueOf（根据 hint 决定顺序）
+ * 4. 都失败则抛出 TypeError
+ * 
+ * hint 说明：
+ * - HINT_STRING: 字符串上下文（如 String()）
+ * - HINT_NUMBER: 数字上下文（如 Number()）
+ * - HINT_NONE: 默认（如 == 比较）
+ * - HINT_FORCE_ORDINARY: 跳过 Symbol.toPrimitive
+ */
 static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
 {
     int i;
@@ -13140,10 +14063,11 @@ static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
     JSAtom method_name;
     JSValue method, ret;
     if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
-        return val;
+        return val;  /* 非对象直接返回 */
     force_ordinary = hint & HINT_FORCE_ORDINARY;
     hint &= ~HINT_FORCE_ORDINARY;
     if (!force_ordinary) {
+        /* 步骤 1：尝试 Symbol.toPrimitive */
         method = JS_GetProperty(ctx, val, JS_ATOM_Symbol_toPrimitive);
         if (JS_IsException(method))
             goto exception;
@@ -13171,11 +14095,12 @@ static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
                 goto exception;
             JS_FreeValue(ctx, val);
             if (JS_VALUE_GET_TAG(ret) != JS_TAG_OBJECT)
-                return ret;
+                return ret;  /* 成功转换为原始类型 */
             JS_FreeValue(ctx, ret);
             return JS_ThrowTypeError(ctx, "toPrimitive");
         }
     }
+    /* 步骤 2：尝试 toString/valueOf */
     if (hint != HINT_STRING)
         hint = HINT_NUMBER;
     for(i = 0; i < 2; i++) {
@@ -13193,7 +14118,7 @@ static JSValue JS_ToPrimitiveFree(JSContext *ctx, JSValue val, int hint)
                 goto exception;
             if (JS_VALUE_GET_TAG(ret) != JS_TAG_OBJECT) {
                 JS_FreeValue(ctx, val);
-                return ret;
+                return ret;  /* 成功转换为原始类型 */
             }
             JS_FreeValue(ctx, ret);
         } else {
@@ -13206,11 +14131,26 @@ exception:
     return JS_EXCEPTION;
 }
 
+/**
+ * JS_ToPrimitive - 将对象转换为原始类型（公开 API）
+ * @ctx: 上下文
+ * @val: JSValue
+ * @hint: 转换提示
+ * 返回：原始类型 JSValue 或 JS_EXCEPTION
+ */
 static JSValue JS_ToPrimitive(JSContext *ctx, JSValueConst val, int hint)
 {
     return JS_ToPrimitiveFree(ctx, JS_DupValue(ctx, val), hint);
 }
 
+/**
+ * JS_SetIsHTMLDDA - 设置对象为 HTML DDA 类型
+ * @ctx: 上下文
+ * @obj: 对象
+ * 
+ * 说明：HTML DDA（[[IsHTMLDDA]]）是特殊的内部槽，typeof 返回 "undefined"
+ * 用于实现 document.all 等历史遗留行为
+ */
 void JS_SetIsHTMLDDA(JSContext *ctx, JSValueConst obj)
 {
     JSObject *p;
@@ -13220,6 +14160,9 @@ void JS_SetIsHTMLDDA(JSContext *ctx, JSValueConst obj)
     p->is_HTMLDDA = TRUE;
 }
 
+/**
+ * JS_IsHTMLDDA - 检查是否为 HTML DDA 类型
+ */
 static inline BOOL JS_IsHTMLDDA(JSContext *ctx, JSValueConst obj)
 {
     JSObject *p;
@@ -13229,6 +14172,16 @@ static inline BOOL JS_IsHTMLDDA(JSContext *ctx, JSValueConst obj)
     return p->is_HTMLDDA;
 }
 
+/**
+ * JS_ToBoolFree - 将 JSValue 转换为布尔值
+ * @ctx: 上下文
+ * @val: JSValue（会被释放）
+ * 返回：0(false)/1(true)/-1(异常)
+ * 
+ * 说明：实现 ECMA ToBoolean 抽象操作
+ * Falsy 值：0, NaN, null, undefined, false, 空字符串，HTMLDDA
+ * 其他均为 Truthy
+ */
 static int JS_ToBoolFree(JSContext *ctx, JSValue val)
 {
     uint32_t tag = JS_VALUE_GET_TAG(val);
@@ -13238,7 +14191,7 @@ static int JS_ToBoolFree(JSContext *ctx, JSValue val)
     case JS_TAG_BOOL:
     case JS_TAG_NULL:
     case JS_TAG_UNDEFINED:
-        return JS_VALUE_GET_INT(val);
+        return JS_VALUE_GET_INT(val);  /* null/undefined 为 0，false 为 0，true 为 1 */
     case JS_TAG_EXCEPTION:
         return -1;
     case JS_TAG_STRING:
@@ -13278,7 +14231,7 @@ static int JS_ToBoolFree(JSContext *ctx, JSValue val)
         {
             JSObject *p = JS_VALUE_GET_OBJ(val);
             BOOL ret;
-            ret = !p->is_HTMLDDA;
+            ret = !p->is_HTMLDDA;  /* HTMLDDA 是唯一的 falsy 对象 */
             JS_FreeValue(ctx, val);
             return ret;
         }
@@ -13286,7 +14239,7 @@ static int JS_ToBoolFree(JSContext *ctx, JSValue val)
     default:
         if (JS_TAG_IS_FLOAT64(tag)) {
             double d = JS_VALUE_GET_FLOAT64(val);
-            return !isnan(d) && d != 0;
+            return !isnan(d) && d != 0;  /* NaN 和 0 为 false */
         } else {
             JS_FreeValue(ctx, val);
             return TRUE;
@@ -13294,11 +14247,23 @@ static int JS_ToBoolFree(JSContext *ctx, JSValue val)
     }
 }
 
+/**
+ * JS_ToBool - 将 JSValue 转换为布尔值（不释放原值）
+ */
 int JS_ToBool(JSContext *ctx, JSValueConst val)
 {
     return JS_ToBoolFree(ctx, JS_DupValue(ctx, val));
 }
 
+/**
+ * skip_spaces - 跳过空白字符
+ * @pc: 字符串指针
+ * 返回：跳过空白后的字符偏移量
+ * 
+ * 说明：
+ * - ASCII 空白：\t, \n, \v, \f, \r, 空格
+ * - Unicode 空白：使用 lre_is_space 检查
+ */
 static int skip_spaces(const char *pc)
 {
     const uint8_t *p, *p_next, *p_start;
@@ -13308,10 +14273,12 @@ static int skip_spaces(const char *pc)
     for (;;) {
         c = *p;
         if (c < 128) {
+            /* ASCII 空白字符 */
             if (!((c >= 0x09 && c <= 0x0d) || (c == 0x20)))
                 break;
             p++;
         } else {
+            /* Unicode 空白字符 */
             c = unicode_from_utf8(p, UTF8_CHAR_LEN_MAX, &p_next);
             if (!lre_is_space(c))
                 break;
