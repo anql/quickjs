@@ -81,112 +81,144 @@ typedef sig_t sighandler_t;
 #endif
 
 /* TODO:
-   - add socket calls
+   - add socket calls  // 待办：添加 Socket 支持
 */
 
+/* ============================================================================
+ * 数据结构定义
+ * 用于管理 OS 事件循环、定时器、信号处理等
+ * ============================================================================ */
+
+/* OS 读写处理器：用于监听文件描述符的可读/可写事件 */
 typedef struct {
-    struct list_head link;
-    int fd;
-    JSValue rw_func[2];
+    struct list_head link;  // 链表节点
+    int fd;  // 文件描述符
+    JSValue rw_func[2];  // [0]=读回调函数，[1]=写回调函数
 } JSOSRWHandler;
 
+/* OS 信号处理器：用于处理 POSIX 信号 */
 typedef struct {
-    struct list_head link;
-    int sig_num;
-    JSValue func;
+    struct list_head link;  // 链表节点
+    int sig_num;  // 信号编号（如 SIGINT、SIGTERM 等）
+    JSValue func;  // JS 回调函数
 } JSOSSignalHandler;
 
+/* OS 定时器：用于 setTimeout/setInterval */
 typedef struct {
-    struct list_head link;
-    int timer_id;
-    int64_t timeout;
-    JSValue func;
+    struct list_head link;  // 链表节点
+    int timer_id;  // 定时器 ID（用于 clearTimeout）
+    int64_t timeout;  // 超时时间（毫秒）
+    JSValue func;  // JS 回调函数
 } JSOSTimer;
 
+/* Worker 消息：用于线程间通信 */
 typedef struct {
-    struct list_head link;
-    uint8_t *data;
-    size_t data_len;
+    struct list_head link;  // 链表节点
+    uint8_t *data;  // 消息数据
+    size_t data_len;  // 数据长度
     /* list of SharedArrayBuffers, necessary to free the message */
-    uint8_t **sab_tab;
-    size_t sab_tab_len;
+    uint8_t **sab_tab;  // SharedArrayBuffer 表（用于释放消息）
+    size_t sab_tab_len;  // 表长度
 } JSWorkerMessage;
 
+/* Worker 唤醒器：用于唤醒阻塞的事件循环 */
 typedef struct JSWaker {
 #ifdef _WIN32
-    HANDLE handle;
+    HANDLE handle;  // Windows 句柄
 #else
-    int read_fd;
-    int write_fd;
+    int read_fd;   // 读端文件描述符
+    int write_fd;  // 写端文件描述符（用于 eventfd 或 pipe）
 #endif
 } JSWaker;
 
+/* Worker 消息管道：用于线程间消息传递 */
 typedef struct {
-    int ref_count;
+    int ref_count;  // 引用计数
 #ifdef USE_WORKER
-    pthread_mutex_t mutex;
+    pthread_mutex_t mutex;  // 互斥锁（保护消息队列）
 #endif
-    struct list_head msg_queue; /* list of JSWorkerMessage.link */
-    JSWaker waker;
+    struct list_head msg_queue; /* list of JSWorkerMessage.link */  // 消息队列
+    JSWaker waker;  // 唤醒器
 } JSWorkerMessagePipe;
 
+/* Worker 消息处理器：处理接收到的消息 */
 typedef struct {
-    struct list_head link;
-    JSWorkerMessagePipe *recv_pipe;
-    JSValue on_message_func;
+    struct list_head link;  // 链表节点
+    JSWorkerMessagePipe *recv_pipe;  // 接收管道
+    JSValue on_message_func;  // onmessage 回调函数
 } JSWorkerMessageHandler;
 
+/* 被拒绝的 Promise 条目：用于跟踪未处理的 Promise 拒绝 */
 typedef struct {
-    struct list_head link;
-    JSValue promise;
-    JSValue reason;
+    struct list_head link;  // 链表节点
+    JSValue promise;  // Promise 对象
+    JSValue reason;  // 拒绝原因
 } JSRejectedPromiseEntry;
 
+/* 线程状态：每个线程都有一个实例，管理该线程的所有 OS 资源 */
 typedef struct JSThreadState {
-    struct list_head os_rw_handlers; /* list of JSOSRWHandler.link */
-    struct list_head os_signal_handlers; /* list JSOSSignalHandler.link */
-    struct list_head os_timers; /* list of JSOSTimer.link */
-    struct list_head port_list; /* list of JSWorkerMessageHandler.link */
-    struct list_head rejected_promise_list; /* list of JSRejectedPromiseEntry.link */
-    int eval_script_recurse; /* only used in the main thread */
-    int next_timer_id; /* for setTimeout() */
+    struct list_head os_rw_handlers; /* list of JSOSRWHandler.link */  // OS 读写处理器链表
+    struct list_head os_signal_handlers; /* list JSOSSignalHandler.link */  // OS 信号处理器链表
+    struct list_head os_timers; /* list of JSOSTimer.link */  // OS 定时器链表
+    struct list_head port_list; /* list of JSWorkerMessageHandler.link */  // Worker 端口链表
+    struct list_head rejected_promise_list; /* list of JSRejectedPromiseEntry.link */  // 被拒绝 Promise 链表
+    int eval_script_recurse; /* only used in the main thread */  // 脚本递归深度（主线程专用）
+    int next_timer_id; /* for setTimeout() */  // 下一个定时器 ID
     /* not used in the main thread */
-    JSWorkerMessagePipe *recv_pipe, *send_pipe;
+    JSWorkerMessagePipe *recv_pipe, *send_pipe;  // 接收/发送管道（Worker 线程专用）
 } JSThreadState;
 
-static uint64_t os_pending_signals;
-static int (*os_poll_func)(JSContext *ctx);
+static uint64_t os_pending_signals;  // 待处理的信号位图
+static int (*os_poll_func)(JSContext *ctx);  // 轮询函数指针
 
+/* 初始化动态缓冲区，使用运行时内存分配器 */
 static void js_std_dbuf_init(JSContext *ctx, DynBuf *s)
 {
     dbuf_init2(s, JS_GetRuntime(ctx), (DynBufReallocFunc *)js_realloc_rt);
 }
 
+/* 自定义 isdigit：检查字符是否为数字（0-9） */
 static BOOL my_isdigit(int c)
 {
     return (c >= '0' && c <= '9');
 }
 
 /* XXX: use 'o' and 'O' for object using JS_PrintValue() ? */
+/**
+ * 内部 printf 实现：格式化输出到文件或字符串
+ * 
+ * @param ctx JS 上下文
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @param fp 输出文件指针（NULL 表示输出到字符串）
+ * @returns 格式化后的字符串或写入的字节数
+ * 
+ * 支持的格式说明符：
+ * - %c: 字符（支持 UTF-8）
+ * - %d/%i/%o/%u/%x/%X: 整数（支持 32 位和 64 位）
+ * - %s: 字符串
+ * - %e/%f/%g/%a/%E/%F/%G/%A: 浮点数
+ * - %%: 百分号本身
+ */
 static JSValue js_printf_internal(JSContext *ctx,
                                   int argc, JSValueConst *argv, FILE *fp)
 {
-    char fmtbuf[32];
-    uint8_t cbuf[UTF8_CHAR_LEN_MAX+1];
-    JSValue res;
-    DynBuf dbuf;
-    const char *fmt_str = NULL;
-    const uint8_t *fmt, *fmt_end;
-    const uint8_t *p;
-    char *q;
-    int i, c, len, mod;
-    size_t fmt_len;
-    int32_t int32_arg;
-    int64_t int64_arg;
-    double double_arg;
-    const char *string_arg;
+    char fmtbuf[32];  // 格式缓冲区
+    uint8_t cbuf[UTF8_CHAR_LEN_MAX+1];  // UTF-8 字符缓冲区
+    JSValue res;  // 返回值
+    DynBuf dbuf;  // 动态缓冲区
+    const char *fmt_str = NULL;  // 格式字符串
+    const uint8_t *fmt, *fmt_end;  // 格式字符串指针
+    const uint8_t *p;  // 临时指针
+    char *q;  // 格式缓冲区指针
+    int i, c, len, mod;  // 循环变量、字符、长度、修饰符
+    size_t fmt_len;  // 格式字符串长度
+    int32_t int32_arg;  // 32 位整数参数
+    int64_t int64_arg;  // 64 位整数参数
+    double double_arg;  // 双精度浮点参数
+    const char *string_arg;  // 字符串参数
     /* Use indirect call to dbuf_printf to prevent gcc warning */
-    int (*dbuf_printf_fun)(DynBuf *s, const char *fmt, ...) = (void*)dbuf_printf;
+    int (*dbuf_printf_fun)(DynBuf *s, const char *fmt, ...) = (void*)dbuf_printf;  // 间接调用避免警告
 
     js_std_dbuf_init(ctx, &dbuf);
 
@@ -385,37 +417,49 @@ fail:
     return JS_EXCEPTION;
 }
 
+/**
+ * 加载文件到内存
+ * 
+ * @param ctx JS 上下文（NULL 表示使用系统 malloc）
+ * @param pbuf_len 输出参数：返回缓冲区长度
+ * @param filename 文件名
+ * @returns 文件内容缓冲区（调用者负责释放），失败返回 NULL
+ * 
+ * 注意：
+ * - 会在缓冲区末尾添加 '\0' 终止符
+ * - 如果是目录会返回 EISDIR 错误
+ */
 uint8_t *js_load_file(JSContext *ctx, size_t *pbuf_len, const char *filename)
 {
-    FILE *f;
-    uint8_t *buf;
-    size_t buf_len;
-    long lret;
+    FILE *f;  // 文件指针
+    uint8_t *buf;  // 缓冲区
+    size_t buf_len;  // 缓冲区长度
+    long lret;  // 临时返回值
 
-    f = fopen(filename, "rb");
+    f = fopen(filename, "rb");  // 以二进制模式打开
     if (!f)
         return NULL;
-    if (fseek(f, 0, SEEK_END) < 0)
+    if (fseek(f, 0, SEEK_END) < 0)  // 定位到文件末尾
         goto fail;
-    lret = ftell(f);
+    lret = ftell(f);  // 获取文件大小
     if (lret < 0)
         goto fail;
     /* XXX: on Linux, ftell() return LONG_MAX for directories */
-    if (lret == LONG_MAX) {
+    if (lret == LONG_MAX) {  // 目录的特殊情况
         errno = EISDIR;
         goto fail;
     }
     buf_len = lret;
-    if (fseek(f, 0, SEEK_SET) < 0)
+    if (fseek(f, 0, SEEK_SET) < 0)  // 回到文件开头
         goto fail;
     if (ctx)
-        buf = js_malloc(ctx, buf_len + 1);
+        buf = js_malloc(ctx, buf_len + 1);  // 使用 JS 内存分配器
     else
-        buf = malloc(buf_len + 1);
+        buf = malloc(buf_len + 1);  // 使用系统 malloc
     if (!buf)
         goto fail;
-    if (fread(buf, 1, buf_len, f) != buf_len) {
-        errno = EIO;
+    if (fread(buf, 1, buf_len, f) != buf_len) {  // 读取文件
+        errno = EIO;  // I/O 错误
         if (ctx)
             js_free(ctx, buf);
         else
@@ -424,7 +468,7 @@ uint8_t *js_load_file(JSContext *ctx, size_t *pbuf_len, const char *filename)
         fclose(f);
         return NULL;
     }
-    buf[buf_len] = '\0';
+    buf[buf_len] = '\0';  // 添加终止符
     fclose(f);
     *pbuf_len = buf_len;
     return buf;
@@ -919,42 +963,55 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
+/* JS 标准文件类 ID */
 static JSClassID js_std_file_class_id;
 
+/* JS 文件对象：封装 FILE* 指针 */
 typedef struct {
-    FILE *f;
-    BOOL close_in_finalizer;
-    BOOL is_popen;
+    FILE *f;  // C 文件指针
+    BOOL close_in_finalizer;  // 是否在析构时关闭
+    BOOL is_popen;  // 是否是通过 popen 打开的
 } JSSTDFile;
 
+/**
+ * JS 文件对象析构函数
+ * 当 JS 对象被 GC 回收时调用
+ */
 static void js_std_file_finalizer(JSRuntime *rt, JSValue val)
 {
     JSSTDFile *s = JS_GetOpaque(val, js_std_file_class_id);
     if (s) {
-        if (s->f && s->close_in_finalizer) {
+        if (s->f && s->close_in_finalizer) {  // 需要关闭文件
             if (s->is_popen)
-                pclose(s->f);
+                pclose(s->f);  // popen 打开的用 pclose
             else
-                fclose(s->f);
+                fclose(s->f);  // 普通打开的用 fclose
         }
-        js_free_rt(rt, s);
+        js_free_rt(rt, s);  // 释放内存
     }
 }
 
+/**
+ * 获取错误号：将 -1 返回值转换为负的错误码
+ */
 static ssize_t js_get_errno(ssize_t ret)
 {
     if (ret == -1)
-        ret = -errno;
+        ret = -errno;  // 系统调用失败时返回负的错误码
     return ret;
 }
 
+/**
+ * strerror 包装：将错误码转换为错误消息字符串
+ * js_std_strerror(errno) → "No such file or directory"
+ */
 static JSValue js_std_strerror(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
     int err;
-    if (JS_ToInt32(ctx, &err, argv[0]))
+    if (JS_ToInt32(ctx, &err, argv[0]))  // 获取错误码参数
         return JS_EXCEPTION;
-    return JS_NewString(ctx, strerror(err));
+    return JS_NewString(ctx, strerror(err));  // 返回错误消息
 }
 
 static JSValue js_std_parseExtJSON(JSContext *ctx, JSValueConst this_val,
@@ -972,16 +1029,25 @@ static JSValue js_std_parseExtJSON(JSContext *ctx, JSValueConst this_val,
     return obj;
 }
 
+/**
+ * 创建 JS 文件对象
+ * 
+ * @param ctx JS 上下文
+ * @param f C 文件指针
+ * @param close_in_finalizer 是否在 GC 时自动关闭
+ * @param is_popen 是否是通过 popen 打开的
+ * @returns JS 文件对象
+ */
 static JSValue js_new_std_file(JSContext *ctx, FILE *f,
                                BOOL close_in_finalizer,
                                BOOL is_popen)
 {
     JSSTDFile *s;
     JSValue obj;
-    obj = JS_NewObjectClass(ctx, js_std_file_class_id);
+    obj = JS_NewObjectClass(ctx, js_std_file_class_id);  // 创建文件类实例
     if (JS_IsException(obj))
         return obj;
-    s = js_mallocz(ctx, sizeof(*s));
+    s = js_mallocz(ctx, sizeof(*s));  // 分配并清零
     if (!s) {
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
@@ -989,10 +1055,13 @@ static JSValue js_new_std_file(JSContext *ctx, FILE *f,
     s->close_in_finalizer = close_in_finalizer;
     s->is_popen = is_popen;
     s->f = f;
-    JS_SetOpaque(obj, s);
+    JS_SetOpaque(obj, s);  // 将 C 指针关联到 JS 对象
     return obj;
 }
 
+/**
+ * 设置错误对象：给对象添加 errno 属性
+ */
 static void js_set_error_object(JSContext *ctx, JSValue obj, int err)
 {
     if (!JS_IsUndefined(obj)) {
