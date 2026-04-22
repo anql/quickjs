@@ -31,23 +31,53 @@
 #include "libunicode.h"
 #include "libunicode-table.h"
 
+/* 
+ * 大小写转换的运行类型枚举
+ * 用于压缩 Unicode 大小写转换表，通过不同的编码方式减少表的大小
+ * 
+ * RUN_TYPE_U: 转大写 (Upper)
+ * RUN_TYPE_L: 转小写 (Lower)
+ * RUN_TYPE_UF: 转大写或折叠 (Upper/Fold)
+ * RUN_TYPE_LF: 转小写或折叠 (Lower/Fold)
+ * RUN_TYPE_UL: 大小写交替 (Upper-Lower alternating，如 A/a, B/b)
+ * RUN_TYPE_LSU: 特殊大小写转换 (Lower-Special-Upper)
+ * RUN_TYPE_U2L_399_EXT2: 大写转小写，扩展表，返回 2 个字符（第二个是 0x399）
+ * RUN_TYPE_UF_D20: 大写/折叠，差值 0x20
+ * RUN_TYPE_UF_D1_EXT: 大写/折叠，扩展表，差值 1
+ * RUN_TYPE_U_EXT: 转大写，使用扩展表
+ * RUN_TYPE_LF_EXT: 转小写/折叠，使用扩展表
+ * RUN_TYPE_UF_EXT2: 大写/折叠，扩展表，返回 2 个字符
+ * RUN_TYPE_LF_EXT2: 小写/折叠，扩展表，返回 2 个字符
+ * RUN_TYPE_UF_EXT3: 大写/折叠，扩展表，返回 3 个字符
+ */
 enum {
-    RUN_TYPE_U,
-    RUN_TYPE_L,
-    RUN_TYPE_UF,
-    RUN_TYPE_LF,
-    RUN_TYPE_UL,
-    RUN_TYPE_LSU,
-    RUN_TYPE_U2L_399_EXT2,
-    RUN_TYPE_UF_D20,
-    RUN_TYPE_UF_D1_EXT,
-    RUN_TYPE_U_EXT,
-    RUN_TYPE_LF_EXT,
-    RUN_TYPE_UF_EXT2,
-    RUN_TYPE_LF_EXT2,
-    RUN_TYPE_UF_EXT3,
+    RUN_TYPE_U,              /* 0: 转大写 */
+    RUN_TYPE_L,              /* 1: 转小写 */
+    RUN_TYPE_UF,             /* 2: 转大写或折叠 */
+    RUN_TYPE_LF,             /* 3: 转小写或折叠 */
+    RUN_TYPE_UL,             /* 4: 大小写交替 */
+    RUN_TYPE_LSU,            /* 5: 特殊大小写转换 */
+    RUN_TYPE_U2L_399_EXT2,   /* 6: 大写转小写 + 0x399 */
+    RUN_TYPE_UF_D20,         /* 7: 差值 0x20 */
+    RUN_TYPE_UF_D1_EXT,      /* 8: 扩展表差值 1 */
+    RUN_TYPE_U_EXT,          /* 9: 扩展表转大写 */
+    RUN_TYPE_LF_EXT,         /* 10: 扩展表转小写/折叠 */
+    RUN_TYPE_UF_EXT2,        /* 11: 扩展表返回 2 字符 */
+    RUN_TYPE_LF_EXT2,        /* 12: 扩展表返回 2 字符 (小写) */
+    RUN_TYPE_UF_EXT3,        /* 13: 扩展表返回 3 字符 */
 };
 
+/*
+ * 【单字符大小写转换 - 辅助函数】
+ * 功能：对单个字符进行大小写转换，返回转换后的单个字符
+ * 参数：
+ *   - c: 输入的 Unicode 字符码点
+ *   - conv_type: 转换类型 (0=转大写，1=转小写，2=大小写折叠)
+ * 返回：转换后的字符码点
+ * 
+ * 说明：这是 lre_case_conv 的简化包装，只返回第一个结果字符
+ *       用于处理单字符转换的简单场景
+ */
 static int lre_case_conv1(uint32_t c, int conv_type)
 {
     uint32_t res[LRE_CC_RES_LEN_MAX];
@@ -55,15 +85,39 @@ static int lre_case_conv1(uint32_t c, int conv_type)
     return res[0];
 }
 
-/* case conversion using the table entry 'idx' with value 'v' */
+/*
+ * 【大小写转换表条目处理 - 核心函数】
+ * 功能：根据压缩表中的条目信息，执行具体的大小写转换
+ * 参数：
+ *   - res: 输出数组，存储转换后的字符（可能多个）
+ *   - c: 输入的 Unicode 字符码点
+ *   - conv_type: 转换类型 (0=转大写，1=转小写，2=大小写折叠)
+ *   - idx: 在 case_conv_table2 中的索引
+ *   - v: 表条目的原始值 (32 位)
+ * 返回：转换后字符的数量（1、2 或 3）
+ * 
+ * 数据结构说明：
+ *   v 的 32 位布局：[17 位起始码点][7 位长度][4 位类型][4 位数据高 4 位]
+ *   data = [4 位数据高 4 位][8 位 case_conv_table2 索引值]
+ * 
+ * 压缩原理：
+ *   Unicode 大小写转换表使用运行长度编码 (RLE) 压缩
+ *   连续具有相同转换规则的字符被编码为一个"运行"(run)
+ *   每个运行类型对应不同的转换公式
+ */
 static int lre_case_conv_entry(uint32_t *res, uint32_t c, int conv_type, uint32_t idx, uint32_t v)
 {
     uint32_t code, data, type, a, is_lower;
-    is_lower = (conv_type != 0);
-    type = (v >> (32 - 17 - 7 - 4)) & 0xf;
-    data = ((v & 0xf) << 8) | case_conv_table2[idx];
-    code = v >> (32 - 17);
+    is_lower = (conv_type != 0);  /* 判断是否为转小写/折叠模式 */
+    type = (v >> (32 - 17 - 7 - 4)) & 0xf;  /* 提取 4 位运行类型 */
+    data = ((v & 0xf) << 8) | case_conv_table2[idx];  /* 组合完整数据索引 */
+    code = v >> (32 - 17);  /* 提取 17 位起始码点 */
     switch(type) {
+    /* 
+     * RUN_TYPE_U/L/UF/LF: 简单偏移转换
+     * 转换公式：目标字符 = 输入字符 - 起始码点 + 偏移量
+     * type & 1 判断是转大写 (0) 还是转小写 (1)
+     */
     case RUN_TYPE_U:
     case RUN_TYPE_L:
     case RUN_TYPE_UF:
@@ -73,71 +127,121 @@ static int lre_case_conv_entry(uint32_t *res, uint32_t c, int conv_type, uint32_
             c = c - code + (case_conv_table1[data] >> (32 - 17));
         }
         break;
+    
+    /*
+     * RUN_TYPE_UL: 大小写交替模式
+     * 用于 A/a, B/b, C/c 这种成对出现的字符
+     * 通过奇偶位判断当前是大写还是小写，然后翻转
+     */
     case RUN_TYPE_UL:
         a = c - code;
-        if ((a & 1) != (1 - is_lower))
+        if ((a & 1) != (1 - is_lower))  /* 检查奇偶性是否匹配 */
             break;
-        c = (a ^ 1) + code;
+        c = (a ^ 1) + code;  /* 翻转最低位实现大小写切换 */
         break;
+    
+    /*
+     * RUN_TYPE_LSU: 特殊三态转换
+     * 用于某些特殊的希腊字母，有三种状态
+     * 例如：σ (U+03C2) 在词尾和词中形式不同
+     */
     case RUN_TYPE_LSU:
         a = c - code;
         if (a == 1) {
-            c += 2 * is_lower - 1;
+            c += 2 * is_lower - 1;  /* 状态 1 转换 */
         } else if (a == (1 - is_lower) * 2) {
-            c += (2 * is_lower - 1) * 2;
+            c += (2 * is_lower - 1) * 2;  /* 状态 2 转换 */
         }
         break;
+    
+    /*
+     * RUN_TYPE_U2L_399_EXT2: 大写转小写 + 追加字符
+     * 特殊场景：一个大写字母转小写时需要拆分成两个字符
+     * 第二个字符固定为 0x399 (希腊字母 Ι)
+     */
     case RUN_TYPE_U2L_399_EXT2:
         if (!is_lower) {
-            res[0] = c - code + case_conv_ext[data >> 6];
-            res[1] = 0x399;
+            res[0] = c - code + case_conv_ext[data >> 6];  /* 第一个字符从扩展表查 */
+            res[1] = 0x399;  /* 固定追加 Ι */
             return 2;
         } else {
             c = c - code + case_conv_ext[data & 0x3f];
         }
         break;
+    
+    /*
+     * RUN_TYPE_UF_D20: 固定差值 0x20 转换
+     * ASCII 字母的大小写差值正好是 0x20 (32)
+     * 用于某些具有固定差值的字符范围
+     */
     case RUN_TYPE_UF_D20:
-        if (conv_type == 1)
+        if (conv_type == 1)  /* 转小写时不适用 */
             break;
-        c = data + (conv_type == 2) * 0x20;
+        c = data + (conv_type == 2) * 0x20;  /* 折叠时加 0x20 */
         break;
+    
+    /*
+     * RUN_TYPE_UF_D1_EXT: 扩展表差值 1 转换
+     * 从扩展表查基础值，折叠时加 1
+     */
     case RUN_TYPE_UF_D1_EXT:
         if (conv_type == 1)
             break;
         c = case_conv_ext[data] + (conv_type == 2);
         break;
+    
+    /*
+     * RUN_TYPE_U_EXT / RUN_TYPE_LF_EXT: 扩展表直接查找
+     * 转换结果直接存储在扩展表中，不适用简单公式
+     */
     case RUN_TYPE_U_EXT:
     case RUN_TYPE_LF_EXT:
         if (is_lower != (type - RUN_TYPE_U_EXT))
             break;
         c = case_conv_ext[data];
         break;
+    
+    /*
+     * RUN_TYPE_LF_EXT2: 扩展表双字符输出 (小写模式)
+     * 一个小写字母对应两个字符的展开
+     */
     case RUN_TYPE_LF_EXT2:
         if (!is_lower)
             break;
-        res[0] = c - code + case_conv_ext[data >> 6];
-        res[1] = case_conv_ext[data & 0x3f];
+        res[0] = c - code + case_conv_ext[data >> 6];  /* 高 6 位索引 */
+        res[1] = case_conv_ext[data & 0x3f];  /* 低 6 位索引 */
         return 2;
+    
+    /*
+     * RUN_TYPE_UF_EXT2: 扩展表双字符输出 (大写/折叠模式)
+     * 折叠时需要递归转换为小写
+     */
     case RUN_TYPE_UF_EXT2:
         if (conv_type == 1)
             break;
         res[0] = c - code + case_conv_ext[data >> 6];
         res[1] = case_conv_ext[data & 0x3f];
         if (conv_type == 2) {
-            /* convert to lower */
+            /* 折叠模式：递归转换为小写 */
             res[0] = lre_case_conv1(res[0], 1);
             res[1] = lre_case_conv1(res[1], 1);
         }
         return 2;
+    
+    /*
+     * RUN_TYPE_UF_EXT3: 扩展表三字符输出
+     * 最复杂的情况，一个大写字母对应三个字符的展开
+     * 例如：ß (U+00DF) 大写展开为 "SSS"
+     */
     default:
     case RUN_TYPE_UF_EXT3:
         if (conv_type == 1)
             break;
-        res[0] = case_conv_ext[data >> 8];
-        res[1] = case_conv_ext[(data >> 4) & 0xf];
-        res[2] = case_conv_ext[data & 0xf];
+        res[0] = case_conv_ext[data >> 8];  /* 高 8 位索引 */
+        res[1] = case_conv_ext[(data >> 4) & 0xf];  /* 中 4 位索引 */
+        res[2] = case_conv_ext[data & 0xf];  /* 低 4 位索引 */
         if (conv_type == 2) {
-            /* convert to lower */
+            /* 折叠模式：递归转换为小写 */
             res[0] = lre_case_conv1(res[0], 1);
             res[1] = lre_case_conv1(res[1], 1);
             res[2] = lre_case_conv1(res[2], 1);
@@ -145,27 +249,49 @@ static int lre_case_conv_entry(uint32_t *res, uint32_t c, int conv_type, uint32_
         return 3;
     }
     res[0] = c;
-    return 1;
+    return 1;  /* 默认返回单字符 */
 }
 
-/* conv_type:
-   0 = to upper
-   1 = to lower
-   2 = case folding (= to lower with modifications)
-*/
+/*
+ * 【大小写转换主函数】
+ * 功能：将 Unicode 字符进行大小写转换
+ * 参数：
+ *   - res: 输出数组，存储转换后的字符（LRE_CC_RES_LEN_MAX 长度，通常为 3）
+ *   - c: 输入的 Unicode 字符码点
+ *   - conv_type: 转换类型
+ *       0 = to upper (转大写)
+ *       1 = to lower (转小写)
+ *       2 = case folding (大小写折叠，用于正则匹配，类似转小写但有特殊规则)
+ * 返回：转换后字符的数量（1、2 或 3）
+ * 
+ * 算法说明：
+ * 1. ASCII 字符 (c < 128): 直接计算，A-Z 转 a-z 或反之
+ * 2. 非 ASCII 字符：使用二分查找在压缩表中定位
+ *    - case_conv_table1 存储运行条目，每个条目包含：
+ *      [17 位起始码点][7 位长度][8 位其他数据]
+ *    - 找到匹配的条目后，调用 lre_case_conv_entry 处理具体转换
+ * 
+ * 性能优化：
+ * - ASCII 快速路径：无需查表，直接位运算
+ * - 二分查找：O(log N) 时间复杂度查找表条目
+ */
 int lre_case_conv(uint32_t *res, uint32_t c, int conv_type)
 {
+    /* 快速路径：ASCII 字符直接处理 */
     if (c < 128) {
         if (conv_type) {
+            /* 转小写或折叠：A-Z -> a-z */
             if (c >= 'A' && c <= 'Z') {
                 c = c - 'A' + 'a';
             }
         } else {
+            /* 转大写：a-z -> A-Z */
             if (c >= 'a' && c <= 'z') {
                 c = c - 'a' + 'A';
             }
         }
     } else {
+        /* 非 ASCII 字符：二分查找压缩表 */
         uint32_t v, code, len;
         int idx, idx_min, idx_max;
 
@@ -174,33 +300,55 @@ int lre_case_conv(uint32_t *res, uint32_t c, int conv_type)
         while (idx_min <= idx_max) {
             idx = (unsigned)(idx_max + idx_min) / 2;
             v = case_conv_table1[idx];
-            code = v >> (32 - 17);
-            len = (v >> (32 - 17 - 7)) & 0x7f;
+            code = v >> (32 - 17);  /* 提取起始码点 */
+            len = (v >> (32 - 17 - 7)) & 0x7f;  /* 提取运行长度 */
             if (c < code) {
-                idx_max = idx - 1;
+                idx_max = idx - 1;  /* 在左半部分查找 */
             } else if (c >= code + len) {
-                idx_min = idx + 1;
+                idx_min = idx + 1;  /* 在右半部分查找 */
             } else {
+                /* 找到匹配的条目，委托给入口处理函数 */
                 return lre_case_conv_entry(res, c, conv_type, idx, v);
             }
         }
     }
+    /* 未找到转换规则或无需转换，返回原字符 */
     res[0] = c;
     return 1;
 }
 
+/*
+ * 【正则表达式大小写折叠入口】
+ * 功能：为正则表达式引擎提供大小写折叠支持
+ * 参数：
+ *   - c: 输入字符
+ *   - idx: 压缩表索引
+ *   - v: 表条目值
+ *   - is_unicode: 是否为 Unicode 模式（正则的 /u 标志）
+ * 返回：折叠后的字符
+ * 
+ * 背景知识：
+ * 正则表达式的不区分大小写匹配需要"折叠"大小写差异
+ * Unicode 模式 vs 传统模式有不同规则：
+ * - Unicode 模式：严格遵循 Unicode 大小写折叠标准
+ * - 传统模式：ASCII 字母转大写，非 ASCII 单字符也转大写（历史原因）
+ */
 static int lre_case_folding_entry(uint32_t c, uint32_t idx, uint32_t v, BOOL is_unicode)
 {
     uint32_t res[LRE_CC_RES_LEN_MAX];
     int len;
 
     if (is_unicode) {
+        /* Unicode 模式：使用标准大小写折叠 (conv_type=2) */
         len = lre_case_conv_entry(res, c, 2, idx, v);
         if (len == 1) {
             c = res[0];
         } else {
-            /* handle the few specific multi-character cases (see
-               unicode_gen.c:dump_case_folding_special_cases()) */
+            /* 
+             * 处理少数多字符折叠的特殊情况
+             * 这些是 Unicode 标准中的边缘案例
+             * 例如：0xFB06 (ﬁ) 折叠为 0xFB05 (ﬅ)
+             */
             if (c == 0xfb06) {
                 c = 0xfb05;
             } else if (c == 0x01fd3) {
@@ -210,11 +358,16 @@ static int lre_case_folding_entry(uint32_t c, uint32_t idx, uint32_t v, BOOL is_
             }
         }
     } else {
+        /* 传统模式（非 Unicode）：兼容旧版正则行为 */
         if (likely(c < 128)) {
+            /* ASCII 字母转大写 */
             if (c >= 'a' && c <= 'z')
                 c = c - 'a' + 'A';
         } else {
-            /* legacy regexp: to upper case if single char >= 128 */
+            /* 
+             * 历史行为：非 ASCII 单字符也转大写
+             * 这是为了向后兼容早期 JavaScript 引擎
+             */
             len = lre_case_conv_entry(res, c, FALSE, idx, v);
             if (len == 1 && res[0] >= 128)
                 c = res[0];
@@ -223,21 +376,46 @@ static int lre_case_folding_entry(uint32_t c, uint32_t idx, uint32_t v, BOOL is_
     return c;
 }
 
-/* JS regexp specific rules for case folding */
+/*
+ * 【JS 正则表达式专用大小写规范化】
+ * 功能：为正则表达式的不区分大小写匹配提供字符规范化
+ * 参数：
+ *   - c: 输入字符
+ *   - is_unicode: 是否为 Unicode 模式（正则的 /u 标志）
+ * 返回：规范化后的字符（用于比较）
+ * 
+ * 使用场景：
+ * 当正则表达式使用 /i 标志（不区分大小写）时：
+ * - /a/i 应该匹配 'a' 和 'A'
+ * - 实现方式：将两个字符都规范化到同一形式再比较
+ * 
+ * 与 lre_case_conv 的区别：
+ * - lre_case_conv: 完整的大小写转换，可能返回多字符
+ * - lre_canonicalize: 只返回单字符，用于比较目的
+ * 
+ * 算法：
+ * 1. ASCII 快速路径
+ *    - Unicode 模式：大写转小写 (A->a)
+ *    - 传统模式：小写转大写 (a->A)，历史兼容性
+ * 2. 非 ASCII：二分查找 + 折叠处理
+ */
 int lre_canonicalize(uint32_t c, BOOL is_unicode)
 {
+    /* 快速路径：ASCII 字符 */
     if (c < 128) {
-        /* fast case */
         if (is_unicode) {
+            /* Unicode 模式：统一转小写（现代标准） */
             if (c >= 'A' && c <= 'Z') {
                 c = c - 'A' + 'a';
             }
         } else {
+            /* 传统模式：统一转大写（历史兼容） */
             if (c >= 'a' && c <= 'z') {
                 c = c - 'a' + 'A';
             }
         }
     } else {
+        /* 非 ASCII：二分查找压缩表 */
         uint32_t v, code, len;
         int idx, idx_min, idx_max;
 
@@ -253,21 +431,53 @@ int lre_canonicalize(uint32_t c, BOOL is_unicode)
             } else if (c >= code + len) {
                 idx_min = idx + 1;
             } else {
+                /* 找到匹配条目，调用折叠入口处理 */
                 return lre_case_folding_entry(c, idx, v, is_unicode);
             }
         }
     }
-    return c;
+    return c;  /* 无转换规则，返回原字符 */
 }
 
+/*
+ * 【读取 24 位小端整数】
+ * 功能：从字节数组中读取一个 24 位（3 字节）的小端整数
+ * 参数：ptr - 指向 3 字节数据的指针
+ * 返回：32 位整数（高 8 位为 0）
+ * 
+ * 用途：Unicode 表使用 24 位编码节省空间
+ *       每个索引条目占 3 字节：[21 位码点][3 位块内偏移高 3 位]
+ */
 static uint32_t get_le24(const uint8_t *ptr)
 {
     return ptr[0] | (ptr[1] << 8) | (ptr[2] << 16);
 }
 
+/* 索引块长度：每个块包含 32 个字符的位图数据 */
 #define UNICODE_INDEX_BLOCK_LEN 32
 
-/* return -1 if not in table, otherwise the offset in the block */
+/*
+ * 【获取字符在 Unicode 属性表中的索引位置】
+ * 功能：在两级索引结构中定位字符所在的位图块
+ * 参数：
+ *   - pcode: 输出参数，返回块的起始码点
+ *   - c: 要查找的字符
+ *   - index_table: 一级索引表（24 位条目数组）
+ *   - index_table_len: 索引表长度
+ * 返回：
+ *   - -1: 字符超出表的范围
+ *   - 其他：在位图表中的字节偏移量
+ * 
+ * 数据结构：
+ * 两级索引设计用于压缩大型 Unicode 属性表：
+ * 1. 一级索引 (index_table): 24 位/条目
+ *    - 低 21 位：块的起始码点
+ *    - 高 3 位：块内偏移的高位
+ * 2. 二级数据 (table): 压缩的位图数据
+ *    - 每个块 32 字符，用压缩游程编码存储
+ * 
+ * 算法：二分查找一级索引，定位字符所属的块
+ */
 static int get_index_pos(uint32_t *pcode, uint32_t c,
                          const uint8_t *index_table, int index_table_len)
 {
@@ -276,16 +486,17 @@ static int get_index_pos(uint32_t *pcode, uint32_t c,
 
     idx_min = 0;
     v = get_le24(index_table);
-    code = v & ((1 << 21) - 1);
+    code = v & ((1 << 21) - 1);  /* 提取 21 位起始码点 */
     if (c < code) {
         *pcode = 0;
-        return 0;
+        return 0;  /* 字符在表之前 */
     }
     idx_max = index_table_len - 1;
     code = get_le24(index_table + idx_max * 3);
     if (c >= code)
-        return -1;
-    /* invariant: tab[idx_min] <= c < tab2[idx_max] */
+        return -1;  /* 字符超出表的范围 */
+    
+    /* 二分查找不变式：tab[idx_min] <= c < tab[idx_max] */
     while ((idx_max - idx_min) > 1) {
         idx = (idx_max + idx_min) / 2;
         v = get_le24(index_table + idx * 3);
@@ -301,6 +512,37 @@ static int get_index_pos(uint32_t *pcode, uint32_t c,
     return (idx_min + 1) * UNICODE_INDEX_BLOCK_LEN + (v >> 21);
 }
 
+/*
+ * 【检查字符是否在 Unicode 属性表中】
+ * 功能：查询某个 Unicode 字符是否具有特定属性（如是否字母、是否数字等）
+ * 参数：
+ *   - c: 要查询的 Unicode 字符码点
+ *   - table: 压缩的位图数据表
+ *   - index_table: 一级索引表
+ *   - index_table_len: 索引表长度
+ * 返回：TRUE/FALSE，表示字符是否具有该属性
+ * 
+ * 压缩格式详解（游程编码 RLE）：
+ * 属性表存储的是"具有某属性的字符范围"，使用压缩游程编码：
+ * 
+ * 字节值范围      编码格式                      长度计算
+ * ─────────────────────────────────────────────────────
+ * 0x00-0x3F   2 个打包长度 (3 位 +3 位)      (b>>3)+1 和 (b&7)+1
+ * 0x40-0x5F   5 位 + 1 字节扩展             ((b-0x40)<<8 | p[0]) + 1
+ * 0x60-0x7F   5 位 + 2 字节扩展             ((b-0x60)<<16 | p[0]<<8 | p[1]) + 1
+ * 0x80-0xFF   7 位长度                     (b-0x80) + 1
+ * 
+ * 解码逻辑：
+ * - 从起始码点开始，依次读取每个范围的长度
+ * - 范围交替表示"假 - 真 - 假 - 真..."
+ * - bit=0 表示当前范围外的字符不具有该属性
+ * - bit=1 表示当前范围内的字符具有该属性
+ * 
+ * 示例：
+ * 假设表存储"大写字母范围"，编码可能是：
+ * [0x41-0x5A] 为真，其他为假
+ * 压缩后：跳过 0x00-0x40(假) -> 0x41-0x5A(真) -> 0x5B-... (假)
+ */
 static BOOL lre_is_in_table(uint32_t c, const uint8_t *table,
                             const uint8_t *index_table, int index_table_len)
 {
@@ -308,47 +550,69 @@ static BOOL lre_is_in_table(uint32_t c, const uint8_t *table,
     int pos;
     const uint8_t *p;
 
+    /* 第一步：通过两级索引定位到位图表中的位置 */
     pos = get_index_pos(&code, c, index_table, index_table_len);
     if (pos < 0)
-        return FALSE; /* outside the table */
-    p = table + pos;
-    bit = 0;
-    /* Compressed run length encoding:
-       00..3F: 2 packed lengths: 3-bit + 3-bit
-       40..5F: 5-bits plus extra byte for length
-       60..7F: 5-bits plus 2 extra bytes for length
-       80..FF: 7-bit length
-       lengths must be incremented to get character count
-       Ranges alternate between false and true return value.
-     */
+        return FALSE;  /* 字符超出表的范围 */
+    
+    p = table + pos;  /* 指向压缩数据的起始位置 */
+    bit = 0;  /* 初始状态为"假"（不在范围内） */
+    
+    /* 第二步：解码压缩游程编码，查找字符所在的范围 */
     for(;;) {
-        b = *p++;
+        b = *p++;  /* 读取控制字节 */
         if (b < 64) {
-            code += (b >> 3) + 1;
+            /* 0x00-0x3F: 两个 3 位长度打包在一个字节中 */
+            code += (b >> 3) + 1;  /* 第一个范围长度 */
             if (c < code)
-                return bit;
-            bit ^= 1;
-            code += (b & 7) + 1;
+                return bit;  /* 字符在第一个范围内 */
+            bit ^= 1;  /* 切换真假状态 */
+            code += (b & 7) + 1;  /* 第二个范围长度 */
         } else if (b >= 0x80) {
+            /* 0x80-0xFF: 7 位长度，无扩展字节 */
             code += b - 0x80 + 1;
         } else if (b < 0x60) {
+            /* 0x40-0x5F: 5 位 + 1 字节扩展 (13 位长度) */
             code += (((b - 0x40) << 8) | p[0]) + 1;
             p++;
         } else {
+            /* 0x60-0x7F: 5 位 + 2 字节扩展 (21 位长度) */
             code += (((b - 0x60) << 16) | (p[0] << 8) | p[1]) + 1;
             p += 2;
         }
+        /* 检查字符是否在当前范围内 */
         if (c < code)
             return bit;
-        bit ^= 1;
+        bit ^= 1;  /* 切换到下一个范围（真假交替） */
     }
 }
 
+/*
+ * 【判断字符是否有大小写】
+ * 功能：检查 Unicode 字符是否是"有大小写"的字母
+ * 参数：c - Unicode 字符码点
+ * 返回：TRUE=有大小写，FALSE=无大小写
+ * 
+ * 什么是"cased"字符：
+ * - 有大写和小写形式的字母（如 A/a, B/b, Σ/σ）
+ * - 不包括数字、标点、符号等
+ * 
+ * 判断逻辑：
+ * 1. 先在大小写转换表中查找（快速路径）
+ *    - 如果字符在转换表中，说明有大小写变化，返回 TRUE
+ * 2. 如果不在转换表中，再查 Cased1 属性表
+ *    - 某些字符有大小写属性但没有转换规则
+ * 
+ * 应用场景：
+ * - 正则表达式的 \p{Cased} 属性
+ * - 字符串的大小写敏感操作
+ */
 BOOL lre_is_cased(uint32_t c)
 {
     uint32_t v, code, len;
     int idx, idx_min, idx_max;
 
+    /* 第一步：在大小写转换表中查找 */
     idx_min = 0;
     idx_max = countof(case_conv_table1) - 1;
     while (idx_min <= idx_max) {
@@ -361,14 +625,31 @@ BOOL lre_is_cased(uint32_t c)
         } else if (c >= code + len) {
             idx_min = idx + 1;
         } else {
+            /* 在转换表中找到，说明有大小写 */
             return TRUE;
         }
     }
+    /* 第二步：查 Cased1 属性表（补充检查） */
     return lre_is_in_table(c, unicode_prop_Cased1_table,
                            unicode_prop_Cased1_index,
                            sizeof(unicode_prop_Cased1_index) / 3);
 }
 
+/*
+ * 【判断字符是否可忽略大小写】
+ * 功能：检查字符是否在大小写折叠时可以忽略
+ * 参数：c - Unicode 字符码点
+ * 返回：TRUE=可忽略，FALSE=不可忽略
+ * 
+ * 什么是"case ignorable"字符：
+ * - 在大小写折叠时不影响匹配的字符
+ * - 主要是某些变音符号、连接符等
+ * - 例如：U+00AD (软连字符)、U+200C (零宽不连字)
+ * 
+ * 应用场景：
+ * - 正则表达式的不区分大小写匹配
+ * - 字符串比较时跳过这些字符
+ */
 BOOL lre_is_case_ignorable(uint32_t c)
 {
     return lre_is_in_table(c, unicode_prop_Case_Ignorable_table,
@@ -376,8 +657,30 @@ BOOL lre_is_case_ignorable(uint32_t c)
                            sizeof(unicode_prop_Case_Ignorable_index) / 3);
 }
 
-/* character range */
+/* ============================================================
+ * 字符范围 (CharRange) 操作工具
+ * ============================================================
+ * 
+ * 数据结构说明：
+ * CharRange 使用"端点数组"表示一组字符区间的并集
+ * 
+ * 表示方法：
+ * - points 数组存储成对的端点：[start1, end1, start2, end2, ...]
+ * - 每个区间是左闭右开：[start, end)
+ * - 偶数索引 (0,2,4...) 是区间起点
+ * - 奇数索引 (1,3,5...) 是区间终点
+ * 
+ * 示例：
+ * 表示字符范围 [a-z] ∪ [A-Z]：
+ *   points = ['a', 'z'+1, 'A', 'Z'+1]
+ *   len = 4
+ * 
+ * 用途：
+ * - 正则表达式字符类的内部表示
+ * - Unicode 属性集合操作（并、交、差、补）
+ */
 
+/* 【调试函数】打印字符范围内容（仅调试用） */
 static __maybe_unused void cr_dump(CharRange *cr)
 {
     int i;
@@ -385,11 +688,20 @@ static __maybe_unused void cr_dump(CharRange *cr)
         printf("%d: 0x%04x\n", i, cr->points[i]);
 }
 
+/* 【默认内存重分配函数】使用标准 realloc */
 static void *cr_default_realloc(void *opaque, void *ptr, size_t size)
 {
     return realloc(ptr, size);
 }
 
+/*
+ * 【初始化字符范围】
+ * 功能：初始化 CharRange 结构为空
+ * 参数：
+ *   - cr: 要初始化的 CharRange 结构
+ *   - mem_opaque: 内存分配器的上下文（通常为 NULL）
+ *   - realloc_func: 内存重分配函数，NULL 则使用默认 realloc
+ */
 void cr_init(CharRange *cr, void *mem_opaque, DynBufReallocFunc *realloc_func)
 {
     cr->len = cr->size = 0;
@@ -398,11 +710,27 @@ void cr_init(CharRange *cr, void *mem_opaque, DynBufReallocFunc *realloc_func)
     cr->realloc_func = realloc_func ? realloc_func : cr_default_realloc;
 }
 
+/*
+ * 【释放字符范围】
+ * 功能：释放 CharRange 占用的内存
+ */
 void cr_free(CharRange *cr)
 {
     cr->realloc_func(cr->mem_opaque, cr->points, 0);
 }
 
+/*
+ * 【字符范围扩容】
+ * 功能：确保 CharRange 能容纳至少 size 个元素
+ * 参数：
+ *   - cr: CharRange 结构
+ *   - size: 期望的容量
+ * 返回：0=成功，-1=内存分配失败
+ * 
+ * 扩容策略：
+ * - 新容量 = max(size, 原容量 × 1.5)
+ * - 增长因子 1.5 平衡了内存利用率和扩容频率
+ */
 int cr_realloc(CharRange *cr, int size)
 {
     int new_size;
@@ -420,6 +748,10 @@ int cr_realloc(CharRange *cr, int size)
     return 0;
 }
 
+/*
+ * 【复制字符范围】
+ * 功能：将 cr1 的内容复制到 cr
+ */
 int cr_copy(CharRange *cr, const CharRange *cr1)
 {
     if (cr_realloc(cr, cr1->len))
@@ -429,7 +761,24 @@ int cr_copy(CharRange *cr, const CharRange *cr1)
     return 0;
 }
 
-/* merge consecutive intervals and remove empty intervals */
+/*
+ * 【压缩字符范围】
+ * 功能：合并连续的区间，移除空区间，优化存储
+ * 
+ * 优化场景：
+ * 1. 空区间：[5, 5) 这样的区间不包含任何字符，移除
+ * 2. 连续区间：[a, m) 和 [m, z) 可以合并为 [a, z)
+ * 
+ * 算法：
+ * - 遍历所有区间对 (start, end)
+ * - 跳过空区间 (start == end)
+ * - 合并连续区间 (前一个 end == 后一个 start)
+ * - 原地压缩，k 是写入位置，i/j 是读取位置
+ * 
+ * 示例：
+ * 输入：[1,3), [3,5), [5,5), [7,9)
+ * 输出：[1,5), [7,9)
+ */
 static void cr_compress(CharRange *cr)
 {
     int i, j, k, len;
@@ -442,13 +791,14 @@ static void cr_compress(CharRange *cr)
     k = 0;
     while ((i + 1) < len) {
         if (pt[i] == pt[i + 1]) {
-            /* empty interval */
+            /* 空区间，跳过 */
             i += 2;
         } else {
             j = i;
+            /* 查找可以合并的连续区间 */
             while ((j + 3) < len && pt[j + 1] == pt[j + 2])
                 j += 2;
-            /* just copy */
+            /* 复制合并后的区间 */
             pt[k] = pt[i];
             pt[k + 1] = pt[j + 1];
             k += 2;
@@ -458,7 +808,35 @@ static void cr_compress(CharRange *cr)
     cr->len = k;
 }
 
-/* union or intersection */
+/*
+ * 【字符范围集合运算】
+ * 功能：对两个字符范围执行集合运算（并、交、差、异或）
+ * 参数：
+ *   - cr: 输出结果的 CharRange（需已初始化）
+ *   - a_pt, a_len: 第一个操作数的端点数组和长度
+ *   - b_pt, b_len: 第二个操作数的端点数组和长度
+ *   - op: 运算类型
+ *       CR_OP_UNION  - 并集 (A ∪ B)
+ *       CR_OP_INTER  - 交集 (A ∩ B)
+ *       CR_OP_XOR    - 异或 (A ⊕ B)
+ *       CR_OP_SUB    - 差集 (A - B)
+ * 返回：0=成功，-1=失败
+ * 
+ * 算法：扫描线算法 (Sweep Line)
+ * 1. 将两个端点数组按升序合并遍历
+ * 2. 维护"进入/退出"状态：
+ *    - a_idx & 1: A 集合的内外状态（奇数=内，偶数=外）
+ *    - b_idx & 1: B 集合的内外状态
+ * 3. 当结果的内外状态变化时，添加端点
+ * 
+ * 状态转换真值表：
+ * 运算    | A 外 B 外 | A 内 B 外 | A 外 B 内 | A 内 B 内
+ * --------+---------+---------+---------+--------
+ * UNION   |   外    |   内    |   内    |   内
+ * INTER   |   外    |   外    |   外    |   内
+ * XOR     |   外    |   内    |   内    |   外
+ * SUB     |   外    |   内    |   外    |   外
+ */
 int cr_op(CharRange *cr, const uint32_t *a_pt, int a_len,
           const uint32_t *b_pt, int b_len, int op)
 {
@@ -468,11 +846,12 @@ int cr_op(CharRange *cr, const uint32_t *a_pt, int a_len,
     a_idx = 0;
     b_idx = 0;
     for(;;) {
-        /* get one more point from a or b in increasing order */
+        /* 按升序从 a 或 b 获取下一个端点 */
         if (a_idx < a_len && b_idx < b_len) {
             if (a_pt[a_idx] < b_pt[b_idx]) {
                 goto a_add;
             } else if (a_pt[a_idx] == b_pt[b_idx]) {
+                /* 端点重合，同时消耗两个 */
                 v = a_pt[a_idx];
                 a_idx++;
                 b_idx++;
@@ -486,31 +865,32 @@ int cr_op(CharRange *cr, const uint32_t *a_pt, int a_len,
         b_add:
             v = b_pt[b_idx++];
         } else {
-            break;
+            break;  /* 两个数组都处理完 */
         }
-        /* add the point if the in/out status changes */
+        /* 根据运算类型计算结果的内/外状态 */
         switch(op) {
         case CR_OP_UNION:
-            is_in = (a_idx & 1) | (b_idx & 1);
+            is_in = (a_idx & 1) | (b_idx & 1);  /* 任一在内则在内 */
             break;
         case CR_OP_INTER:
-            is_in = (a_idx & 1) & (b_idx & 1);
+            is_in = (a_idx & 1) & (b_idx & 1);  /* 都在内才在内 */
             break;
         case CR_OP_XOR:
-            is_in = (a_idx & 1) ^ (b_idx & 1);
+            is_in = (a_idx & 1) ^ (b_idx & 1);  /* 仅一个在内 */
             break;
         case CR_OP_SUB:
-            is_in = (a_idx & 1) & ((b_idx & 1) ^ 1);
+            is_in = (a_idx & 1) & ((b_idx & 1) ^ 1);  /* 在 A 但不在 B */
             break;
         default:
             abort();
         }
+        /* 状态变化时添加端点（形成新区间的起点或终点） */
         if (is_in != (cr->len & 1)) {
             if (cr_add_point(cr, v))
                 return -1;
         }
     }
-    cr_compress(cr);
+    cr_compress(cr);  /* 压缩结果，合并连续区间 */
     return 0;
 }
 
