@@ -1069,6 +1069,18 @@ static void js_set_error_object(JSContext *ctx, JSValue obj, int err)
     }
 }
 
+/**
+ * std.open(filename, mode[, errorObj]) - 打开文件
+ * 
+ * @param argv[0] 文件名
+ * @param argv[1] 模式（r/w/a/+/b 组合）
+ * @param argv[2] 可选：错误对象（用于返回 errno）
+ * @returns 文件对象，失败返回 NULL
+ * 
+ * 示例：
+ *   const f = std.open('test.txt', 'r');
+ *   const f = std.open('data.bin', 'rb');
+ */
 static JSValue js_std_open(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
 {
@@ -1076,35 +1088,48 @@ static JSValue js_std_open(JSContext *ctx, JSValueConst this_val,
     FILE *f;
     int err;
 
-    filename = JS_ToCString(ctx, argv[0]);
+    filename = JS_ToCString(ctx, argv[0]);  // 获取文件名
     if (!filename)
         goto fail;
-    mode = JS_ToCString(ctx, argv[1]);
+    mode = JS_ToCString(ctx, argv[1]);  // 获取模式
     if (!mode)
         goto fail;
+    // 验证模式字符串：只允许 r/w/a/+/b 字符
     if (mode[strspn(mode, "rwa+b")] != '\0') {
         JS_ThrowTypeError(ctx, "invalid file mode");
         goto fail;
     }
 
-    f = fopen(filename, mode);
+    f = fopen(filename, mode);  // 打开文件
     if (!f)
-        err = errno;
+        err = errno;  // 记录错误码
     else
         err = 0;
     if (argc >= 3)
-        js_set_error_object(ctx, argv[2], err);
+        js_set_error_object(ctx, argv[2], err);  // 设置错误对象
     JS_FreeCString(ctx, filename);
     JS_FreeCString(ctx, mode);
     if (!f)
-        return JS_NULL;
-    return js_new_std_file(ctx, f, TRUE, FALSE);
+        return JS_NULL;  // 失败返回 NULL
+    return js_new_std_file(ctx, f, TRUE, FALSE);  // 创建文件对象（需要关闭）
  fail:
     JS_FreeCString(ctx, filename);
     JS_FreeCString(ctx, mode);
     return JS_EXCEPTION;
 }
 
+/**
+ * std.popen(command, mode[, errorObj]) - 打开管道
+ * 
+ * @param argv[0] 命令字符串
+ * @param argv[1] 模式（r=读取管道/w=写入管道）
+ * @param argv[2] 可选：错误对象
+ * @returns 文件对象，失败返回 NULL
+ * 
+ * 示例：
+ *   const f = std.popen('ls -la', 'r');  // 读取命令输出
+ *   const f = std.popen('cat > out.txt', 'w');  // 写入命令
+ */
 static JSValue js_std_popen(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv)
 {
@@ -1112,18 +1137,19 @@ static JSValue js_std_popen(JSContext *ctx, JSValueConst this_val,
     FILE *f;
     int err;
 
-    filename = JS_ToCString(ctx, argv[0]);
+    filename = JS_ToCString(ctx, argv[0]);  // 获取命令
     if (!filename)
         goto fail;
-    mode = JS_ToCString(ctx, argv[1]);
+    mode = JS_ToCString(ctx, argv[1]);  // 获取模式
     if (!mode)
         goto fail;
+    // popen 只支持 r/w 模式
     if (mode[strspn(mode, "rw")] != '\0') {
         JS_ThrowTypeError(ctx, "invalid file mode");
         goto fail;
     }
 
-    f = popen(filename, mode);
+    f = popen(filename, mode);  // 打开管道
     if (!f)
         err = errno;
     else
@@ -1134,13 +1160,25 @@ static JSValue js_std_popen(JSContext *ctx, JSValueConst this_val,
     JS_FreeCString(ctx, mode);
     if (!f)
         return JS_NULL;
-    return js_new_std_file(ctx, f, TRUE, TRUE);
+    return js_new_std_file(ctx, f, TRUE, TRUE);  // is_popen=TRUE（用 pclose 关闭）
  fail:
     JS_FreeCString(ctx, filename);
     JS_FreeCString(ctx, mode);
     return JS_EXCEPTION;
 }
 
+/**
+ * std.fdopen(fd, mode[, errorObj]) - 文件描述符转文件对象
+ * 
+ * @param argv[0] 文件描述符（整数）
+ * @param argv[1] 模式（r/w/a/+）
+ * @param argv[2] 可选：错误对象
+ * @returns 文件对象，失败返回 NULL
+ * 
+ * 示例：
+ *   const f = std.fdopen(0, 'r');  // stdin
+ *   const f = std.fdopen(1, 'w');  // stdout
+ */
 static JSValue js_std_fdopen(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -1148,17 +1186,18 @@ static JSValue js_std_fdopen(JSContext *ctx, JSValueConst this_val,
     FILE *f;
     int fd, err;
 
-    if (JS_ToInt32(ctx, &fd, argv[0]))
+    if (JS_ToInt32(ctx, &fd, argv[0]))  // 获取文件描述符
         return JS_EXCEPTION;
     mode = JS_ToCString(ctx, argv[1]);
     if (!mode)
         goto fail;
+    // 验证模式
     if (mode[strspn(mode, "rwa+")] != '\0') {
         JS_ThrowTypeError(ctx, "invalid file mode");
         goto fail;
     }
 
-    f = fdopen(fd, mode);
+    f = fdopen(fd, mode);  // 将 fd 转换为 FILE*
     if (!f)
         err = errno;
     else
@@ -1174,11 +1213,15 @@ static JSValue js_std_fdopen(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+/**
+ * std.tmpfile() - 创建临时文件
+ * @returns 临时文件对象（自动删除），失败返回 NULL
+ */
 static JSValue js_std_tmpfile(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
     FILE *f;
-    f = tmpfile();
+    f = tmpfile();  // 创建临时文件（关闭时自动删除）
     if (argc >= 1)
         js_set_error_object(ctx, argv[0], f ? 0 : errno);
     if (!f)
@@ -1186,25 +1229,42 @@ static JSValue js_std_tmpfile(JSContext *ctx, JSValueConst this_val,
     return js_new_std_file(ctx, f, TRUE, FALSE);
 }
 
+/**
+ * std.sprintf(format, ...args) - 格式化字符串
+ * @returns 格式化后的字符串
+ * 
+ * 示例：std.sprintf('Hello %s, you are %d years old', 'Alice', 25)
+ */
 static JSValue js_std_sprintf(JSContext *ctx, JSValueConst this_val,
                           int argc, JSValueConst *argv)
 {
-    return js_printf_internal(ctx, argc, argv, NULL);
+    return js_printf_internal(ctx, argc, argv, NULL);  // 输出到字符串
 }
 
+/**
+ * std.printf(format, ...args) - 格式化输出到 stdout
+ * @returns 写入的字符数
+ * 
+ * 示例：std.printf('Progress: %d%%\n', 50)
+ */
 static JSValue js_std_printf(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
-    return js_printf_internal(ctx, argc, argv, stdout);
+    return js_printf_internal(ctx, argc, argv, stdout);  // 输出到 stdout
 }
 
+/**
+ * 从 JS 文件对象获取 C FILE 指针
+ * @param obj JS 文件对象
+ * @returns FILE 指针，失败返回 NULL
+ */
 static FILE *js_std_file_get(JSContext *ctx, JSValueConst obj)
 {
     JSSTDFile *s = JS_GetOpaque2(ctx, obj, js_std_file_class_id);
     if (!s)
         return NULL;
     if (!s->f) {
-        JS_ThrowTypeError(ctx, "invalid file handle");
+        JS_ThrowTypeError(ctx, "invalid file handle");  // 文件已关闭
         return NULL;
     }
     return s->f;
