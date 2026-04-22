@@ -44997,29 +44997,57 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     bc_read_trace(s, "name: "); print_atom(s->ctx, b->func_name); printf("\n");
 #endif
     bc_read_trace(s, "args=%d vars=%d defargs=%d closures=%d cpool=%d\n",
-                  b->arg_count, b->var_count, b->defined_arg_count,
+                  /* ============================================================
+ * QJ-18 模块：字节码反序列化与内置对象 (行 45000-50000)
+ * ============================================================
+ * 功能概述:
+ * 1. 字节码反序列化：将二进制字节码还原为可执行的函数/模块对象
+ * 2. 内置对象实现：Object/Function/Error/Array 等核心对象
+ * 3. 迭代器协议：数组迭代器、连接迭代器等
+ * 
+ * 关键函数:
+ * - JS_ReadFunction: 读取函数字节码
+ * - JS_ReadModule: 读取模块定义
+ * - JS_ReadObjectRec: 递归读取对象（反序列化核心）
+ * - js_object_*: Object 内置方法族
+ * - js_function_*: Function 内置方法族
+ * - js_array_*: Array 内置方法族
+ * ============================================================ */
+
+/* --- 函数字节码读取：局部变量定义解析 --- */
+b->arg_count, b->var_count, b->defined_arg_count,
                   b->closure_var_count, b->cpool_count);
     bc_read_trace(s, "stack=%d bclen=%d locals=%d\n",
                   b->stack_size, b->byte_code_len, local_count);
 
+    /* 读取局部变量定义表 */
     if (local_count != 0) {
         bc_read_trace(s, "vars {\n");
         for(i = 0; i < local_count; i++) {
             JSBytecodeVarDef *vd = &b->vardefs[i];
+            /* 读取变量名（atom 索引） */
             if (bc_get_atom(s, &vd->var_name))
                 goto fail;
+            /* 读取作用域链下一个变量索引（LEB128 编码） */
             if (bc_get_leb128_int(s, &vd->scope_next))
                 goto fail;
-            vd->scope_next--;
+            vd->scope_next--;  /* 转换为 0 基索引 */
+            /* 读取变量引用索引 */
             if (bc_get_leb128_u16(s, &vd->var_ref_idx))
                 goto fail;
+            /* 读取变量属性标志位（1 字节位域） */
             if (bc_get_u8(s, &v8))
                 goto fail;
             idx = 0;
+            /* 解析标志位：变量类型（4 位） */
             vd->var_kind = bc_get_flags(v8, &idx, 4);
+            /* 解析标志位：是否为 const（1 位） */
             vd->is_const = bc_get_flags(v8, &idx, 1);
+            /* 解析标志位：是否为词法作用域（1 位） */
             vd->is_lexical = bc_get_flags(v8, &idx, 1);
+            /* 解析标志位：是否被闭包捕获（1 位） */
             vd->is_captured = bc_get_flags(v8, &idx, 1);
+            /* 解析标志位：是否有作用域信息（1 位） */
             vd->has_scope = bc_get_flags(v8, &idx, 1);
 #ifdef DUMP_READ_OBJECT
             bc_read_trace(s, "name: "); print_atom(s->ctx, vd->var_name); printf("\n");
@@ -45027,22 +45055,31 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         }
         bc_read_trace(s, "}\n");
     }
+/* --- 读取闭包变量定义表 --- */
+    /* 闭包变量：被内部函数捕获的外部作用域变量 */
     if (b->closure_var_count != 0) {
         bc_read_trace(s, "closure vars {\n");
         for(i = 0; i < b->closure_var_count; i++) {
             JSClosureVar *cv = &b->closure_var[i];
             int var_idx;
+            /* 读取闭包变量名 */
             if (bc_get_atom(s, &cv->var_name))
                 goto fail;
+            /* 读取变量索引 */
             if (bc_get_leb128_int(s, &var_idx))
                 goto fail;
             cv->var_idx = var_idx;
+            /* 读取闭包类型标志（2 字节位域） */
             if (bc_get_u16(s, &v16))
                 goto fail;
             idx = 0;
+            /* 解析闭包类型（3 位）：区分普通变量/捕获变量等 */
             cv->closure_type = bc_get_flags(v16, &idx, 3);
+            /* 解析 const 标志 */
             cv->is_const = bc_get_flags(v16, &idx, 1);
+            /* 解析词法作用域标志 */
             cv->is_lexical = bc_get_flags(v16, &idx, 1);
+            /* 解析变量类型（4 位） */
             cv->var_kind = bc_get_flags(v16, &idx, 4);
 #ifdef DUMP_READ_OBJECT
             bc_read_trace(s, "name: "); print_atom(s->ctx, cv->var_name); printf("\n");
@@ -45050,22 +45087,29 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         }
         bc_read_trace(s, "}\n");
     }
+/* --- 读取字节码主体 --- */
     {
         bc_read_trace(s, "bytecode {\n");
+        /* 读取实际字节码指令流 */
         if (JS_ReadFunctionBytecode(s, b, byte_code_offset, b->byte_code_len))
             goto fail;
         bc_read_trace(s, "}\n");
     }
+    
+    /* --- 读取调试信息（可选） --- */
+    /* 调试信息用于错误堆栈和源码映射 */
     if (b->has_debug) {
-        /* read optional debug information */
         bc_read_trace(s, "debug {\n");
+        /* 读取源文件名字符串 */
         if (bc_get_atom(s, &b->debug.filename))
             goto fail;
 #ifdef DUMP_READ_OBJECT
         bc_read_trace(s, "filename: "); print_atom(s->ctx, b->debug.filename); printf("\n");
 #endif
+        /* 读取程序计数器到行号的映射表长度 */
         if (bc_get_leb128_int(s, &b->debug.pc2line_len))
             goto fail;
+        /* 读取 pc2line 映射表（用于将字节码偏移量映射回源码行号） */
         if (b->debug.pc2line_len) {
             b->debug.pc2line_buf = js_mallocz(ctx, b->debug.pc2line_len);
             if (!b->debug.pc2line_buf)
@@ -45073,8 +45117,10 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
             if (bc_get_buf(s, b->debug.pc2line_buf, b->debug.pc2line_len))
                 goto fail;
         }
+        /* 读取源代码长度 */
         if (bc_get_leb128_int(s, &b->debug.source_len))
             goto fail;
+        /* 读取源代码快照（用于错误显示） */
         if (b->debug.source_len) {
             bc_read_trace(s, "source: %d bytes\n", b->source_len);
             b->debug.source = js_mallocz(ctx, b->debug.source_len);
@@ -45085,10 +45131,13 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         }
         bc_read_trace(s, "}\n");
     }
+/* --- 读取常量池 --- */
+    /* 常量池：存储函数中使用的常量值（字符串、数字、对象等） */
     if (b->cpool_count != 0) {
         bc_read_trace(s, "cpool {\n");
         for(i = 0; i < b->cpool_count; i++) {
             JSValue val;
+            /* 递归读取常量对象 */
             val = JS_ReadObjectRec(s);
             if (JS_IsException(val))
                 goto fail;
@@ -45096,6 +45145,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         }
         bc_read_trace(s, "}\n");
     }
+    /* 复制上下文引用（用于模块作用域） */
     b->realm = JS_DupContext(ctx);
     return obj;
  fail:
@@ -45103,6 +45153,17 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     return JS_EXCEPTION;
 }
 
+/* ============================================================
+ * JS_ReadModule - 读取模块定义
+ * ============================================================
+ * 功能：从字节码流中反序列化 ES6 模块
+ * 读取内容:
+ * - 模块名
+ * - 导入声明（import）
+ * - 导出声明（export）
+ * - 星号导出（export * from）
+ * - 模块函数字节码
+ * ============================================================ */
 static JSValue JS_ReadModule(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
@@ -45112,17 +45173,22 @@ static JSValue JS_ReadModule(BCReaderState *s)
     int i;
     uint8_t v8;
 
+    /* 读取模块名称 */
     if (bc_get_atom(s, &module_name))
         goto fail;
 #ifdef DUMP_READ_OBJECT
     bc_read_trace(s, "name: "); print_atom(s->ctx, module_name); printf("\n");
 #endif
+    /* 创建新的模块定义结构 */
     m = js_new_module_def(ctx, module_name);
     if (!m)
         goto fail;
+    /* 创建模块值对象 */
     obj = JS_NewModuleValue(ctx, m);
+    /* 读取依赖模块数量 */
     if (bc_get_leb128_int(s, &m->req_module_entries_count))
         goto fail;
+    /* 读取依赖模块列表（import 语句） */
     if (m->req_module_entries_count != 0) {
         m->req_module_entries_size = m->req_module_entries_count;
         m->req_module_entries = js_mallocz(ctx, sizeof(m->req_module_entries[0]) * m->req_module_entries_size);
@@ -45131,8 +45197,10 @@ static JSValue JS_ReadModule(BCReaderState *s)
         for(i = 0; i < m->req_module_entries_count; i++) {
             JSReqModuleEntry *rme = &m->req_module_entries[i];
             JSValue val;
+            /* 读取依赖模块名 */
             if (bc_get_atom(s, &rme->module_name))
                 goto fail;
+            /* 读取导入属性（如 import attributes） */
             val = JS_ReadObjectRec(s);
             if (JS_IsException(val))
                 goto fail;
@@ -45140,6 +45208,8 @@ static JSValue JS_ReadModule(BCReaderState *s)
         }
     }
 
+/* --- 读取导出声明列表 --- */
+    /* export_entries: 存储所有 export 语句的信息 */
     if (bc_get_leb128_int(s, &m->export_entries_count))
         goto fail;
     if (m->export_entries_count != 0) {
@@ -45149,23 +45219,32 @@ static JSValue JS_ReadModule(BCReaderState *s)
             goto fail;
         for(i = 0; i < m->export_entries_count; i++) {
             JSExportEntry *me = &m->export_entries[i];
+            /* 读取导出类型标志 */
             if (bc_get_u8(s, &v8))
                 goto fail;
             me->export_type = v8;
             if (me->export_type == JS_EXPORT_TYPE_LOCAL) {
+                /* 本地导出：export { name } 或 export var name */
+                /* 读取本地变量索引 */
                 if (bc_get_leb128_int(s, &me->u.local.var_idx))
                     goto fail;
             } else {
+                /* 重命名导出：export { local as name } from "module" */
+                /* 读取依赖模块索引 */
                 if (bc_get_leb128_int(s, &me->u.req_module_idx))
                     goto fail;
+                /* 读取本地名称 */
                 if (bc_get_atom(s, &me->local_name))
                     goto fail;
             }
+            /* 读取导出名称 */
             if (bc_get_atom(s, &me->export_name))
                 goto fail;
         }
     }
 
+/* --- 读取星号导出列表 --- */
+    /* star_export_entries: export * from "module" 语句 */
     if (bc_get_leb128_int(s, &m->star_export_entries_count))
         goto fail;
     if (m->star_export_entries_count != 0) {
@@ -45175,11 +45254,14 @@ static JSValue JS_ReadModule(BCReaderState *s)
             goto fail;
         for(i = 0; i < m->star_export_entries_count; i++) {
             JSStarExportEntry *se = &m->star_export_entries[i];
+            /* 读取星号导出的源模块索引 */
             if (bc_get_leb128_int(s, &se->req_module_idx))
                 goto fail;
         }
     }
 
+    /* --- 读取导入条目列表 --- */
+    /* import_entries: 存储所有 import 语句绑定的变量 */
     if (bc_get_leb128_int(s, &m->import_entries_count))
         goto fail;
     if (m->import_entries_count != 0) {
@@ -45190,22 +45272,29 @@ static JSValue JS_ReadModule(BCReaderState *s)
         for(i = 0; i < m->import_entries_count; i++) {
             JSImportEntry *mi = &m->import_entries[i];
             uint8_t v8;
+            /* 读取变量索引（导入绑定到的本地变量） */
             if (bc_get_leb128_int(s, &mi->var_idx))
                 goto fail;
+            /* 读取是否为星号导入标志（import * as name） */
             if (bc_get_u8(s, &v8))
                 goto fail;
             mi->is_star = (v8 != 0);
+            /* 读取导入名称（import { name } 中的 name） */
             if (bc_get_atom(s, &mi->import_name))
                 goto fail;
+            /* 读取源模块索引 */
             if (bc_get_leb128_int(s, &mi->req_module_idx))
                 goto fail;
         }
     }
 
+/* --- 读取顶层异步标志和模块函数 --- */
+    /* has_tla: Top-Level Await 标志，表示模块是否使用 await 在顶层 */
     if (bc_get_u8(s, &v8))
         goto fail;
     m->has_tla = (v8 != 0);
 
+    /* 读取模块初始化函数字节码 */
     m->func_obj = JS_ReadObjectRec(s);
     if (JS_IsException(m->func_obj))
         goto fail;
@@ -45217,6 +45306,14 @@ static JSValue JS_ReadModule(BCReaderState *s)
     return JS_EXCEPTION;
 }
 
+/* ============================================================
+ * JS_ReadObjectTag - 读取普通对象
+ * ============================================================
+ * 功能：反序列化 JavaScript 普通对象
+ * 读取内容:
+ * - 属性数量
+ * - 每个属性的键值对（atom + value）
+ * ============================================================ */
 static JSValue JS_ReadObjectTag(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
@@ -45226,22 +45323,28 @@ static JSValue JS_ReadObjectTag(BCReaderState *s)
     JSValue val;
     int ret;
 
+    /* 创建新对象 */
     obj = JS_NewObject(ctx);
-    if (BC_add_object_ref(s, obj))
+    if (BC_add_object_ref(s, obj))  /* 注册对象引用，用于处理循环引用 */
         goto fail;
+    /* 读取属性数量 */
     if (bc_get_leb128(s, &prop_count))
         goto fail;
+    /* 遍历读取所有属性 */
     for(i = 0; i < prop_count; i++) {
+        /* 读取属性名（atom） */
         if (bc_get_atom(s, &atom))
             goto fail;
 #ifdef DUMP_READ_OBJECT
         bc_read_trace(s, "propname: "); print_atom(s->ctx, atom); printf("\n");
 #endif
+        /* 递归读取属性值 */
         val = JS_ReadObjectRec(s);
         if (JS_IsException(val)) {
             JS_FreeAtom(ctx, atom);
             goto fail;
         }
+        /* 定义属性（可配置、可写、可枚举） */
         ret = JS_DefinePropertyValue(ctx, obj, atom, val, JS_PROP_C_W_E);
         JS_FreeAtom(ctx, atom);
         if (ret < 0)
@@ -45253,6 +45356,14 @@ static JSValue JS_ReadObjectTag(BCReaderState *s)
     return JS_EXCEPTION;
 }
 
+/* ============================================================
+ * JS_ReadArray - 读取数组/模板对象
+ * ============================================================
+ * 功能：反序列化数组或模板字符串对象
+ * 参数:
+ * - tag: BC_TAG_ARRAY（普通数组）或 BC_TAG_TEMPLATE_OBJECT（模板对象）
+ * 模板对象特殊处理：包含 raw 属性（未转义的原始字符串）
+ * ============================================================ */
 static JSValue JS_ReadArray(BCReaderState *s, int tag)
 {
     JSContext *ctx = s->ctx;
@@ -45262,34 +45373,44 @@ static JSValue JS_ReadArray(BCReaderState *s, int tag)
     int ret, prop_flags;
     BOOL is_template;
 
+    /* 创建新数组 */
     obj = JS_NewArray(ctx);
     if (BC_add_object_ref(s, obj))
         goto fail;
+    /* 判断是否为模板对象 */
     is_template = (tag == BC_TAG_TEMPLATE_OBJECT);
+    /* 读取数组长度 */
     if (bc_get_leb128(s, &len))
         goto fail;
+    /* 遍历读取数组元素 */
     for(i = 0; i < len; i++) {
+        /* 递归读取元素值 */
         val = JS_ReadObjectRec(s);
         if (JS_IsException(val))
             goto fail;
+        /* 模板对象的属性标志：仅可枚举（不可配置、不可写） */
         if (is_template)
             prop_flags = JS_PROP_ENUMERABLE;
         else
+            /* 普通数组：可配置、可写、可枚举 */
             prop_flags = JS_PROP_C_W_E;
         ret = JS_DefinePropertyValueUint32(ctx, obj, i, val,
                                            prop_flags);
         if (ret < 0)
             goto fail;
     }
+    /* 模板对象特殊处理：读取 raw 属性（未转义的原始字符串数组） */
     if (is_template) {
         val = JS_ReadObjectRec(s);
         if (JS_IsException(val))
             goto fail;
         if (!JS_IsUndefined(val)) {
+            /* 定义 raw 属性（不可枚举、不可配置、不可写） */
             ret = JS_DefinePropertyValue(ctx, obj, JS_ATOM_raw, val, 0);
             if (ret < 0)
                 goto fail;
         }
+        /* 防止扩展：模板对象不能有额外属性 */
         JS_PreventExtensions(ctx, obj);
     }
     return obj;
@@ -45298,6 +45419,16 @@ static JSValue JS_ReadArray(BCReaderState *s, int tag)
     return JS_EXCEPTION;
 }
 
+/* ============================================================
+ * JS_ReadTypedArray - 读取类型化数组
+ * ============================================================
+ * 功能：反序列化 TypedArray（如 Uint8Array、Float32Array 等）
+ * 读取内容:
+ * - 数组类型标签（Uint8/Int16/Float32 等）
+ * - 元素数量
+ * - 在 ArrayBuffer 中的偏移量
+ * - 底层 ArrayBuffer 对象
+ * ============================================================ */
 static JSValue JS_ReadTypedArray(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
@@ -45306,34 +45437,46 @@ static JSValue JS_ReadTypedArray(BCReaderState *s)
     JSValueConst args[3];
     uint32_t offset, len, idx;
 
+    /* 读取类型化数组类型标签 */
     if (bc_get_u8(s, &array_tag))
         return JS_EXCEPTION;
     if (array_tag >= JS_TYPED_ARRAY_COUNT)
         return JS_ThrowTypeError(ctx, "invalid typed array");
+    /* 读取元素数量 */
     if (bc_get_leb128(s, &len))
         return JS_EXCEPTION;
+    /* 读取在 ArrayBuffer 中的字节偏移量 */
     if (bc_get_leb128(s, &offset))
         return JS_EXCEPTION;
-    /* XXX: this hack could be avoided if the typed array could be
-       created before the array buffer */
+    /* 
+     * XXX: 这里有个技巧：需要在创建 TypedArray 之前先注册对象引用
+     * 因为 TypedArray 的构造函数需要引用 ArrayBuffer
+     * 如果 TypedArray 可以在 ArrayBuffer 之前创建，这个技巧就不需要了
+     */
     idx = s->objects_count;
+    /* 预先注册空引用占位 */
     if (BC_add_object_ref1(s, NULL))
         goto fail;
+    /* 读取底层 ArrayBuffer 对象 */
     array_buffer = JS_ReadObjectRec(s);
     if (JS_IsException(array_buffer))
         return JS_EXCEPTION;
+    /* 验证是否为有效的 ArrayBuffer */
     if (!js_get_array_buffer(ctx, array_buffer)) {
         JS_FreeValue(ctx, array_buffer);
         return JS_EXCEPTION;
     }
+    /* 构造 TypedArray 构造函数参数：[buffer, offset, length] */
     args[0] = array_buffer;
     args[1] = JS_NewInt64(ctx, offset);
     args[2] = JS_NewInt64(ctx, len);
+    /* 调用 TypedArray 构造函数创建对象 */
     obj = js_typed_array_constructor(ctx, JS_UNDEFINED,
                                      3, args,
                                      JS_CLASS_UINT8C_ARRAY + array_tag);
     if (JS_IsException(obj))
         goto fail;
+    /* 如果允许引用，更新对象引用表 */
     if (s->allow_reference) {
         s->objects[idx] = JS_VALUE_GET_OBJ(obj);
     }
@@ -45345,6 +45488,15 @@ static JSValue JS_ReadTypedArray(BCReaderState *s)
     return JS_EXCEPTION;
 }
 
+/* ============================================================
+ * JS_ReadArrayBuffer - 读取数组缓冲区
+ * ============================================================
+ * 功能：反序列化 ArrayBuffer 对象
+ * 读取内容:
+ * - 字节长度
+ * - 最大字节长度（用于可增长 ArrayBuffer）
+ * - 原始字节数据（直接复制）
+ * ============================================================ */
 static JSValue JS_ReadArrayBuffer(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
@@ -45352,21 +45504,25 @@ static JSValue JS_ReadArrayBuffer(BCReaderState *s)
     uint64_t max_byte_length_u64, *pmax_byte_length = NULL;
     JSValue obj;
 
+    /* 读取字节长度 */
     if (bc_get_leb128(s, &byte_length))
         return JS_EXCEPTION;
+    /* 读取最大字节长度（可增长 ArrayBuffer 使用） */
     if (bc_get_leb128(s, &max_byte_length))
         return JS_EXCEPTION;
+    /* 验证长度有效性 */
     if (max_byte_length < byte_length)
         return JS_ThrowTypeError(ctx, "invalid array buffer");
     if (max_byte_length != UINT32_MAX) {
         max_byte_length_u64 = max_byte_length;
         pmax_byte_length = &max_byte_length_u64;
     }
+    /* 检查缓冲区是否有足够的数据 */
     if (unlikely(s->buf_end - s->ptr < byte_length)) {
         bc_read_error_end(s);
         return JS_EXCEPTION;
     }
-    // makes a copy of the input
+    // 复制输入数据（创建独立副本）
     obj = js_array_buffer_constructor3(ctx, JS_UNDEFINED,
                                        byte_length, pmax_byte_length,
                                        JS_CLASS_ARRAY_BUFFER,
@@ -45377,6 +45533,7 @@ static JSValue JS_ReadArrayBuffer(BCReaderState *s)
         goto fail;
     if (BC_add_object_ref(s, obj))
         goto fail;
+    /* 跳过已读取的字节数据 */
     s->ptr += byte_length;
     return obj;
  fail:
@@ -45469,20 +45626,37 @@ static JSValue JS_ReadObjectValue(BCReaderState *s)
     return JS_EXCEPTION;
 }
 
+/* ============================================================
+ * JS_ReadObjectRec - 递归读取对象（反序列化核心入口）
+ * ============================================================
+ * 功能：根据标签类型递归反序列化任意 JavaScript 值
+ * 支持的类型:
+ * - 原始值：null, undefined, boolean, int32, float64, string
+ * - 对象：Object, Array, Function, Module
+ * - 特殊类型：TypedArray, ArrayBuffer, Date, BigInt
+ * - 引用：对象引用（处理循环引用）
+ * 
+ * 序列化格式:
+ * [tag:u8] [data:variable]
+ * 标签决定后续数据的格式和长度
+ * ============================================================ */
 static JSValue JS_ReadObjectRec(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
     uint8_t tag;
     JSValue obj = JS_UNDEFINED;
 
+    /* 检查栈溢出（递归深度限制） */
     if (js_check_stack_overflow(ctx->rt, 0))
         return JS_ThrowStackOverflow(ctx);
 
+    /* 读取类型标签（1 字节） */
     if (bc_get_u8(s, &tag))
         return JS_EXCEPTION;
 
     bc_read_trace(s, "%s {\n", bc_tag_str[tag]);
 
+    /* 根据标签类型分发处理 */
     switch(tag) {
     case BC_TAG_NULL:
         obj = JS_NULL;
@@ -45492,11 +45666,13 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
         break;
     case BC_TAG_BOOL_FALSE:
     case BC_TAG_BOOL_TRUE:
+        /* 布尔值：标签直接编码 true/false */
         obj = JS_NewBool(ctx, tag - BC_TAG_BOOL_FALSE);
         break;
     case BC_TAG_INT32:
         {
             int32_t val;
+            /* 读取有符号 LEB128 编码的 32 位整数 */
             if (bc_get_sleb128(s, &val))
                 return JS_EXCEPTION;
             bc_read_trace(s, "%d\n", val);
@@ -45506,6 +45682,7 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
     case BC_TAG_FLOAT64:
         {
             JSFloat64Union u;
+            /* 读取 64 位浮点数（IEEE 754 双精度） */
             if (bc_get_u64(s, &u.u64))
                 return JS_EXCEPTION;
             bc_read_trace(s, "%g\n", u.d);
@@ -45515,6 +45692,7 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
     case BC_TAG_STRING:
         {
             JSString *p;
+            /* 读取字符串（可能是压缩格式） */
             p = JS_ReadString(s);
             if (!p)
                 return JS_EXCEPTION;
@@ -45522,59 +45700,74 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
         }
         break;
     case BC_TAG_FUNCTION_BYTECODE:
+        /* 函数字节码：需要允许字节码标志 */
         if (!s->allow_bytecode)
             goto invalid_tag;
         obj = JS_ReadFunctionTag(s);
         break;
     case BC_TAG_MODULE:
+        /* 模块对象：需要允许字节码标志 */
         if (!s->allow_bytecode)
             goto invalid_tag;
         obj = JS_ReadModule(s);
         break;
     case BC_TAG_OBJECT:
+        /* 普通对象 */
         obj = JS_ReadObjectTag(s);
         break;
     case BC_TAG_ARRAY:
     case BC_TAG_TEMPLATE_OBJECT:
+        /* 数组或模板字符串对象 */
         obj = JS_ReadArray(s, tag);
         break;
     case BC_TAG_TYPED_ARRAY:
+        /* 类型化数组 */
         obj = JS_ReadTypedArray(s);
         break;
     case BC_TAG_ARRAY_BUFFER:
+        /* 数组缓冲区 */
         obj = JS_ReadArrayBuffer(s);
         break;
     case BC_TAG_SHARED_ARRAY_BUFFER:
+        /* 共享数组缓冲区：需要特殊权限 */
         if (!s->allow_sab || !ctx->rt->sab_funcs.sab_dup)
             goto invalid_tag;
         obj = JS_ReadSharedArrayBuffer(s);
         break;
     case BC_TAG_DATE:
+        /* Date 对象 */
         obj = JS_ReadDate(s);
         break;
     case BC_TAG_OBJECT_VALUE:
+        /* 对象值包装 */
         obj = JS_ReadObjectValue(s);
         break;
     case BC_TAG_BIG_INT:
+        /* BigInt 大整数 */
         obj = JS_ReadBigInt(s);
         break;
     case BC_TAG_OBJECT_REFERENCE:
         {
             uint32_t val;
+            /* 对象引用：用于处理循环引用和共享对象 */
             if (!s->allow_reference)
                 return JS_ThrowSyntaxError(ctx, "object references are not allowed");
+            /* 读取引用索引 */
             if (bc_get_leb128(s, &val))
                 return JS_EXCEPTION;
             bc_read_trace(s, "%u\n", val);
+            /* 验证引用索引有效性 */
             if (val >= s->objects_count) {
                 return JS_ThrowSyntaxError(ctx, "invalid object reference (%u >= %u)",
                                            val, s->objects_count);
             }
+            /* 复制引用对象 */
             obj = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, s->objects[val]));
         }
         break;
     default:
     invalid_tag:
+        /* 无效标签：抛出语法错误 */
         return JS_ThrowSyntaxError(ctx, "invalid tag (tag=%d pos=%u)",
                                    tag, (unsigned int)(s->ptr - s->buf_start));
     }
@@ -46062,8 +46255,25 @@ static JSValue js_global_isFinite(JSContext *ctx, JSValueConst this_val,
     return JS_NewBool(ctx, isfinite(d));
 }
 
-/* Object class */
+/* ============================================================
+ * Object 内置类实现
+ * ============================================================
+ * 实现 ECMAScript Object 构造器及其原型方法
+ * 包括：Object.create, Object.defineProperty, Object.keys 等
+ * ============================================================ */
 
+/* ============================================================
+ * JS_ToObject - 将值转换为对象（ToObject 抽象操作）
+ * ============================================================
+ * 功能：实现 ECMAScript ToObject 抽象操作
+ * 将原始值包装为对应的对象类型：
+ * - number → Number 对象
+ * - string → String 对象
+ * - boolean → Boolean 对象
+ * - bigint → BigInt 对象
+ * - symbol → Symbol 对象
+ * - null/undefined → 抛出 TypeError
+ * ============================================================ */
 static JSValue JS_ToObject(JSContext *ctx, JSValueConst val)
 {
     int tag = JS_VALUE_GET_NORM_TAG(val);
@@ -46073,41 +46283,54 @@ static JSValue JS_ToObject(JSContext *ctx, JSValueConst val)
     default:
     case JS_TAG_NULL:
     case JS_TAG_UNDEFINED:
+        /* null 和 undefined 不能转换为对象 */
         return JS_ThrowTypeError(ctx, "cannot convert to object");
     case JS_TAG_OBJECT:
     case JS_TAG_EXCEPTION:
+        /* 已经是对象，直接返回副本 */
         return JS_DupValue(ctx, val);
     case JS_TAG_SHORT_BIG_INT:
     case JS_TAG_BIG_INT:
+        /* BigInt 包装对象 */
         obj = JS_NewObjectClass(ctx, JS_CLASS_BIG_INT);
         goto set_value;
     case JS_TAG_INT:
     case JS_TAG_FLOAT64:
+        /* Number 包装对象 */
         obj = JS_NewObjectClass(ctx, JS_CLASS_NUMBER);
         goto set_value;
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
-        /* XXX: should call the string constructor */
+        /* 
+         * XXX: 理论上应该调用 String 构造函数
+         * 但这里直接创建 String 对象以提高性能
+         * 同时确保不存储 rope 字符串（需要扁平化）
+         */
         {
             JSValue str;
-            str = JS_ToString(ctx, val); /* ensure that we never store a rope */
+            str = JS_ToString(ctx, val); /* 确保不存储 rope */
             if (JS_IsException(str))
                 return JS_EXCEPTION;
             obj = JS_NewObjectClass(ctx, JS_CLASS_STRING);
             if (!JS_IsException(obj)) {
+                /* 设置 length 属性 */
                 JS_DefinePropertyValue(ctx, obj, JS_ATOM_length,
                                        JS_NewInt32(ctx, JS_VALUE_GET_STRING(str)->len), 0);
+                /* 存储内部字符串值 */
                 JS_SetObjectData(ctx, obj, JS_DupValue(ctx, str));
             }
             JS_FreeValue(ctx, str);
             return obj;
         }
     case JS_TAG_BOOL:
+        /* Boolean 包装对象 */
         obj = JS_NewObjectClass(ctx, JS_CLASS_BOOLEAN);
         goto set_value;
     case JS_TAG_SYMBOL:
+        /* Symbol 包装对象 */
         obj = JS_NewObjectClass(ctx, JS_CLASS_SYMBOL);
     set_value:
+        /* 设置内部 [[PrimitiveValue]] */
         if (!JS_IsException(obj))
             JS_SetObjectData(ctx, obj, JS_DupValue(ctx, val));
         return obj;
