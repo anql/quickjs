@@ -14300,11 +14300,34 @@ static inline int to_digit(int c)
         return 36;
 }
 
-/* bigint support */
+/* =============================================================================
+   QJ-04 模块：BigInt 宏定义与基础运算 (行 14300-14500)
+   =============================================================================
+   本模块实现 BigInt 大整数的基础支持：
+   - 定义 BigInt 最大尺寸限制
+   - 定义短大整数的取值范围（根据字长自动适配 32/64 位）
+   - 实现带进位的加法宏 ADDC
+   - 提供位运算辅助函数（前导零计数）
+   
+   核心概念：
+   - js_limb_t: 单精度"肢"（limb），是大整数的基本存储单元，32 或 64 位
+   - js_dlimb_t: 双精度肢，用于中间计算防止溢出
+   - 多精度数由多个 limb 数组表示，低位在前
+   ============================================================================= */
 
+/* bigint support - BigInt 大整数支持 */
+
+/* JS_BIGINT_MAX_SIZE: BigInt 最大尺寸限制（以 limb 为单位）
+ * 计算：(1024 * 1024) / JS_LIMB_BITS
+ * - 若 LIMB=32 位：最大 32768 个 limb = 128KB = 1,048,576 位
+ * - 若 LIMB=64 位：最大 16384 个 limb = 128KB = 1,048,576 位
+ * 即 BigInt 最大支持约 100 万位的整数
+ */
 #define JS_BIGINT_MAX_SIZE ((1024 * 1024) / JS_LIMB_BITS) /* in limbs */
 
-/* it is currently assumed that JS_SHORT_BIG_INT_BITS = JS_LIMB_BITS */
+/* 短大整数范围定义：假设 JS_SHORT_BIG_INT_BITS = JS_LIMB_BITS
+ * 短大整数是直接内联存储的优化形式，无需动态分配
+ */
 #if JS_SHORT_BIG_INT_BITS == 32
 #define JS_SHORT_BIG_INT_MIN INT32_MIN
 #define JS_SHORT_BIG_INT_MAX INT32_MAX
@@ -14315,6 +14338,24 @@ static inline int to_digit(int c)
 #error unsupported
 #endif
 
+/* =============================================================================
+   ADDC 宏：带进位的加法 (Add with Carry)
+   =============================================================================
+   功能：计算 res = op1 + op2 + carry_in，并输出进位 carry_out
+   
+   参数：
+   - res: 结果存储位置
+   - carry_out: 输出的进位标志（0 或 1）
+   - op1, op2: 两个操作数
+   - carry_in: 输入的进位（0 或 1）
+   
+   算法原理：
+   1. 先计算 op1 + op2，若结果小于 op1 说明产生进位 __k1
+   2. 再加上进位输入 carry_in
+   3. 若第二次加法后结果小于进位值，或第一次已产生进位，则最终进位为 1
+   
+   这是多精度加法的核心原语，用于 mp_add 等函数
+   ============================================================================= */
 #define ADDC(res, carry_out, op1, op2, carry_in)        \
 do {                                                    \
     js_limb_t __v, __a, __k, __k1;                      \
@@ -14327,6 +14368,22 @@ do {                                                    \
     res = __a;                                          \
 } while (0)
 
+/* =============================================================================
+   js_limb_clz: 计算前导零个数 (Count Leading Zeros)
+   =============================================================================
+   功能：计算一个 limb 值从最高位开始有多少个连续的 0
+   
+   参数：a - 输入值（假设非零）
+   返回：前导零的个数
+   
+   用途：
+   - 用于规范化除法运算，确定除数需要左移多少位才能最高位为 1
+   - 是 Knuth 除法算法的关键预处理步骤
+   
+   实现：根据字长调用对应的底层函数
+   - 32 位：clz32()
+   - 64 位：clz64()
+   ============================================================================= */
 #if JS_LIMB_BITS == 32
 /* a != 0 */
 static inline js_limb_t js_limb_clz(js_limb_t a)
@@ -14340,6 +14397,19 @@ static inline js_limb_t js_limb_clz(js_limb_t a)
 }
 #endif
 
+/* =============================================================================
+   js_limb_safe_clz: 安全的前导零计数（处理 a=0 的情况）
+   =============================================================================
+   功能：与 js_limb_clz 相同，但能正确处理输入为 0 的边界情况
+   
+   参数：a - 输入值（可为 0）
+   返回：
+   - 若 a == 0：返回 JS_LIMB_BITS（整个字都是 0）
+   - 否则：返回实际的前导零个数
+   
+   为什么需要这个函数？
+   当除数的最高 limb 为 0 时，需要特殊处理，此时前导零个数等于字长
+   ============================================================================= */
 /* handle a = 0 too */
 static inline js_limb_t js_limb_safe_clz(js_limb_t a)
 {
@@ -14349,6 +14419,25 @@ static inline js_limb_t js_limb_safe_clz(js_limb_t a)
         return js_limb_clz(a);
 }
 
+/* =============================================================================
+   mp_add: 多精度加法 (Multi-precision Addition)
+   =============================================================================
+   功能：计算 res = op1 + op2 + carry（初始进位），返回最终进位
+   
+   参数：
+   - res: 结果数组（n 个 limb）
+   - op1: 第一个操作数数组（n 个 limb）
+   - op2: 第二个操作数数组（n 个 limb）
+   - n: limb 个数
+   - carry: 初始进位（通常为 0）
+   
+   返回：最终进位（0 或 1），表示结果是否溢出 n 个 limb
+   
+   算法：
+   从低位到高位逐位相加，使用 ADDC 宏传递进位
+   
+   时间复杂度：O(n)
+   ============================================================================= */
 static js_limb_t mp_add(js_limb_t *res, const js_limb_t *op1, const js_limb_t *op2,
                      js_limb_t n, js_limb_t carry)
 {
@@ -14359,6 +14448,29 @@ static js_limb_t mp_add(js_limb_t *res, const js_limb_t *op1, const js_limb_t *o
     return carry;
 }
 
+/* =============================================================================
+   mp_sub: 多精度减法 (Multi-precision Subtraction)
+   =============================================================================
+   功能：计算 res = op1 - op2 - carry（初始借位），返回最终借位
+   
+   参数：
+   - res: 结果数组（n 个 limb）
+   - op1: 被减数数组（n 个 limb）
+   - op2: 减数数组（n 个 limb）
+   - n: limb 个数
+   - carry: 初始借位（通常为 0）
+   
+   返回：最终借位（0 或 1）
+   - 返回 0：表示 op1 >= op2，结果非负
+   - 返回 1：表示 op1 < op2，结果为负（需要借位）
+   
+   借位判断原理：
+   - 若 v - op2[i] > v，说明需要借位（k1 = 1）
+   - 若再减去进位后 v > a，说明第二次也需要借位
+   - 最终借位 k = 两次借位的逻辑或
+   
+   时间复杂度：O(n)
+   ============================================================================= */
 static js_limb_t mp_sub(js_limb_t *res, const js_limb_t *op1, const js_limb_t *op2,
                         int n, js_limb_t carry)
 {
@@ -14377,6 +14489,29 @@ static js_limb_t mp_sub(js_limb_t *res, const js_limb_t *op1, const js_limb_t *o
     return k;
 }
 
+/* =============================================================================
+   mp_neg: 多精度取负 (Multi-precision Negation)
+   =============================================================================
+   功能：计算 res = 0 - op2，即求 op2 的相反数（补码形式）
+   
+   参数：
+   - res: 结果数组（n 个 limb）
+   - op2: 输入操作数数组（n 个 limb）
+   - n: limb 个数
+   
+   返回：最终进位（通常为 1，表示高位全为 0）
+   
+   算法原理（二进制补码）：
+   1. 对 op2 逐位取反：~op2[i]
+   2. 加 1：通过初始进位 carry = 1 实现
+   3. 即：-op2 = ~op2 + 1
+   
+   用途：
+   - 实现减法：a - b = a + (-b)
+   - 处理负 BigInt 的绝对值转换
+   
+   时间复杂度：O(n)
+   ============================================================================= */
 /* compute 0 - op2. carry = 0 or 1. */
 static js_limb_t mp_neg(js_limb_t *res, const js_limb_t *op2, int n)
 {
@@ -14392,6 +14527,32 @@ static js_limb_t mp_neg(js_limb_t *res, const js_limb_t *op2, int n)
     return carry;
 }
 
+/* =============================================================================
+   mp_mul1: 多精度数 × 单精度数 (Multi-precision × Single-precision)
+   =============================================================================
+   功能：计算 tabr[] = taba[] * b + l
+   
+   参数：
+   - tabr: 结果数组（n 个 limb）
+   - taba: 多精度被乘数数组（n 个 limb）
+   - n: limb 个数
+   - b: 单精度乘数（1 个 limb）
+   - l: 初始进位（低位传入的值）
+   
+   返回：高位进位（超出 n 个 limb 的部分）
+   
+   算法：
+   对每个 limb 执行：t = taba[i] * b + l
+   - 使用 js_dlimb_t（双精度）存储中间结果，防止溢出
+   - 低 JS_LIMB_BITS 位存入结果
+   - 高位部分作为进位传递给下一轮
+   
+   用途：
+   - 大整数乘以小整数的基础操作
+   - 作为 mp_mul_basecase 的内层循环
+   
+   时间复杂度：O(n)
+   ============================================================================= */
 /* tabr[] = taba[] * b + l. Return the high carry */
 static js_limb_t mp_mul1(js_limb_t *tabr, const js_limb_t *taba, js_limb_t n,
                       js_limb_t b, js_limb_t l)
@@ -14407,6 +14568,33 @@ static js_limb_t mp_mul1(js_limb_t *tabr, const js_limb_t *taba, js_limb_t n,
     return l;
 }
 
+/* =============================================================================
+   mp_div1: 多精度数 ÷ 单精度数 (Multi-precision ÷ Single-precision)
+   =============================================================================
+   功能：计算 tabr[] = taba[] / b，返回余数
+   
+   参数：
+   - tabr: 商数组（n 个 limb）
+   - taba: 多精度被除数数组（n 个 limb）
+   - n: limb 个数
+   - b: 单精度除数（1 个 limb）
+   - r: 初始余数（通常为 0）
+   
+   返回：最终余数
+   
+   算法（从高位到低位）：
+   1. 将上一轮余数左移 JS_LIMB_BITS 位，与当前 limb 拼接
+   2. 除以 b 得到当前位的商
+   3. 取模得到新的余数，传递给下一轮
+   
+   例如：1234 ÷ 5
+   - 先算 1 ÷ 5 = 0 余 1
+   - 再算 12 ÷ 5 = 2 余 2
+   - 再算 23 ÷ 5 = 4 余 3
+   - 最后 34 ÷ 5 = 6 余 4
+   
+   时间复杂度：O(n)
+   ============================================================================= */
 static js_limb_t mp_div1(js_limb_t *tabr, const js_limb_t *taba, js_limb_t n,
                       js_limb_t b, js_limb_t r)
 {
@@ -14420,6 +14608,32 @@ static js_limb_t mp_div1(js_limb_t *tabr, const js_limb_t *taba, js_limb_t n,
     return r;
 }
 
+/* =============================================================================
+   mp_add_mul1: 多精度乘加 (Multi-precision Multiply-Add)
+   =============================================================================
+   功能：计算 tabr[] += taba[] * b，返回高位进位
+   
+   参数：
+   - tabr: 累加结果数组（n 个 limb），同时也是被加数
+   - taba: 多精度乘数数组（n 个 limb）
+   - n: limb 个数
+   - b: 单精度乘数（1 个 limb）
+   
+   返回：高位进位（超出 n 个 limb 的部分）
+   
+   算法：
+   对每个 limb 执行：tabr[i] += taba[i] * b + 进位
+   - 先计算乘法 taba[i] * b
+   - 加上上一轮的进位 l
+   - 再加上 tabr[i] 原有值
+   - 低位存回 tabr[i]，高位作为新进位
+   
+   用途：
+   - 多精度乘法的核心内层循环
+   - 在 mp_mul_basecase 中用于累加部分积
+   
+   时间复杂度：O(n)
+   ============================================================================= */
 /* tabr[] += taba[] * b, return the high word. */
 static js_limb_t mp_add_mul1(js_limb_t *tabr, const js_limb_t *taba, js_limb_t n,
                           js_limb_t b)
@@ -14436,6 +14650,43 @@ static js_limb_t mp_add_mul1(js_limb_t *tabr, const js_limb_t *taba, js_limb_t n
     return l;
 }
 
+/* =============================================================================
+   mp_mul_basecase: 多精度乘法基础算法 (Base-case Multi-precision Multiplication)
+   =============================================================================
+   功能：计算 result = op1 × op2（学校教的竖式乘法）
+   
+   参数：
+   - result: 结果数组（op1_size + op2_size 个 limb）
+   - op1: 第一个乘数（op1_size 个 limb）
+   - op1_size: 第一个乘数的 limb 个数
+   - op2: 第二个乘数（op2_size 个 limb）
+   - op2_size: 第二个乘数的 limb 个数
+   
+   返回：无（结果直接写入 result）
+   
+   算法原理（竖式乘法）：
+   
+       1 2 3   (op1, 3 个 limb)
+     × 4 5     (op2, 2 个 limb)
+     -------
+       6 1 5   (123 × 5, 第 1 轮)
+     4 9 2     (123 × 4, 左移一位)
+     -------
+     5 5 3 5   (结果，5 个 limb)
+   
+   实现步骤：
+   1. 第 1 轮：result = op1 × op2[0]，使用 mp_mul1
+   2. 后续轮次：result += op1 × op2[i]，左移 i 位，使用 mp_add_mul1
+   3. 每轮的高位进位存入 result[i + op1_size]
+   
+   结果大小：op1_size + op2_size 个 limb
+   
+   时间复杂度：O(op1_size × op2_size)
+   
+   优化说明：
+   - 这是基础算法，适用于较小的操作数
+   - 对于大整数，可使用 Karatsuba 或 FFT 等更快算法
+   ============================================================================= */
 /* size of the result : op1_size + op2_size. */
 static void mp_mul_basecase(js_limb_t *result,
                             const js_limb_t *op1, js_limb_t op1_size,
@@ -14451,6 +14702,32 @@ static void mp_mul_basecase(js_limb_t *result,
     }
 }
 
+/* =============================================================================
+   mp_sub_mul1: 多精度减乘 (Multi-precision Subtract-Multiply)
+   =============================================================================
+   功能：计算 tabr[] -= taba[] * b，返回需要从高字减去的值
+   
+   参数：
+   - tabr: 被减数数组（n 个 limb），结果也存回此处
+   - taba: 多精度乘数数组（n 个 limb）
+   - n: limb 个数
+   - b: 单精度乘数（1 个 limb）
+   
+   返回：需要从高字减去的值（借位）
+   
+   算法：
+   对每个 limb 执行：tabr[i] -= taba[i] * b + 借位
+   - 先计算乘法 taba[i] * b
+   - 从 tabr[i] 中减去乘积和上一轮的借位
+   - 若结果为负（高位为 1），则产生借位
+   - l = -(t >> JS_LIMB_BITS)：提取符号位作为借位
+   
+   用途：
+   - 多精度除法中的"试商 - 减法"步骤
+   - 在 mp_divnorm 中用于减去部分积
+   
+   时间复杂度：O(n)
+   ============================================================================= */
 /* tabr[] -= taba[] * b. Return the value to substract to the high
    word. */
 static js_limb_t mp_sub_mul1(js_limb_t *tabr, const js_limb_t *taba, js_limb_t n,
@@ -14468,6 +14745,27 @@ static js_limb_t mp_sub_mul1(js_limb_t *tabr, const js_limb_t *taba, js_limb_t n
     return l;
 }
 
+/* =============================================================================
+   udiv1norm_init: 规范化除法初始化（计算除数的倒数近似值）
+   =============================================================================
+   功能：预计算除数 d 的倒数近似值，用于加速后续多次除法
+   
+   参数：d - 除数（必须满足 d >= 2^(JS_LIMB_BITS-1)，即最高位为 1）
+   
+   返回：倒数近似值 d_inv，满足 d_inv ≈ (2^(2*JS_LIMB_BITS) - 1) / d
+   
+   算法原理：
+   - 计算 a1 = -d - 1，a0 = -1
+   - 构造双精度数 (a1 << JS_LIMB_BITS) | a0 ≈ 2^(2*JS_LIMB_BITS) - 1
+   - 除以 d 得到倒数近似值
+   
+   为什么需要这个？
+   - 硬件除法指令很慢，尤其是 64 位除法
+   - 通过预计算倒数，后续可以用乘法近似代替除法
+   - 这是 Knuth《计算机程序设计艺术》卷 2 中的经典优化
+   
+   时间复杂度：O(1)，但包含一次双精度除法
+   ============================================================================= */
 /* WARNING: d must be >= 2^(JS_LIMB_BITS-1) */
 static inline js_limb_t udiv1norm_init(js_limb_t d)
 {
@@ -14477,6 +14775,31 @@ static inline js_limb_t udiv1norm_init(js_limb_t d)
     return (((js_dlimb_t)a1 << JS_LIMB_BITS) | a0) / d;
 }
 
+/* =============================================================================
+   udiv1norm: 规范化单字除法（使用预计算的倒数）
+   =============================================================================
+   功能：计算 (a1 * 2^JS_LIMB_BITS + a0) / d 的商和余数
+   
+   参数：
+   - pr: 输出参数，存储余数
+   - a1: 被除数的高位部分（必须满足 0 <= a1 < d）
+   - a0: 被除数的低位部分
+   - d: 除数（必须满足 d >= 2^(JS_LIMB_BITS-1)）
+   - d_inv: 由 udiv1norm_init 预计算的倒数近似值
+   
+   返回：商 q
+   
+   算法原理（Knuth 算法）：
+   1. 用 d_inv * (a1 - n1m) 近似计算商
+   2. 通过修正步骤确保余数在 [0, d-1] 范围内
+   3. n1m 是符号扩展，用于处理边界情况
+   
+   为什么这么复杂？
+   - 直接计算 (a1<<64|a0)/d 需要 128 位÷64 位除法，很多 CPU 不支持
+   - 用倒数近似可以将除法转为乘法，速度更快
+   
+   时间复杂度：O(1)，仅包含乘法和移位
+   ============================================================================= */
 /* return the quotient and the remainder in '*pr'of 'a1*2^JS_LIMB_BITS+a0
    / d' with 0 <= a1 < d. */
 static inline js_limb_t udiv1norm(js_limb_t *pr, js_limb_t a1, js_limb_t a0,
@@ -14488,7 +14811,7 @@ static inline js_limb_t udiv1norm(js_limb_t *pr, js_limb_t a1, js_limb_t a0,
     n_adj = a0 + (n1m & d);
     a = (js_dlimb_t)d_inv * (a1 - n1m) + n_adj;
     q = (a >> JS_LIMB_BITS) + a1;
-    /* compute a - q * r and update q so that the remainder is\
+    /* compute a - q * r and update q so that the remainder is
        between 0 and d - 1 */
     a = ((js_dlimb_t)a1 << JS_LIMB_BITS) | a0;
     a = a - (js_dlimb_t)q * d - d;
@@ -14499,8 +14822,45 @@ static inline js_limb_t udiv1norm(js_limb_t *pr, js_limb_t a1, js_limb_t a0,
     return q;
 }
 
+/* UDIV1NORM_THRESHOLD: 使用优化除法的最小 limb 数阈值
+ * 当 n >= 3 时，使用倒数近似优化（乘法代替除法）
+ * 当 n < 3 时，直接使用硬件除法（开销更小）
+ */
 #define UDIV1NORM_THRESHOLD 3
 
+/* =============================================================================
+   mp_div1norm: 规范化多精度 ÷ 单精度 (Normalized Multi-precision ÷ Single)
+   =============================================================================
+   功能：计算 tabr[] = taba[] / b，返回余数（除数已规范化）
+   
+   参数：
+   - tabr: 商数组（n 个 limb）
+   - taba: 被除数数组（n 个 limb）
+   - n: limb 个数
+   - b: 除数（必须满足 b >= 2^(JS_LIMB_BITS-1)，即最高位为 1）
+   - r: 初始余数（通常为 0）
+   
+   返回：最终余数
+   
+   算法选择策略：
+   
+   情况 1：n >= 3（大数除法）
+   - 预计算 b 的倒数近似值 b_inv
+   - 对每个 limb 使用 udiv1norm（乘法近似）
+   - 优点：避免多次昂贵的硬件除法
+   
+   情况 2：n < 3（小数除法）
+   - 直接使用硬件除法指令
+   - 计算 (r << JS_LIMB_BITS | taba[i]) / b
+   - 优点：简单直接，预计算开销不划算
+   
+   为什么要求除数规范化（最高位为 1）？
+   - 确保商的估计值不会偏差太大
+   - 是 Knuth 除法算法的前提条件
+   - 若除数未规范化，需先左移被除数和除数
+   
+   时间复杂度：O(n)
+   ============================================================================= */
 /* b must be >= 1 << (JS_LIMB_BITS - 1) */
 static js_limb_t mp_div1norm(js_limb_t *tabr, const js_limb_t *taba, js_limb_t n,
                           js_limb_t b, js_limb_t r)
@@ -14524,6 +14884,65 @@ static js_limb_t mp_div1norm(js_limb_t *tabr, const js_limb_t *taba, js_limb_t n
     return r;
 }
 
+/* =============================================================================
+   mp_divnorm: 规范化多精度除法 (Base-case Multi-precision Division)
+   =============================================================================
+   功能：计算 taba[] / tabb[]，得到商和余数（Knuth 算法）
+   
+   参数：
+   - tabq: 商数组（na - nb + 1 个 limb）
+   - taba: 被除数数组（na 个 limb），计算后存储余数（nb 个 limb）
+   - na: 被除数的 limb 个数
+   - tabb: 除数数组（nb 个 limb）
+   - nb: 除数的 limb 个数
+   
+   前置条件：
+   - tabb[nb-1] >= 2^(JS_LIMB_BITS-1)（除数已规范化，最高位为 1）
+   - na >= nb（被除数位数不少于除数）
+   
+   返回：无
+   - 商存储在 tabq[0..na-nb]
+   - 余数存储在 taba[0..nb-1]（覆盖原被除数低位）
+   
+   算法原理（Knuth 除法，TAOCP Vol.2 算法 4.3.1-D）：
+   
+   1. 特殊情况：若 nb == 1，退化为 mp_div1norm
+   
+   2. 第一次迭代（最高位）：
+      - 比较 taba[n..n+nb-1] 与 tabb[0..nb-1]
+      - 若前者 >= 后者，商为 1，否则为 0
+      - 若商为 1，执行减法 taba -= tabb
+   
+   3. 主循环（从高位到低位）：
+      a) 试商：用 taba[i+nb..i+nb-1] / tabb[nb-1] 估算商 q
+         - 若 taba[i+nb] >= b1，q = -1（特殊情况）
+         - 否则使用 udiv1norm 或硬件除法估算
+      b) 减去部分积：taba[i..i+nb-1] -= q * tabb[0..nb-1]
+      c) 若结果为负（借位 c != 0），说明商估大了：
+         - q 减 1
+         - taba += tabb（加回除数）
+         - 重复直到结果为正
+      d) 存储商 tabq[i] = q
+   
+   为什么需要"试商 - 修正"步骤？
+   - 用单字除法估算多精度商，可能有 ±1 的误差
+   - 通过检查结果正负来判断是否需要修正
+   - 理论上最多修正 2 次，实践中通常 0-1 次
+   
+   时间复杂度：O((na-nb) × nb)
+   
+   图示：
+   
+        商：q[n] q[n-1] ... q[1] q[0]
+           ________________________
+   除数 ) 被除数 [na 个 limb]
+         - q[n] * 除数
+         -----------
+           余数 1
+         - q[n-1] * 除数
+         -----------
+           ...
+   ============================================================================= */
 /* base case division: divides taba[0..na-1] by tabb[0..nb-1]. tabb[nb
    - 1] must be >= 1 << (JS_LIMB_BITS - 1). na - nb must be >= 0. 'taba'
    is modified and contains the remainder (nb limbs). tabq[0..na-nb]
@@ -14546,7 +14965,8 @@ static void mp_divnorm(js_limb_t *tabq, js_limb_t *taba, js_limb_t na,
     else
         b1_inv = 0;
 
-    /* first iteration: the quotient is only 0 or 1 */
+    /* first iteration: the quotient is only 0 or 1 
+     * 第一次迭代：最高位商只能是 0 或 1（因为已规范化）*/
     q = 1;
     for(j = nb - 1; j >= 0; j--) {
         if (taba[n + j] != tabb[j]) {
@@ -14560,41 +14980,86 @@ static void mp_divnorm(js_limb_t *tabq, js_limb_t *taba, js_limb_t na,
         mp_sub(taba + n, taba + n, tabb, nb, 0);
     }
 
+    /* 主循环：从高位到低位逐位计算商
+     * i 表示当前处理的商位，对应被除数的 taba[i..i+nb] 部分 */
     for(i = n - 1; i >= 0; i--) {
+        /* 步骤 1：试商（估算当前位的商）
+         * 用被除数的最高 2 个 limb 除以除数的最高 1 个 limb */
         if (unlikely(taba[i + nb] >= b1)) {
+            /* 特殊情况：被除数高位 >= 除数高位，商至少为 1
+             * 设为 -1 表示需要特殊处理（实际商可能是 1 或更大）*/
             q = -1;
         } else if (b1_inv) {
+            /* 使用优化的倒数近似除法（n 较大时）*/
             q = udiv1norm(&dummy_r, taba[i + nb], taba[i + nb - 1], b1, b1_inv);
         } else {
+            /* 直接使用硬件除法（n 较小时）*/
             js_dlimb_t al;
             al = ((js_dlimb_t)taba[i + nb] << JS_LIMB_BITS) | taba[i + nb - 1];
             q = al / b1;
             r = al % b1;
         }
+        
+        /* 步骤 2：减去部分积 taba[i..i+nb-1] -= q * tabb[0..nb-1]
+         * r 返回需要从高字减去的值（借位）*/
         r = mp_sub_mul1(taba + i, tabb, nb, q);
 
+        /* 步骤 3：更新高字并检查是否需要修正
+         * v = 原高字，a = 新高字，c = 借位标志 */
         v = taba[i + nb];
         a = v - r;
-        c = (a > v);
+        c = (a > v);  /* 若 a > v，说明发生借位，结果为负 */
         taba[i + nb] = a;
 
+        /* 步骤 4：若结果为负（商估大了），进行修正
+         * 循环减 1 并加回除数，直到结果为正 */
         if (c != 0) {
-            /* negative result */
+            /* negative result - 结果为负，说明商估大了 */
             for(;;) {
-                q--;
-                c = mp_add(taba + i, taba + i, tabb, nb, 0);
-                /* propagate carry and test if positive result */
+                q--;  /* 商减 1 */
+                c = mp_add(taba + i, taba + i, tabb, nb, 0);  /* 加回除数 */
+                /* propagate carry and test if positive result 
+                 * 传播进位并检查是否变为正数 */
                 if (c != 0) {
                     if (++taba[i + nb] == 0) {
-                        break;
+                        break;  /* 进位传播完成且结果为正，退出修正循环 */
                     }
                 }
             }
         }
-        tabq[i] = q;
+        tabq[i] = q;  /* 存储最终商 */
     }
 }
 
+/* =============================================================================
+   mp_shl: 多精度左移 (Multi-precision Shift Left)
+   =============================================================================
+   功能：计算 tabr[] = taba[] << shift，返回移出的高位
+   
+   参数：
+   - tabr: 结果数组（n 个 limb）
+   - taba: 输入数组（n 个 limb）
+   - n: limb 个数
+   - shift: 移位位数（1 <= shift <= JS_LIMB_BITS - 1）
+   
+   返回：移出的高位（最后一个 limb 移出的部分）
+   
+   算法：
+   从低位到高位处理：
+   - 当前 limb 左移 shift 位
+   - 低位移入上一 limb 的高位部分（l）
+   - 当前 limb 的高位部分保存为 l，传递给下一轮
+   
+   例如：0x12345678 << 4（32 位系统）
+   - 第 1 轮：0x12345678 << 4 = 0x23456780，l = 0x1
+   - 若有第 2 轮：0x... << 4 | 0x1 = 0x...1
+   
+   用途：
+   - 除法规范化（左移除数使最高位为 1）
+   - BigInt 位移运算
+   
+   时间复杂度：O(n)
+   ============================================================================= */
 /* 1 <= shift <= JS_LIMB_BITS - 1 */
 static js_limb_t mp_shl(js_limb_t *tabr, const js_limb_t *taba, int n,
                         int shift)
@@ -14610,6 +15075,38 @@ static js_limb_t mp_shl(js_limb_t *tabr, const js_limb_t *taba, int n,
     return l;
 }
 
+/* =============================================================================
+   mp_shr: 多精度右移 (Multi-precision Shift Right)
+   =============================================================================
+   功能：计算 tab_r[] = (tab[] + high*B^n) >> shift，返回移出的低位部分
+   
+   参数：
+   - tab_r: 结果数组（n 个 limb）
+   - tab: 输入数组（n 个 limb）
+   - n: limb 个数
+   - shift: 移位位数（1 <= shift <= JS_LIMB_BITS - 1）
+   - high: 高位扩展值（视为 tab 数组之上的额外 limb）
+   
+   返回：移出的低位部分（0 <= r < 2^shift），即余数
+   
+   算法：
+   从高位到低位处理：
+   - 当前 limb 右移 shift 位
+   - 高位移入上一 limb 的低位部分（l）
+   - 当前 limb 的低位部分保存为 l，传递给下一轮
+   - 最后返回最低位移出的部分（作为余数）
+   
+   例如：0x12345678 >> 4（32 位系统，high=0）
+   - 第 1 轮：0x12345678 >> 4 = 0x01234567，l = 0x8
+   - 返回：0x8 & 0xF = 0x8（余数）
+   
+   用途：
+   - 除法规范化后的还原（右移商和余数）
+   - BigInt 位移运算
+   - 提取低位余数
+   
+   时间复杂度：O(n)
+   ============================================================================= */
 /* r = (a + high*B^n) >> shift. Return the remainder r (0 <= r < 2^shift). 
    1 <= shift <= LIMB_BITS - 1 */
 static js_limb_t mp_shr(js_limb_t *tab_r, const js_limb_t *tab, int n,
