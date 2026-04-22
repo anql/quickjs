@@ -66394,6 +66394,50 @@ static JSValue js_typed_array_constructor_ta(JSContext *ctx,
     return JS_EXCEPTION;
 }
 
+/* ============================================================================
+ * QJ-24: TypedArray 构造函数族
+ * 功能：11 种 TypedArray 构造函数的实现
+ * 行号范围：66400-66800
+ * ============================================================================ */
+
+/**
+ * js_typed_array_constructor - TypedArray 通用构造函数
+ * @ctx: JS 上下文
+ * @new_target: new 操作符的目标构造函数（用于继承）
+ * @argc: 参数个数
+ * @argv: 参数数组
+ * @classid: TypedArray 类型 ID（JS_CLASS_UINT8C_ARRAY 到 JS_CLASS_FLOAT64_ARRAY）
+ * 
+ * 功能：
+ * - 实现 ECMAScript TypedArray 构造函数的三种调用形式
+ * - 支持所有 11 种 TypedArray 类型（Uint8ClampedArray, Int8Array, Uint8Array, 
+ *   Int16Array, Uint16Array, Int32Array, Uint32Array, BigInt64Array, 
+ *   BigUint64Array, Float16Array, Float32Array, Float64Array）
+ * 
+ * 三种调用形式：
+ * 1. TypedArray(length) - 创建指定长度的数组，初始化为 0
+ * 2. TypedArray(typedArray) - 从另一个 TypedArray 复制
+ * 3. TypedArray(arrayLike) - 从类数组对象或可迭代对象创建
+ * 4. TypedArray(buffer, byteOffset, length) - 基于 ArrayBuffer 创建视图
+ * 
+ * 参数处理：
+ * - argv[0]: 长度（数字）、源 TypedArray、类数组对象、或 ArrayBuffer
+ * - argv[1]: byteOffset（仅当 argv[0] 是 ArrayBuffer 时有效）
+ * - argv[2]: length（仅当 argv[0] 是 ArrayBuffer 时有效）
+ * 
+ * 特殊情况：
+ * - track_rab: 跟踪可调整大小的 ArrayBuffer（Resizable ArrayBuffer）
+ * - 偏移量必须按元素大小对齐（如 Int32Array 需要 4 字节对齐）
+ * 
+ * 返回：
+ * - 成功：新创建的 TypedArray 对象
+ * - 失败：JS_EXCEPTION 并抛出异常（TypeError 或 RangeError）
+ * 
+ * 异常处理：
+ * - invalid_offset: 偏移量未对齐或超出缓冲区范围
+ * - invalid_length: 长度超出缓冲区剩余空间
+ * - detached buffer: 缓冲区已分离
+ */
 static JSValue js_typed_array_constructor(JSContext *ctx,
                                           JSValueConst new_target,
                                           int argc, JSValueConst *argv,
@@ -66478,6 +66522,20 @@ static JSValue js_typed_array_constructor(JSContext *ctx,
     return JS_EXCEPTION;
 }
 
+/**
+ * js_typed_array_finalizer - TypedArray 对象析构函数
+ * @rt: 运行时
+ * @val: TypedArray 对象
+ * 
+ * 功能：
+ * - 在 GC 回收 TypedArray 对象时调用
+ * - 从 ArrayBuffer 的链表中移除该 TypedArray
+ * - 释放 JSTypedArray 结构体
+ * 
+ * 注意：
+ * - GC 期间析构函数调用顺序不确定，ArrayBuffer 可能已被回收
+ * - 需要检查 ta->link.next 是否为 NULL 来判断链表是否有效
+ */
 static void js_typed_array_finalizer(JSRuntime *rt, JSValue val)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
@@ -66493,6 +66551,17 @@ static void js_typed_array_finalizer(JSRuntime *rt, JSValue val)
     }
 }
 
+/**
+ * js_typed_array_mark - TypedArray 对象 GC 标记函数
+ * @rt: 运行时
+ * @val: TypedArray 对象
+ * @mark_func: 标记函数
+ * 
+ * 功能：
+ * - 在 GC 标记阶段调用
+ * - 标记 TypedArray 引用的 ArrayBuffer 对象
+ * - 防止 ArrayBuffer 被错误回收
+ */
 static void js_typed_array_mark(JSRuntime *rt, JSValueConst val,
                                 JS_MarkFunc *mark_func)
 {
@@ -66503,6 +66572,42 @@ static void js_typed_array_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
+/* ============================================================================
+ * QJ-25: DataView 操作
+ * 功能：DataView 构造函数、getter/setter、字节序处理
+ * 行号范围：66800-67200
+ * ============================================================================ */
+
+/**
+ * js_dataview_constructor - DataView 构造函数
+ * @ctx: JS 上下文
+ * @new_target: new 操作符的目标构造函数
+ * @argc: 参数个数
+ * @argv: 参数数组
+ * 
+ * 功能：
+ * - 实现 ECMAScript DataView 构造函数
+ * - 创建 ArrayBuffer 的视图，支持任意字节偏移和长度
+ * - 与 TypedArray 不同，DataView 不固定元素类型和字节序
+ * 
+ * 参数：
+ * - argv[0]: ArrayBuffer 对象（必需）
+ * - argv[1]: byteOffset（可选，默认 0）
+ * - argv[2]: byteLength（可选，默认 buffer.byteLength - byteOffset）
+ * 
+ * 特殊情况处理：
+ * - recompute_len: 当未指定 byteLength 时，需要在每次访问时重新计算
+ * - track_rab: 跟踪可调整大小的 ArrayBuffer
+ * - detached buffer: 检查缓冲区是否已分离
+ * 
+ * 返回：
+ * - 成功：新创建的 DataView 对象
+ * - 失败：JS_EXCEPTION 并抛出异常
+ * 
+ * 异常：
+ * - TypeError: 参数不是 ArrayBuffer、缓冲区已分离
+ * - RangeError: 偏移量或长度超出缓冲区范围
+ */
 static JSValue js_dataview_constructor(JSContext *ctx,
                                        JSValueConst new_target,
                                        int argc, JSValueConst *argv)
@@ -66578,6 +66683,24 @@ static JSValue js_dataview_constructor(JSContext *ctx,
     return obj;
 }
 
+/**
+ * dataview_is_oob - 检查 DataView 是否越界或已分离
+ * @p: DataView 对象指针
+ * 
+ * 功能：
+ * - 检查底层 ArrayBuffer 是否已分离（detached）
+ * - 检查 DataView 的偏移量是否超出缓冲区范围
+ * - 检查 DataView 的长度是否超出缓冲区剩余空间
+ * - 对于可调整大小的 ArrayBuffer（RAB），只检查偏移量
+ * 
+ * 返回：
+ * - TRUE: 越界或已分离，不能安全访问
+ * - FALSE: 可以安全访问
+ * 
+ * 注意：
+ * - 此函数不抛出异常，仅返回状态
+ * - 调用前必须确保 p 是有效的 DataView 对象
+ */
 // is the DataView out of bounds relative to its parent arraybuffer?
 static BOOL dataview_is_oob(JSObject *p)
 {
@@ -66596,6 +66719,20 @@ static BOOL dataview_is_oob(JSObject *p)
     return (int64_t)ta->offset + ta->length > abuf->byte_length;
 }
 
+/**
+ * get_dataview - 验证并获取 DataView 对象
+ * @ctx: JS 上下文
+ * @this_val: 要验证的 JS 值
+ * 
+ * 功能：
+ * - 检查 this_val 是否为对象类型
+ * - 检查对象的 class_id 是否为 JS_CLASS_DATAVIEW
+ * - 如果不是 DataView，抛出 TypeError 并返回 NULL
+ * 
+ * 返回：
+ * - 成功：JSObject 指针
+ * - 失败：NULL 并抛出异常
+ */
 static JSObject *get_dataview(JSContext *ctx, JSValueConst this_val)
 {
     JSObject *p;
@@ -66610,6 +66747,23 @@ static JSObject *get_dataview(JSContext *ctx, JSValueConst this_val)
     return p;
 }
 
+/**
+ * js_dataview_get_buffer - DataView.prototype.buffer 的 getter
+ * @ctx: JS 上下文
+ * @this_val: DataView 对象
+ * 
+ * 功能：
+ * - 获取 DataView 底层的 ArrayBuffer 对象
+ * - 返回缓冲区的引用（增加引用计数）
+ * 
+ * 返回：
+ * - 成功：ArrayBuffer 对象（引用计数 +1）
+ * - 失败：JS_EXCEPTION 并抛出异常
+ * 
+ * 注意：
+ * - 返回的对象需要调用者负责释放（JS_FreeValue）
+ * - 即使缓冲区已分离，仍然返回该缓冲区对象
+ */
 static JSValue js_dataview_get_buffer(JSContext *ctx, JSValueConst this_val)
 {
     JSObject *p;
@@ -66621,6 +66775,26 @@ static JSValue js_dataview_get_buffer(JSContext *ctx, JSValueConst this_val)
     return JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
 }
 
+/**
+ * js_dataview_get_byteLength - DataView.prototype.byteLength 的 getter
+ * @ctx: JS 上下文
+ * @this_val: DataView 对象
+ * 
+ * 功能：
+ * - 获取 DataView 的字节长度
+ * - 对于可调整大小的 ArrayBuffer（RAB），需要重新计算
+ * 
+ * 返回：
+ * - 成功：字节数（Uint32）
+ * - 越界：抛出 TypeErrorArrayBufferOOB 异常
+ * - 失败：JS_EXCEPTION 并抛出异常
+ * 
+ * 特殊情况处理：
+ * - track_rab=true：底层是可调整大小的 ArrayBuffer
+ *   - byteLength = buffer.byteLength - offset（动态计算）
+ * - track_rab=false：底层是固定大小的 ArrayBuffer
+ *   - 直接返回缓存的 ta->length 值
+ */
 static JSValue js_dataview_get_byteLength(JSContext *ctx, JSValueConst this_val)
 {
     JSArrayBuffer *abuf;
@@ -66640,6 +66814,19 @@ static JSValue js_dataview_get_byteLength(JSContext *ctx, JSValueConst this_val)
     return JS_NewUint32(ctx, ta->length);
 }
 
+/**
+ * js_dataview_get_byteOffset - DataView.prototype.byteOffset 的 getter
+ * @ctx: JS 上下文
+ * @this_val: DataView 对象
+ * 
+ * 功能：
+ * - 获取 DataView 在底层 ArrayBuffer 中的起始偏移量（字节）
+ * 
+ * 返回：
+ * - 成功：偏移量（Uint32）
+ * - 越界：抛出 TypeErrorArrayBufferOOB 异常
+ * - 失败：JS_EXCEPTION 并抛出异常
+ */
 static JSValue js_dataview_get_byteOffset(JSContext *ctx, JSValueConst this_val)
 {
     JSTypedArray *ta;
@@ -66654,6 +66841,43 @@ static JSValue js_dataview_get_byteOffset(JSContext *ctx, JSValueConst this_val)
     return JS_NewUint32(ctx, ta->offset);
 }
 
+/**
+ * js_dataview_getValue - DataView get 方法族的核心实现
+ * @ctx: JS 上下文
+ * @this_obj: DataView 对象
+ * @argc: 参数个数
+ * @argv: 参数数组（argv[0]=byteOffset, argv[1]=littleEndian）
+ * @class_id: 要读取的数据类型（JS_CLASS_INT8_ARRAY 等）
+ * 
+ * 功能：
+ * - 实现 DataView.prototype.getInt8/Uint8/Int16/Uint16/Int32/Uint32/
+ *   BigInt64/BigUint64/Float16/Float32/Float64 方法
+ * - 从指定字节偏移量读取数据，支持大端/小端字节序
+ * 
+ * 参数：
+ * - argv[0]: byteOffset（必需）- 要读取的字节偏移量
+ * - argv[1]: littleEndian（可选，默认 false）- 是否使用小端字节序
+ * 
+ * 字节序处理：
+ * - is_swap: 是否需要字节交换
+ *   - 小端系统（x86/x64）：littleEndian=false 时需要交换
+ *   - 大端系统：littleEndian=true 时需要交换
+ * - 使用 bswap16/bswap32/bswap64 进行字节交换
+ * 
+ * 边界检查：
+ * 1. 检查 DataView 是否越界（dataview_is_oob）
+ * 2. 检查 pos + size 是否超出 DataView 长度
+ * 3. 检查底层 ArrayBuffer 是否已分离
+ * 
+ * 返回：
+ * - 成功：对应类型的 JS 值（Int32/Uint32/BigInt64/BigUint64/Float64）
+ * - 失败：JS_EXCEPTION 并抛出异常（RangeError 或 TypeError）
+ * 
+ * 特殊值处理：
+ * - Float16：使用 tofp16/fromfp16 转换
+ * - NaN：IEEE 754 标准
+ * - 正负零：符号位处理
+ */
 static JSValue js_dataview_getValue(JSContext *ctx,
                                     JSValueConst this_obj,
                                     int argc, JSValueConst *argv, int class_id)
@@ -66766,6 +66990,43 @@ static JSValue js_dataview_getValue(JSContext *ctx,
     }
 }
 
+/**
+ * js_dataview_setValue - DataView set 方法族的核心实现
+ * @ctx: JS 上下文
+ * @this_obj: DataView 对象
+ * @argc: 参数个数
+ * @argv: 参数数组（argv[0]=byteOffset, argv[1]=value, argv[2]=littleEndian）
+ * @class_id: 要写入的数据类型（JS_CLASS_INT8_ARRAY 等）
+ * 
+ * 功能：
+ * - 实现 DataView.prototype.setInt8/Uint8/Int16/Uint16/Int32/Uint32/
+ *   BigInt64/BigUint64/Float16/Float32/Float64 方法
+ * - 向指定字节偏移量写入数据，支持大端/小端字节序
+ * 
+ * 参数：
+ * - argv[0]: byteOffset（必需）- 要写入的字节偏移量
+ * - argv[1]: value（必需）- 要写入的值
+ * - argv[2]: littleEndian（可选，默认 false）- 是否使用小端字节序
+ * 
+ * 类型转换：
+ * - 整数类型（Int8-Uint32）：使用 JS_ToUint32
+ * - BigInt 类型（Int64/Uint64）：使用 JS_ToBigInt64
+ * - 浮点类型（Float16/32/64）：使用 JS_ToFloat64
+ * 
+ * 字节序处理：
+ * - is_swap: 是否需要字节交换
+ * - 使用 set_u16/set_u32/set_u64 写入内存
+ * - 使用 bswap16/bswap32/bswap64 进行字节交换
+ * 
+ * 边界检查：
+ * 1. 检查 DataView 是否越界
+ * 2. 检查 pos + size 是否超出 DataView 长度
+ * 3. 检查底层 ArrayBuffer 是否已分离
+ * 
+ * 返回：
+ * - 成功：JS_UNDEFINED
+ * - 失败：JS_EXCEPTION 并抛出异常（RangeError 或 TypeError）
+ */
 static JSValue js_dataview_setValue(JSContext *ctx,
                                     JSValueConst this_obj,
                                     int argc, JSValueConst *argv, int class_id)
@@ -67211,6 +67472,64 @@ static pthread_mutex_t js_atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct list_head js_atomics_waiter_list =
     LIST_HEAD_INIT(js_atomics_waiter_list);
 
+/* ============================================================================
+ * QJ-26: Atomics 原子操作
+ * 功能：共享内存原子操作、等待/通知机制
+ * 行号范围：67480-67700
+ * ============================================================================ */
+
+/**
+ * JSAtomicsWaiter - Atomics.wait() 的等待者结构
+ * @link: 链表节点（连接到全局等待者列表）
+ * @linked: 是否已链接到等待列表
+ * @cond: POSIX 条件变量（用于线程等待）
+ * @ptr: 等待的内存地址（指向 SharedArrayBuffer 中的值）
+ * 
+ * 用途：
+ * - 实现 Atomics.wait() 的阻塞等待机制
+ * - 多个线程可以等待同一个内存地址
+ * - 通过 Atomics.notify() 唤醒等待的线程
+ */
+typedef struct JSAtomicsWaiter {
+    struct list_head link;
+    BOOL linked;
+    pthread_cond_t cond;
+    int32_t *ptr;
+} JSAtomicsWaiter;
+
+/**
+ * js_atomics_mutex - Atomics 操作的全局互斥锁
+ * 用途：
+ * - 保护 js_atomics_waiter_list 链表
+ * - 确保等待/通知操作的原子性
+ */
+static pthread_mutex_t js_atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * js_atomics_waiter_list - 全局 Atomics 等待者列表
+ * 用途：
+ * - 存储所有正在等待的 JSAtomicsWaiter
+ * - Atomics.notify() 遍历此列表查找匹配的等待者
+ */
+static struct list_head js_atomics_waiter_list =
+    LIST_HEAD_INIT(js_atomics_waiter_list);
+
+/**
+ * cpu_pause - CPU 暂停指令（自旋锁优化）
+ * 
+ * 功能：
+ * - 在不同的 CPU 架构上执行优化的暂停指令
+ * - 用于自旋锁等待循环，减少功耗和内存总线争用
+ * 
+ * 架构特定实现：
+ * - ARM64 (aarch64): yield 指令
+ * - x86/x86_64: pause 指令
+ * - 其他架构：空操作（无暂停）
+ * 
+ * 用途：
+ * - 在 Atomics.wait() 的自旋等待循环中使用
+ * - 避免忙等待（busy-wait）浪费 CPU 资源
+ */
 #if defined(__aarch64__)
 static inline void cpu_pause(void)
 {
@@ -67227,6 +67546,29 @@ static inline void cpu_pause(void)
 }
 #endif
 
+/**
+ * js_atomics_pause - Atomics.pause() 实现
+ * @ctx: JS 上下文
+ * @this_obj: this 对象（未使用）
+ * @argc: 参数个数
+ * @argv: 参数数组（可选的超时时间）
+ * 
+ * 功能：
+ * - 实现 ECMAScript Atomics.pause() 方法
+ * - 提示 CPU 暂停一小段时间，用于自旋锁优化
+ * 
+ * 参数：
+ * - argv[0]: 可选的超时时间（必须是整数）
+ *   - 如果提供，验证是否为有限整数
+ *   - 如果不是整数，抛出 TypeError
+ * 
+ * 注意：
+ * - 根据规范，Atomics.pause() 不能阻塞或让出线程
+ * - 仅作为 CPU 提示，实际暂停时间由硬件决定
+ * - 在此实现中，直接调用 cpu_pause() 作为替代
+ * 
+ * 返回：JS_UNDEFINED
+ */
 // no-op: Atomics.pause() is not allowed to block or yield to another
 // thread, only to hint the CPU that it should back off for a bit;
 // the amount of work we do here is a good enough substitute
@@ -67254,6 +67596,50 @@ static JSValue js_atomics_pause(JSContext *ctx, JSValueConst this_obj,
     return JS_UNDEFINED;
 }
 
+/**
+ * js_atomics_wait - Atomics.wait() 实现
+ * @ctx: JS 上下文
+ * @this_obj: this 对象（未使用）
+ * @argc: 参数个数
+ * @argv: 参数数组
+ * 
+ * 功能：
+ * - 实现 ECMAScript Atomics.wait() 方法
+ * - 在 SharedArrayBuffer 上等待某个值不变，直到被唤醒或超时
+ * - 用于多线程同步（类似 POSIX 条件变量）
+ * 
+ * 参数：
+ * - argv[0]: typedArray - Int32Array 或 BigInt64Array（必须在 SharedArrayBuffer 上）
+ * - argv[1]: index - 要等待的索引
+ * - argv[2]: value - 期望的值（如果内存中的值不等于此值，立即返回"not-equal"）
+ * - argv[3]: timeout - 超时时间（毫秒），Infinity 表示无限等待
+ * 
+ * 执行流程：
+ * 1. 获取 typedArray 的内存指针
+ * 2. 检查内存中的值是否等于期望值
+ *    - 如果不等：立即返回"not-equal"
+ *    - 如果相等：继续等待
+ * 3. 将当前线程添加到等待者列表
+ * 4. 等待条件变量（pthread_cond_wait 或 pthread_cond_timedwait）
+ * 5. 被唤醒或超时后，从等待者列表移除
+ * 6. 返回"ok"（被唤醒）或"timed-out"（超时）
+ * 
+ * 超时处理：
+ * - timeout < 0: 立即超时（返回"timed-out"）
+ * - timeout = Infinity: 无限等待
+ * - timeout >= 0: 等待指定毫秒数
+ * 
+ * 注意：
+ * - 必须在支持阻塞的线程中调用（ctx->rt->can_block = true）
+ * - 使用全局互斥锁保护等待者列表
+ * - 使用 CLOCK_REALTIME 时钟（可能有系统时间调整问题）
+ * 
+ * 返回：
+ * - "not-equal": 内存中的值不等于期望值
+ * - "ok": 被 Atomics.notify() 唤醒
+ * - "timed-out": 超时
+ * - JS_EXCEPTION: 发生错误
+ */
 static JSValue js_atomics_wait(JSContext *ctx,
                                JSValueConst this_obj,
                                int argc, JSValueConst *argv)
@@ -67337,6 +67723,38 @@ static JSValue js_atomics_wait(JSContext *ctx,
     }
 }
 
+/**
+ * js_atomics_notify - Atomics.notify() 实现
+ * @ctx: JS 上下文
+ * @this_obj: this 对象（未使用）
+ * @argc: 参数个数
+ * @argv: 参数数组
+ * 
+ * 功能：
+ * - 实现 ECMAScript Atomics.notify() 方法
+ * - 唤醒在 SharedArrayBuffer 上等待的线程
+ * - 与 Atomics.wait() 配合使用，实现线程同步
+ * 
+ * 参数：
+ * - argv[0]: typedArray - Int32Array 或 BigInt64Array（必须在 SharedArrayBuffer 上）
+ * - argv[1]: index - 要通知的索引
+ * - argv[2]: count（可选）- 要唤醒的等待者数量（默认 Infinity）
+ * 
+ * 执行流程：
+ * 1. 获取 typedArray 的内存指针
+ * 2. 遍历全局等待者列表，查找等待同一内存地址的线程
+ * 3. 将匹配的等待者移动到临时列表
+ * 4. 释放全局锁
+ * 5. 唤醒临时列表中的所有等待者（pthread_cond_signal）
+ * 6. 返回实际唤醒的等待者数量
+ * 
+ * 注意：
+ * - 使用临时列表避免在持有锁时调用 pthread_cond_signal
+ * - 只唤醒等待同一内存地址的线程
+ * - count 参数限制最多唤醒的线程数
+ * 
+ * 返回：实际唤醒的等待者数量（Int32）
+ */
 static JSValue js_atomics_notify(JSContext *ctx,
                                  JSValueConst this_obj,
                                  int argc, JSValueConst *argv)
@@ -67507,13 +67925,43 @@ int JS_AddIntrinsicTypedArrays(JSContext *ctx)
     return 0;
 }
 
-/* WeakRef */
+/* ============================================================================
+ * QJ-27: WeakRef & FinalizationRegistry
+ * 功能：弱引用、最终化注册表、垃圾回收感知
+ * 行号范围：67950-68100
+ * ============================================================================ */
 
+/**
+ * JSWeakRefData - WeakRef 对象的内部数据
+ * @weakref_header: 弱引用头（链接到全局弱引用列表）
+ * @target: 弱引用的目标对象
+ * 
+ * 用途：
+ * - 实现 ECMAScript WeakRef 对象
+ * - 持有目标对象的弱引用（不阻止 GC 回收）
+ * - 通过 weakref_header 链接到运行时全局列表
+ * 
+ * 生命周期：
+ * - 创建时：target 指向目标对象，weakref_header 链接到全局列表
+ * - GC 时：如果目标对象被回收，target 设置为 undefined
+ * - 销毁时：从全局列表移除，释放内存
+ */
 typedef struct JSWeakRefData {
     JSWeakRefHeader weakref_header;
     JSValue target;
 } JSWeakRefData;
 
+/**
+ * js_weakref_finalizer - WeakRef 对象析构函数
+ * @rt: 运行时
+ * @val: WeakRef 对象
+ * 
+ * 功能：
+ * - 在 GC 回收 WeakRef 对象时调用
+ * - 释放目标对象的弱引用
+ * - 从全局弱引用列表中移除
+ * - 释放 JSWeakRefData 结构体
+ */
 static void js_weakref_finalizer(JSRuntime *rt, JSValue val)
 {
     JSWeakRefData *wrd = JS_GetOpaque(val, JS_CLASS_WEAK_REF);
@@ -67524,6 +67972,20 @@ static void js_weakref_finalizer(JSRuntime *rt, JSValue val)
     js_free_rt(rt, wrd);
 }
 
+/**
+ * weakref_delete_weakref - WeakRef 删除回调
+ * @rt: 运行时
+ * @wh: 弱引用头
+ * 
+ * 功能：
+ * - 当弱引用的目标对象被 GC 回收时调用
+ * - 释放目标对象的弱引用
+ * - 将 target 设置为 undefined（标记为已失效）
+ * 
+ * 注意：
+ * - 此函数由 GC 系统调用，不是由 JS 代码直接调用
+ * - 不释放 JSWeakRefData 结构体（WeakRef 对象本身可能还存在）
+ */
 static void weakref_delete_weakref(JSRuntime *rt, JSWeakRefHeader *wh)
 {
     JSWeakRefData *wrd = container_of(wh, JSWeakRefData, weakref_header);
@@ -67534,6 +67996,36 @@ static void weakref_delete_weakref(JSRuntime *rt, JSWeakRefHeader *wh)
     }
 }
 
+/**
+ * js_weakref_constructor - WeakRef 构造函数
+ * @ctx: JS 上下文
+ * @new_target: new 操作符的目标构造函数
+ * @argc: 参数个数
+ * @argv: 参数数组
+ * 
+ * 功能：
+ * - 实现 ECMAScript WeakRef 构造函数
+ * - 创建对目标对象的弱引用
+ * 
+ * 参数：
+ * - argv[0]: target - 要弱引用的目标对象（必须是对象，不能是 primitive）
+ * 
+ * 执行流程：
+ * 1. 验证 new 调用（不能直接调用）
+ * 2. 验证目标对象是否有效（不能是 primitive）
+ * 3. 创建 WeakRef 对象
+ * 4. 分配 JSWeakRefData 结构体
+ * 5. 创建目标对象的弱引用
+ * 6. 设置 weakref_header 类型并链接到全局列表
+ * 7. 将 JSWeakRefData 绑定到 WeakRef 对象
+ * 
+ * 返回：
+ * - 成功：新创建的 WeakRef 对象
+ * - 失败：JS_EXCEPTION 并抛出 TypeError
+ * 
+ * 异常：
+ * - TypeError: 未使用 new 调用、目标对象无效
+ */
 static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
                                       int argc, JSValueConst *argv)
 {
@@ -67560,6 +68052,32 @@ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
     return obj;
 }
 
+/**
+ * js_weakref_deref - WeakRef.prototype.deref() 实现
+ * @ctx: JS 上下文
+ * @this_val: WeakRef 对象
+ * @argc: 参数个数（未使用）
+ * @argv: 参数数组（未使用）
+ * 
+ * 功能：
+ * - 实现 ECMAScript WeakRef.prototype.deref() 方法
+ * - 返回弱引用的目标对象（如果未被 GC 回收）
+ * 
+ * 执行流程：
+ * 1. 获取 WeakRef 对象的内部数据
+ * 2. 检查目标对象是否仍然存活
+ *    - 如果存活：返回目标对象的副本（引用计数 +1）
+ *    - 如果已回收：返回 undefined
+ * 
+ * 返回：
+ * - 目标对象仍然存活：目标对象（引用计数 +1）
+ * - 目标对象已回收：undefined
+ * - 失败：JS_EXCEPTION 并抛出异常
+ * 
+ * 注意：
+ * - 返回的对象需要调用者负责释放（JS_FreeValue）
+ * - 即使返回了目标对象，也不能保证在后续使用时仍然存活
+ */
 static JSValue js_weakref_deref(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
     JSWeakRefData *wrd = JS_GetOpaque2(ctx, this_val, JS_CLASS_WEAK_REF);
@@ -67580,6 +68098,23 @@ static const JSClassShortDef js_weakref_class_def[] = {
     { JS_ATOM_WeakRef, js_weakref_finalizer, NULL }, /* JS_CLASS_WEAK_REF */
 };
 
+/**
+ * JSFinRecEntry - FinalizationRegistry 的注册条目
+ * @link: 链表节点（连接到 FinalizationRegistry 的条目列表）
+ * @target: 目标对象的弱引用（被监控的对象）
+ * @held_val: 持有值（目标对象被回收时传递给回调函数的值）
+ * @token: 注销令牌（用于取消注册的弱引用）
+ * 
+ * 用途：
+ * - 实现 ECMAScript FinalizationRegistry 的注册机制
+ * - 每个条目代表一个被监控的目标对象
+ * - 当目标对象被 GC 回收时，触发回调并传递 held_val
+ * 
+ * 生命周期：
+ * - 创建时：target 和 token 创建弱引用，held_val 增加引用计数
+ * - GC 时：如果 target 被回收，触发回调，释放所有引用
+ * - 注销时：通过 token 查找并移除条目
+ */
 typedef struct JSFinRecEntry {
     struct list_head link;
     JSValue target;
@@ -67587,6 +68122,23 @@ typedef struct JSFinRecEntry {
     JSValue token;
 } JSFinRecEntry;
 
+/**
+ * JSFinalizationRegistryData - FinalizationRegistry 对象的内部数据
+ * @weakref_header: 弱引用头（链接到全局弱引用列表）
+ * @entries: 注册条目列表（JSFinRecEntry 链表）
+ * @realm: JS 上下文（用于执行回调函数）
+ * @cb: 回调函数（目标对象被回收时调用）
+ * 
+ * 用途：
+ * - 实现 ECMAScript FinalizationRegistry 对象
+ * - 注册目标对象，当对象被 GC 回收时调用回调函数
+ * - 支持通过注销令牌取消注册
+ * 
+ * 回调执行：
+ * - 当 target 被回收时，将回调函数和 held_val 放入 Job 队列
+ * - 在下一个微任务（microtask）中执行回调
+ * - 回调签名：callback(heldValue)
+ */
 typedef struct JSFinalizationRegistryData {
     JSWeakRefHeader weakref_header;
     struct list_head entries; /* list of JSFinRecEntry.link */
@@ -67594,6 +68146,18 @@ typedef struct JSFinalizationRegistryData {
     JSValue cb;
 } JSFinalizationRegistryData;
 
+/**
+ * js_finrec_finalizer - FinalizationRegistry 对象析构函数
+ * @rt: 运行时
+ * @val: FinalizationRegistry 对象
+ * 
+ * 功能：
+ * - 在 GC 回收 FinalizationRegistry 对象时调用
+ * - 释放所有注册条目的弱引用和持有值
+ * - 释放回调函数和 JS 上下文
+ * - 从全局弱引用列表中移除
+ * - 释放 JSFinalizationRegistryData 结构体
+ */
 static void js_finrec_finalizer(JSRuntime *rt, JSValue val)
 {
     JSFinalizationRegistryData *frd = JS_GetOpaque(val, JS_CLASS_FINALIZATION_REGISTRY);
@@ -67613,6 +68177,19 @@ static void js_finrec_finalizer(JSRuntime *rt, JSValue val)
     }
 }
 
+/**
+ * js_finrec_mark - FinalizationRegistry 对象 GC 标记函数
+ * @rt: 运行时
+ * @val: FinalizationRegistry 对象
+ * @mark_func: 标记函数
+ * 
+ * 功能：
+ * - 在 GC 标记阶段调用
+ * - 标记所有注册条目的持有值（held_val）
+ * - 标记回调函数
+ * - 标记 JS 上下文
+ * - 防止这些对象被错误回收
+ */
 static void js_finrec_mark(JSRuntime *rt, JSValueConst val,
                            JS_MarkFunc *mark_func)
 {
@@ -67628,11 +68205,46 @@ static void js_finrec_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
+/**
+ * js_finrec_job - FinalizationRegistry 回调执行 Job
+ * @ctx: JS 上下文
+ * @argc: 参数个数
+ * @argv: 参数数组（argv[0]=回调函数，argv[1]=持有值）
+ * 
+ * 功能：
+ * - 作为微任务（microtask）执行 FinalizationRegistry 回调
+ * - 调用回调函数并传递持有值：callback(heldValue)
+ * 
+ * 注意：
+ * - 此函数不抛出异常（避免在 GC 期间递归进入 GC）
+ * - 由 JS_EnqueueJob2 调度执行
+ * 
+ * 返回：回调函数的返回值
+ */
 static JSValue js_finrec_job(JSContext *ctx, int argc, JSValueConst *argv)
 {
     return JS_Call(ctx, argv[0], JS_UNDEFINED, 1, &argv[1]);
 }
 
+/**
+ * finrec_delete_weakref - FinalizationRegistry 弱引用删除回调
+ * @rt: 运行时
+ * @wh: 弱引用头
+ * 
+ * 功能：
+ * - 当注册的目标对象或注销令牌被 GC 回收时调用
+ * - 遍历所有注册条目，检查 token 和 target 是否存活
+ * - 如果 target 被回收：
+ *   1. 将回调函数和持有值放入 Job 队列
+ *   2. 释放 target 和 token 的弱引用
+ *   3. 释放持有值的引用
+ *   4. 从条目列表中移除
+ * 
+ * 注意：
+ * - 此函数由 GC 系统调用，不是由 JS 代码直接调用
+ * - 不抛出异常（避免在 GC 期间递归进入 GC）
+ * - 使用 JS_EnqueueJob2 调度回调执行（微任务）
+ */
 static void finrec_delete_weakref(JSRuntime *rt, JSWeakRefHeader *wh)
 {
     JSFinalizationRegistryData *frd = container_of(wh, JSFinalizationRegistryData, weakref_header);
@@ -67662,6 +68274,40 @@ static void finrec_delete_weakref(JSRuntime *rt, JSWeakRefHeader *wh)
     }
 }
 
+/**
+ * js_finrec_constructor - FinalizationRegistry 构造函数
+ * @ctx: JS 上下文
+ * @new_target: new 操作符的目标构造函数
+ * @argc: 参数个数
+ * @argv: 参数数组
+ * 
+ * 功能：
+ * - 实现 ECMAScript FinalizationRegistry 构造函数
+ * - 创建最终化注册表对象，用于监控对象的生命周期
+ * 
+ * 参数：
+ * - argv[0]: callback - 回调函数（必需）
+ *   - 当注册的目标对象被 GC 回收时调用
+ *   - 签名：callback(heldValue)
+ * 
+ * 执行流程：
+ * 1. 验证 new 调用（不能直接调用）
+ * 2. 验证回调函数是否有效
+ * 3. 创建 FinalizationRegistry 对象
+ * 4. 分配 JSFinalizationRegistryData 结构体
+ * 5. 设置 weakref_header 类型并链接到全局列表
+ * 6. 初始化条目列表
+ * 7. 复制 JS 上下文（用于后续回调执行）
+ * 8. 复制回调函数
+ * 9. 将 JSFinalizationRegistryData 绑定到对象
+ * 
+ * 返回：
+ * - 成功：新创建的 FinalizationRegistry 对象
+ * - 失败：JS_EXCEPTION 并抛出 TypeError
+ * 
+ * 异常：
+ * - TypeError: 未使用 new 调用、回调函数无效
+ */
 static JSValue js_finrec_constructor(JSContext *ctx, JSValueConst new_target,
                                      int argc, JSValueConst *argv)
 {
@@ -67692,6 +68338,48 @@ static JSValue js_finrec_constructor(JSContext *ctx, JSValueConst new_target,
     return obj;
 }
 
+/**
+ * js_finrec_register - FinalizationRegistry.prototype.register() 实现
+ * @ctx: JS 上下文
+ * @this_val: FinalizationRegistry 对象
+ * @argc: 参数个数
+ * @argv: 参数数组
+ * 
+ * 功能：
+ * - 实现 ECMAScript FinalizationRegistry.prototype.register() 方法
+ * - 注册目标对象，当对象被 GC 回收时调用回调函数
+ * 
+ * 参数：
+ * - argv[0]: target - 要监控的目标对象（必需）
+ *   - 必须是对象，不能是 primitive
+ * - argv[1]: heldValue - 持有值（必需）
+ *   - 当 target 被回收时，传递给回调函数的值
+ *   - 不能与 target 是同一个对象（防止内存泄漏）
+ * - argv[2]: unregisterToken（可选）
+ *   - 注销令牌，用于后续取消注册
+ *   - 必须是对象或 undefined
+ * 
+ * 执行流程：
+ * 1. 获取 FinalizationRegistry 对象的内部数据
+ * 2. 验证 target 是否有效（必须是对象）
+ * 3. 验证 heldValue 不与 target 相同
+ * 4. 验证 unregisterToken 是否有效（如果提供）
+ * 5. 分配 JSFinRecEntry 结构体
+ * 6. 创建 target 和 unregisterToken 的弱引用
+ * 7. 复制 heldValue（增加引用计数）
+ * 8. 将条目添加到注册列表
+ * 
+ * 返回：
+ * - 成功：JS_UNDEFINED
+ * - 失败：JS_EXCEPTION 并抛出 TypeError
+ * 
+ * 异常：
+ * - TypeError: target 无效、heldValue 与 target 相同、unregisterToken 无效
+ * 
+ * 注意：
+ * - 注册后，当 target 被 GC 回收时，回调函数会被调用
+ * - 可以通过 unregisterToken 取消注册
+ */
 static JSValue js_finrec_register(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv)
 {
@@ -67722,6 +68410,45 @@ static JSValue js_finrec_register(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * js_finrec_unregister - FinalizationRegistry.prototype.unregister() 实现
+ * @ctx: JS 上下文
+ * @this_val: FinalizationRegistry 对象
+ * @argc: 参数个数
+ * @argv: 参数数组
+ * 
+ * 功能：
+ * - 实现 ECMAScript FinalizationRegistry.prototype.unregister() 方法
+ * - 通过注销令牌取消注册目标对象
+ * 
+ * 参数：
+ * - argv[0]: unregisterToken - 注销令牌（必需）
+ *   - 必须是对象（在 register 时提供的 token）
+ *   - 用于查找匹配的注册条目
+ * 
+ * 执行流程：
+ * 1. 获取 FinalizationRegistry 对象的内部数据
+ * 2. 验证 unregisterToken 是否有效（必须是对象）
+ * 3. 遍历所有注册条目，查找匹配的 token
+ * 4. 如果找到匹配的条目：
+ *    - 释放 target 和 token 的弱引用
+ *    - 释放 heldValue 的引用
+ *    - 从条目列表中移除
+ *    - 标记为已移除
+ * 5. 返回是否成功移除
+ * 
+ * 返回：
+ * - TRUE: 成功移除至少一个条目
+ * - FALSE: 未找到匹配的条目
+ * - JS_EXCEPTION: 发生错误
+ * 
+ * 异常：
+ * - TypeError: unregisterToken 无效
+ * 
+ * 注意：
+ * - 可能移除多个条目（如果多个注册使用相同的 token）
+ * - 如果 target 已经被回收，条目可能已不存在
+ */
 static JSValue js_finrec_unregister(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
     JSFinalizationRegistryData *frd = JS_GetOpaque2(ctx, this_val, JS_CLASS_FINALIZATION_REGISTRY);
@@ -67760,6 +68487,41 @@ static const JSClassShortDef js_finrec_class_def[] = {
     { JS_ATOM_FinalizationRegistry, js_finrec_finalizer, js_finrec_mark }, /* JS_CLASS_FINALIZATION_REGISTRY */
 };
 
+/**
+ * JS_AddIntrinsicWeakRef - 初始化 WeakRef 和 FinalizationRegistry 内置对象
+ * @ctx: JS 上下文
+ * 
+ * 功能：
+ * - 注册 WeakRef 和 FinalizationRegistry 类
+ * - 创建 WeakRef 构造函数和原型
+ * - 创建 FinalizationRegistry 构造函数和原型
+ * - 将这些对象添加到全局作用域
+ * 
+ * 执行流程：
+ * 1. 检查 WeakRef 类是否已注册
+ *    - 如果未注册：注册类（设置 finalizer）
+ *    - 如果已注册：跳过
+ * 2. 创建 WeakRef 构造函数
+ *    - 名称："WeakRef"
+ *    - 构造函数：js_weakref_constructor
+ *    - 原型方法：deref
+ * 3. 检查 FinalizationRegistry 类是否已注册
+ *    - 如果未注册：注册类（设置 finalizer 和 mark 函数）
+ *    - 如果已注册：跳过
+ * 4. 创建 FinalizationRegistry 构造函数
+ *    - 名称："FinalizationRegistry"
+ *    - 构造函数：js_finrec_constructor
+ *    - 原型方法：register, unregister
+ * 
+ * 返回：
+ * - 成功：0
+ * - 失败：-1 并抛出异常
+ * 
+ * 注意：
+ * - 使用 init_class_range 注册类（设置 finalizer 和 mark 函数）
+ * - 使用 JS_NewCConstructor 创建构造函数
+ * - 这些对象只在第一次调用时创建（幂等）
+ */
 int JS_AddIntrinsicWeakRef(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
