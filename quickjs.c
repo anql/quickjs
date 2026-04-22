@@ -22190,6 +22190,21 @@ static const uint16_t func_kind_to_class_id[] = {
     [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
 };
 
+/* ==========================================================================
+ * js_closure() - 创建闭包函数对象
+ * 
+ * 将字节码函数转换为可执行的 JavaScript 函数对象
+ * 
+ * 参数:
+ *   ctx           - JS 上下文
+ *   bfunc         - 字节码函数值
+ *   cur_var_refs  - 当前变量引用表（用于闭包捕获）
+ *   sf            - 当前栈帧
+ *   is_eval       - 是否为 eval 调用
+ * 
+ * 返回:
+ *   函数对象，或 JS_EXCEPTION
+ * ========================================================================== */
 static JSValue js_closure(JSContext *ctx, JSValue bfunc,
                           JSVarRef **cur_var_refs,
                           JSStackFrame *sf, BOOL is_eval)
@@ -22198,41 +22213,48 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
     JSValue func_obj;
     JSAtom name_atom;
 
-    b = JS_VALUE_GET_PTR(bfunc);
+    b = JS_VALUE_GET_PTR(bfunc);  // 获取字节码函数体指针
+    // 根据函数类型（普通/生成器/异步生成器）创建对应的对象类
     func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
     if (JS_IsException(func_obj)) {
         JS_FreeValue(ctx, bfunc);
         return JS_EXCEPTION;
     }
+    // 将字节码闭包转换为可执行的函数对象（设置作用域链等）
     func_obj = js_closure2(ctx, func_obj, b, cur_var_refs, sf, is_eval, NULL);
     if (JS_IsException(func_obj)) {
         /* bfunc has been freed */
         goto fail;
     }
+    // 设置函数名称（未命名函数使用空字符串）
     name_atom = b->func_name;
     if (name_atom == JS_ATOM_NULL)
         name_atom = JS_ATOM_empty_string;
     js_function_set_properties(ctx, func_obj, name_atom,
                                b->defined_arg_count);
 
+    // 处理生成器函数：生成器需要特殊的原型对象
     if (b->func_kind & JS_FUNC_GENERATOR) {
         JSValue proto;
         int proto_class_id;
         /* generators have a prototype field which is used as
            prototype for the generator object */
         if (b->func_kind == JS_FUNC_ASYNC_GENERATOR)
-            proto_class_id = JS_CLASS_ASYNC_GENERATOR;
+            proto_class_id = JS_CLASS_ASYNC_GENERATOR;  // 异步生成器
         else
-            proto_class_id = JS_CLASS_GENERATOR;
+            proto_class_id = JS_CLASS_GENERATOR;  // 普通生成器
+        // 创建生成器原型对象，继承自对应的原型
         proto = JS_NewObjectProto(ctx, ctx->class_proto[proto_class_id]);
         if (JS_IsException(proto))
             goto fail;
+        // 将原型对象设置为函数的 prototype 属性
         JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_prototype, proto,
                                JS_PROP_WRITABLE);
     } else if (b->has_prototype) {
         /* add the 'prototype' property: delay instantiation to avoid
            creating cycles for every javascript function. The prototype
            object is created on the fly when first accessed */
+        // 普通函数：设置构造器标志，延迟创建 prototype 以避免循环引用
         JS_SetConstructorBit(ctx, func_obj, TRUE);
         JS_DefineAutoInitProperty(ctx, func_obj, JS_ATOM_prototype,
                                   JS_AUTOINIT_ID_PROTOTYPE, NULL,
@@ -22245,8 +22267,27 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
     return JS_EXCEPTION;
 }
 
+/* 类定义标志：是否有继承（extends 子句） */
 #define JS_DEFINE_CLASS_HAS_HERITAGE     (1 << 0)
 
+/* ==========================================================================
+ * js_op_define_class() - 执行类定义操作
+ * 
+ * 处理 ES6 class 语法，创建构造函数和原型对象
+ * 对应字节码：OP_define_class
+ * 
+ * 参数:
+ *   ctx             - JS 上下文
+ *   sp              - 栈指针（栈顶包含父类和字节码函数）
+ *   class_name      - 类名 atom
+ *   class_flags     - 类标志（是否有 extends）
+ *   cur_var_refs    - 变量引用表
+ *   sf              - 栈帧
+ *   is_computed_name - 是否为计算属性名
+ * 
+ * 返回:
+ *   0 成功，-1 失败
+ * ========================================================================== */
 static int js_op_define_class(JSContext *ctx, JSValue *sp,
                               JSAtom class_name, int class_flags,
                               JSVarRef **cur_var_refs,
@@ -22256,21 +22297,26 @@ static int js_op_define_class(JSContext *ctx, JSValue *sp,
     JSValue ctor = JS_UNDEFINED, parent_proto = JS_UNDEFINED;
     JSFunctionBytecode *b;
 
-    parent_class = sp[-2];
-    bfunc = sp[-1];
+    parent_class = sp[-2];  // 父类（extends 后面的类）
+    bfunc = sp[-1];         // 构造函数字节码
 
+    // 处理继承情况
     if (class_flags & JS_DEFINE_CLASS_HAS_HERITAGE) {
         if (JS_IsNull(parent_class)) {
+            // extends null：原型链顶端为 null
             parent_proto = JS_NULL;
             parent_class = JS_DupValue(ctx, ctx->function_proto);
         } else {
+            // 验证父类必须是构造函数
             if (!JS_IsConstructor(ctx, parent_class)) {
                 JS_ThrowTypeError(ctx, "parent class must be constructor");
                 goto fail;
             }
+            // 获取父类的 prototype
             parent_proto = JS_GetProperty(ctx, parent_class, JS_ATOM_prototype);
             if (JS_IsException(parent_proto))
                 goto fail;
+            // 验证父类 prototype 必须是对象或 null
             if (!JS_IsNull(parent_proto) && !JS_IsObject(parent_proto)) {
                 JS_ThrowTypeError(ctx, "parent prototype must be an object or null");
                 goto fail;
@@ -22278,30 +22324,37 @@ static int js_op_define_class(JSContext *ctx, JSValue *sp,
         }
     } else {
         /* parent_class is JS_UNDEFINED in this case */
+        // 无继承：默认继承 Object
         parent_proto = JS_DupValue(ctx, ctx->class_proto[JS_CLASS_OBJECT]);
         parent_class = JS_DupValue(ctx, ctx->function_proto);
     }
+    // 创建类的原型对象，继承自父类原型
     proto = JS_NewObjectProto(ctx, parent_proto);
     if (JS_IsException(proto))
         goto fail;
 
+    // 创建构造函数对象
     b = JS_VALUE_GET_PTR(bfunc);
     assert(b->func_kind == JS_FUNC_NORMAL);
     ctor = JS_NewObjectProtoClass(ctx, parent_class,
                                   JS_CLASS_BYTECODE_FUNCTION);
     if (JS_IsException(ctor))
         goto fail;
+    // 将字节码转换为可执行的闭包函数
     ctor = js_closure2(ctx, ctor, b, cur_var_refs, sf, FALSE, NULL);
     bfunc = JS_UNDEFINED;
     if (JS_IsException(ctor))
         goto fail;
+    // 设置 home_object（用于 super 调用）
     js_method_set_home_object(ctx, ctor, proto);
-    JS_SetConstructorBit(ctx, ctor, TRUE);
+    JS_SetConstructorBit(ctx, ctor, TRUE);  // 标记为构造函数
 
+    // 设置函数的 length 属性（参数个数）
     JS_DefinePropertyValue(ctx, ctor, JS_ATOM_length,
                            JS_NewInt32(ctx, b->defined_arg_count),
                            JS_PROP_CONFIGURABLE);
 
+    // 设置函数名称（计算属性名或普通名称）
     if (is_computed_name) {
         if (JS_DefineObjectNameComputed(ctx, ctor, sp[-3],
                                         JS_PROP_CONFIGURABLE) < 0)
@@ -22313,25 +22366,30 @@ static int js_op_define_class(JSContext *ctx, JSValue *sp,
 
     /* the constructor property must be first. It can be overriden by
        computed property names */
+    // 在原型上设置 constructor 属性指向构造函数
     if (JS_DefinePropertyValue(ctx, proto, JS_ATOM_constructor,
                                JS_DupValue(ctx, ctor),
                                JS_PROP_CONFIGURABLE |
                                JS_PROP_WRITABLE | JS_PROP_THROW) < 0)
         goto fail;
     /* set the prototype property */
+    // 在构造函数上设置 prototype 属性指向原型对象
     if (JS_DefinePropertyValue(ctx, ctor, JS_ATOM_prototype,
                                JS_DupValue(ctx, proto), JS_PROP_THROW) < 0)
         goto fail;
+    // 设置循环引用标志（用于垃圾回收）
     set_cycle_flag(ctx, ctor);
     set_cycle_flag(ctx, proto);
 
     JS_FreeValue(ctx, parent_proto);
     JS_FreeValue(ctx, parent_class);
 
+    // 将构造函数和原型对象放回栈中供后续使用
     sp[-2] = ctor;
     sp[-1] = proto;
     return 0;
  fail:
+    // 错误处理：释放所有资源
     JS_FreeValue(ctx, parent_class);
     JS_FreeValue(ctx, parent_proto);
     JS_FreeValue(ctx, bfunc);
@@ -22342,47 +22400,99 @@ static int js_op_define_class(JSContext *ctx, JSValue *sp,
     return -1;
 }
 
+/* ==========================================================================
+ * close_var_ref() - 关闭变量引用
+ * 
+ * 当函数返回时，将局部变量引用"分离"，使其不再指向栈上的局部变量，
+ * 而是拥有独立的值拷贝。这对于闭包捕获局部变量至关重要。
+ * 
+ * 对于异步函数，还需要释放异步函数状态。
+ * ========================================================================== */
 static void close_var_ref(JSRuntime *rt, JSStackFrame *sf, JSVarRef *var_ref)
 {
+    // 如果是异步函数，释放异步函数状态
     if (sf->js_mode & JS_MODE_ASYNC) {
         JSAsyncFunctionState *async_func = container_of(sf, JSAsyncFunctionState, frame);
         async_func_free(rt, async_func);
     }
+    // 复制当前值到变量引用的独立存储
     var_ref->value = JS_DupValueRT(rt, *var_ref->pvalue);
     var_ref->pvalue = &var_ref->value;
     /* the reference is no longer to a local variable */
-    var_ref->is_detached = TRUE;
+    var_ref->is_detached = TRUE;  // 标记为已分离（不再指向栈上局部变量）
 }
 
+/* ==========================================================================
+ * close_var_refs() - 关闭所有变量引用
+ * 
+ * 遍历函数的所有变量引用，逐个关闭它们。
+ * 在函数返回时调用，确保闭包捕获的变量有独立的值。
+ * ========================================================================== */
 static void close_var_refs(JSRuntime *rt, JSFunctionBytecode *b, JSStackFrame *sf)
 {
     JSVarRef *var_ref;
     int i;
 
+    // 遍历所有变量引用
     for(i = 0; i < b->var_ref_count; i++) {
         var_ref = sf->var_refs[i];
         if (var_ref)
-            close_var_ref(rt, sf, var_ref);
+            close_var_ref(rt, sf, var_ref);  // 关闭单个变量引用
     }
 }
 
+/* ==========================================================================
+ * close_lexical_var() - 关闭词法变量
+ * 
+ * 关闭指定索引的词法变量（let/const 声明的变量）。
+ * 用于块级作用域退出时的清理。
+ * 
+ * 参数:
+ *   ctx     - JS 上下文
+ *   b       - 函数字节码
+ *   sf      - 栈帧
+ *   var_idx - 变量索引（相对于参数之后）
+ * ========================================================================== */
 static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
                               JSStackFrame *sf, int var_idx)
 {
     JSVarRef *var_ref;
     int var_ref_idx;
     
+    // 获取变量定义中的引用索引
     var_ref_idx = b->vardefs[b->arg_count + var_idx].var_ref_idx;
     var_ref = sf->var_refs[var_ref_idx];
     if (var_ref) {
-        close_var_ref(ctx->rt, sf, var_ref);
-        sf->var_refs[var_ref_idx] = NULL;
+        close_var_ref(ctx->rt, sf, var_ref);  // 关闭引用
+        sf->var_refs[var_ref_idx] = NULL;     // 清空引用指针
     }
 }
 
-#define JS_CALL_FLAG_COPY_ARGV   (1 << 1)
-#define JS_CALL_FLAG_GENERATOR   (1 << 2)
+/* 函数调用标志 */
+#define JS_CALL_FLAG_COPY_ARGV   (1 << 1)  // 复制参数数组
+#define JS_CALL_FLAG_GENERATOR   (1 << 2)  // 生成器调用
 
+/* ==========================================================================
+ * js_call_c_function() - 调用 C 语言实现的函数
+ * 
+ * 处理所有用 C 语言实现的内置函数的调用，包括：
+ * - 普通函数
+ * - 构造函数
+ * - getter/setter
+ * - 特殊优化形式（f_f, f_f_f 等）
+ * - 迭代器 next 方法
+ * 
+ * 参数:
+ *   ctx      - JS 上下文
+ *   func_obj - 函数对象
+ *   this_obj - this 绑定对象
+ *   argc     - 参数个数
+ *   argv     - 参数数组
+ *   flags    - 调用标志
+ * 
+ * 返回:
+ *   函数返回值或 JS_EXCEPTION
+ * ========================================================================== */
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                   JSValueConst this_obj,
                                   int argc, JSValueConst *argv, int flags)
@@ -22397,22 +22507,25 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     JSCFunctionEnum cproto;
 
     p = JS_VALUE_GET_OBJ(func_obj);
-    cproto = p->u.cfunc.cproto;
-    arg_count = p->u.cfunc.length;
+    cproto = p->u.cfunc.cproto;     // 获取 C 函数原型类型
+    arg_count = p->u.cfunc.length;  // 期望的参数个数
 
     /* better to always check stack overflow */
+    // 检查栈溢出
     if (js_check_stack_overflow(rt, sizeof(arg_buf[0]) * arg_count))
         return JS_ThrowStackOverflow(ctx);
 
+    // 设置新的栈帧
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
     rt->current_stack_frame = sf;
-    ctx = p->u.cfunc.realm; /* change the current realm */
+    ctx = p->u.cfunc.realm; /* change the current realm */  // 切换到函数的 realm
     sf->js_mode = 0;
     sf->cur_func = (JSValue)func_obj;
     sf->arg_count = argc;
     arg_buf = argv;
 
+    // 如果实际参数少于期望参数，用 undefined 填充
     if (unlikely(argc < arg_count)) {
         /* ensure that at least argc_count arguments are readable */
         arg_buf = alloca(sizeof(arg_buf[0]) * arg_count);
@@ -22425,25 +22538,30 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     sf->arg_buf = (JSValue*)arg_buf;
 
     func = p->u.cfunc.c_function;
+    // 根据函数类型分发到不同的调用约定
     switch(cproto) {
     case JS_CFUNC_constructor:
     case JS_CFUNC_constructor_or_func:
+        // 构造函数：必须用 new 调用
         if (!(flags & JS_CALL_FLAG_CONSTRUCTOR)) {
             if (cproto == JS_CFUNC_constructor) {
             not_a_constructor:
                 ret_val = JS_ThrowTypeError(ctx, "must be called with new");
                 break;
             } else {
+                // constructor_or_func 可以不用 new
                 this_obj = JS_UNDEFINED;
             }
         }
         /* here this_obj is new_target */
         /* fall thru */
     case JS_CFUNC_generic:
+        // 普通 C 函数调用
         ret_val = func.generic(ctx, this_obj, argc, arg_buf);
         break;
     case JS_CFUNC_constructor_magic:
     case JS_CFUNC_constructor_or_func_magic:
+        // 带 magic 参数的构造函数
         if (!(flags & JS_CALL_FLAG_CONSTRUCTOR)) {
             if (cproto == JS_CFUNC_constructor_magic) {
                 goto not_a_constructor;
@@ -22453,13 +22571,16 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
         }
         /* fall thru */
     case JS_CFUNC_generic_magic:
+        // 带 magic 参数的普通函数（magic 用于区分同一 C 函数的不同行为）
         ret_val = func.generic_magic(ctx, this_obj, argc, arg_buf,
                                      p->u.cfunc.magic);
         break;
     case JS_CFUNC_getter:
+        // getter：无参数，返回属性值
         ret_val = func.getter(ctx, this_obj);
         break;
     case JS_CFUNC_setter:
+        // setter：一个参数，设置属性值
         ret_val = func.setter(ctx, this_obj, arg_buf[0]);
         break;
     case JS_CFUNC_getter_magic:
@@ -22469,6 +22590,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
         ret_val = func.setter_magic(ctx, this_obj, arg_buf[0], p->u.cfunc.magic);
         break;
     case JS_CFUNC_f_f:
+        // 优化形式：double -> double 的数学函数（如 Math.sin）
         {
             double d1;
 
@@ -22480,6 +22602,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
         }
         break;
     case JS_CFUNC_f_f_f:
+        // 优化形式：double, double -> double（如 Math.pow）
         {
             double d1, d2;
 
@@ -22495,23 +22618,45 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
         }
         break;
     case JS_CFUNC_iterator_next:
+        // 迭代器 next 方法
         {
             int done;
             ret_val = func.iterator_next(ctx, this_obj, argc, arg_buf,
                                          &done, p->u.cfunc.magic);
             if (!JS_IsException(ret_val) && done != 2) {
+                // 创建迭代器结果对象 { value, done }
                 ret_val = js_create_iterator_result(ctx, ret_val, done);
             }
         }
         break;
     default:
-        abort();
+        abort();  // 不应该到达这里
     }
 
+    // 恢复之前的栈帧
     rt->current_stack_frame = sf->prev_frame;
     return ret_val;
 }
 
+/* ==========================================================================
+ * js_call_bound_function() - 调用绑定函数（bind 创建）
+ * 
+ * 处理 Function.prototype.bind() 创建的绑定函数。
+ * 绑定函数的特点：
+ * - this 值已固定
+ * - 可以预设部分参数（柯里化）
+ * 
+ * 参数:
+ *   ctx      - JS 上下文
+ *   func_obj - 绑定函数对象
+ *   this_obj - 调用时的 this（构造函数调用时为 new_target）
+ *   argc     - 参数个数
+ *   argv     - 参数数组
+ *   flags    - 调用标志
+ * 
+ * 返回:
+ *   函数返回值
+ * ========================================================================== */
 static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
                                       JSValueConst this_obj,
                                       int argc, JSValueConst *argv, int flags)
@@ -22522,46 +22667,72 @@ static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
     int arg_count, i;
 
     p = JS_VALUE_GET_OBJ(func_obj);
-    bf = p->u.bound_function;
-    arg_count = bf->argc + argc;
+    bf = p->u.bound_function;  // 获取绑定函数数据
+    arg_count = bf->argc + argc;  // 总参数数 = 预设参数 + 调用时参数
     if (js_check_stack_overflow(ctx->rt, sizeof(JSValue) * arg_count))
         return JS_ThrowStackOverflow(ctx);
     arg_buf = alloca(sizeof(JSValue) * arg_count);
+    // 复制预设参数
     for(i = 0; i < bf->argc; i++) {
         arg_buf[i] = bf->argv[i];
     }
+    // 追加调用时的参数
     for(i = 0; i < argc; i++) {
         arg_buf[bf->argc + i] = argv[i];
     }
     if (flags & JS_CALL_FLAG_CONSTRUCTOR) {
+        // 构造函数调用：处理 new_target
         new_target = this_obj;
         if (js_same_value(ctx, func_obj, new_target))
-            new_target = bf->func_obj;
+            new_target = bf->func_obj;  // 绑定函数的 new_target 指向原函数
         return JS_CallConstructor2(ctx, bf->func_obj, new_target,
                                    arg_count, arg_buf);
     } else {
+        // 普通调用：使用绑定的 this 值
         return JS_Call(ctx, bf->func_obj, bf->this_val,
                        arg_count, arg_buf);
     }
 }
 
-/* argument of OP_special_object */
+/* OP_special_object 指令的参数枚举 - 特殊对象类型 */
 typedef enum {
-    OP_SPECIAL_OBJECT_ARGUMENTS,
-    OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS,
-    OP_SPECIAL_OBJECT_THIS_FUNC,
-    OP_SPECIAL_OBJECT_NEW_TARGET,
-    OP_SPECIAL_OBJECT_HOME_OBJECT,
-    OP_SPECIAL_OBJECT_VAR_OBJECT,
-    OP_SPECIAL_OBJECT_IMPORT_META,
+    OP_SPECIAL_OBJECT_ARGUMENTS,       // arguments 对象
+    OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS, // 映射的 arguments（与命名参数绑定）
+    OP_SPECIAL_OBJECT_THIS_FUNC,       // 当前函数对象
+    OP_SPECIAL_OBJECT_NEW_TARGET,      // new.target
+    OP_SPECIAL_OBJECT_HOME_OBJECT,     // super 调用的 home object
+    OP_SPECIAL_OBJECT_VAR_OBJECT,      // 变量对象（with 语句）
+    OP_SPECIAL_OBJECT_IMPORT_META,     // import.meta
 } OPSpecialObjectEnum;
 
-#define FUNC_RET_AWAIT         0
-#define FUNC_RET_YIELD         1
-#define FUNC_RET_YIELD_STAR    2
-#define FUNC_RET_INITIAL_YIELD 3
+// 函数返回/暂停类型
+#define FUNC_RET_AWAIT         0  // await 暂停
+#define FUNC_RET_YIELD         1  // yield 暂停
+#define FUNC_RET_YIELD_STAR    2  // yield* 暂停
+#define FUNC_RET_INITIAL_YIELD 3  // 生成器初始 yield
 
-/* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
+/* ==========================================================================
+ * JS_CallInternal() - 字节码解释器核心
+ * 
+ * 这是 QuickJS 的心脏：一个完整的字节码解释器。
+ * 实现了：
+ * - 栈式虚拟机
+ * - 所有 JavaScript 操作符
+ * - 函数调用、返回、异常处理
+ * - 闭包、生成器、async/await
+ * 
+ * 参数:
+ *   caller_ctx  - 调用者上下文
+ *   func_obj    - 被调用的函数对象
+ *   this_obj    - this 绑定值
+ *   new_target  - new.target（构造函数调用时）
+ *   argc        - 参数个数
+ *   argv        - 参数数组
+ *   flags       - 调用标志
+ * 
+ * 返回:
+ *   函数返回值或 JS_EXCEPTION
+ * ========================================================================== */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValue *argv, int flags)
@@ -22571,18 +22742,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSObject *p;
     JSFunctionBytecode *b;
     JSStackFrame sf_s, *sf = &sf_s;
-    const uint8_t *pc;
+    const uint8_t *pc;           // 程序计数器（指向当前字节码）
     int opcode, arg_allocated_size, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
     JSVarRef **var_refs;
     size_t alloca_size;
 
 #if !DIRECT_DISPATCH
+// 标准 switch 分派（兼容性最好）
 #define SWITCH(pc)      switch (opcode = *pc++)
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
 #else
+// 直接线程分派（GCC 扩展，性能更好）
     static const void * const dispatch_table[256] = {
 #define DEF(id, size, n_pop, n_push, f) && case_OP_ ## id,
 #if SHORT_OPCODES
@@ -22599,14 +22772,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define BREAK           SWITCH(pc)
 #endif
 
+    // 检查中断（如超时、信号等）
     if (js_poll_interrupts(caller_ctx))
         return JS_EXCEPTION;
+    
+    // 处理非对象类型的函数（如生成器恢复执行）
     if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
         if (flags & JS_CALL_FLAG_GENERATOR) {
+            // 恢复异步生成器执行
             JSAsyncFunctionState *s = JS_VALUE_GET_PTR(func_obj);
             /* func_obj get contains a pointer to JSFuncAsyncState */
             /* the stack frame is already allocated */
-            sf = &s->frame;
+            sf = &s->frame;  // 使用已存在的栈帧
             p = JS_VALUE_GET_OBJ(sf->cur_func);
             b = p->u.func.function_bytecode;
             ctx = b->realm;
@@ -22620,14 +22797,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sf->prev_frame = rt->current_stack_frame;
             rt->current_stack_frame = sf;
             if (s->throw_flag)
-                goto exception;
+                goto exception;  // 恢复时抛出异常
             else
-                goto restart;
+                goto restart;    // 恢复执行
         } else {
             goto not_a_function;
         }
     }
+    
     p = JS_VALUE_GET_OBJ(func_obj);
+    // 检查是否为字节码函数，否则调用类的方法
     if (unlikely(p->class_id != JS_CLASS_BYTECODE_FUNCTION)) {
         JSClassCall *call_func;
         call_func = rt->class_array[p->class_id].call;
@@ -22635,11 +22814,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         not_a_function:
             return JS_ThrowTypeError(caller_ctx, "not a function");
         }
+        // 调用类的自定义调用方法
         return call_func(caller_ctx, func_obj, this_obj, argc,
                          (JSValueConst *)argv, flags);
     }
-    b = p->u.func.function_bytecode;
+    b = p->u.func.function_bytecode;  // 获取字节码
 
+    // 计算需要的栈空间大小
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
         arg_allocated_size = b->arg_count;
     } else {
@@ -22652,58 +22833,76 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     if (js_check_stack_overflow(rt, alloca_size))
         return JS_ThrowStackOverflow(caller_ctx);
 
+    // 初始化栈帧
     sf->js_mode = b->js_mode;
     arg_buf = argv;
     sf->arg_count = argc;
     sf->cur_func = (JSValue)func_obj;
     var_refs = p->u.func.var_refs;
 
+    // 分配本地内存（参数 + 变量 + 栈空间）
     local_buf = alloca(alloca_size);
     if (unlikely(arg_allocated_size)) {
+        // 需要复制参数（参数不足或需要拷贝）
         int n = min_int(argc, b->arg_count);
         arg_buf = local_buf;
         for(i = 0; i < n; i++)
             arg_buf[i] = JS_DupValue(caller_ctx, argv[i]);
         for(; i < b->arg_count; i++)
-            arg_buf[i] = JS_UNDEFINED;
+            arg_buf[i] = JS_UNDEFINED;  // 用 undefined 填充缺失参数
         sf->arg_count = b->arg_count;
     }
     var_buf = local_buf + arg_allocated_size;
     sf->var_buf = var_buf;
     sf->arg_buf = arg_buf;
 
+    // 初始化局部变量为 undefined
     for(i = 0; i < b->var_count; i++)
         var_buf[i] = JS_UNDEFINED;
 
+    // 设置栈指针和变量引用表
     stack_buf = var_buf + b->var_count;
     sf->var_refs = (JSVarRef **)(stack_buf + b->stack_size);
     for(i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
-    sp = stack_buf;
-    pc = b->byte_code_buf;
+    sp = stack_buf;           // 栈顶指针
+    pc = b->byte_code_buf;    // 程序计数器指向字节码起始
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
-    ctx = b->realm; /* set the current realm */
+    ctx = b->realm; /* set the current realm */  // 切换到函数的 realm
 
  restart:
+    /* ======================================================================
+     * 字节码解释器主循环
+     * 
+     * 这是一个典型的栈式虚拟机：
+     * - pc: 程序计数器，指向当前字节码
+     * - sp: 栈顶指针
+     * - 所有操作都在栈上进行
+     * ====================================================================== */
     for(;;) {
         int call_argc;
         JSValue *call_argv;
 
         SWITCH(pc) {
+        /* ==================== 压栈指令族 ==================== */
         CASE(OP_push_i32):
+            // 压入 32 位整数（4 字节操作数）
             *sp++ = JS_NewInt32(ctx, get_u32(pc));
             pc += 4;
             BREAK;
         CASE(OP_push_bigint_i32):
+            // 压入短 BigInt（32 位整数转换）
             *sp++ = __JS_NewShortBigInt(ctx, (int)get_u32(pc));
             pc += 4;
             BREAK;
         CASE(OP_push_const):
+            // 从常量池压入值（4 字节索引）
             *sp++ = JS_DupValue(ctx, b->cpool[get_u32(pc)]);
             pc += 4;
             BREAK;
 #if SHORT_OPCODES
+        // 短操作码优化：单字节压入小整数 -1 到 7
         CASE(OP_push_minus1):
         CASE(OP_push_0):
         CASE(OP_push_1):
@@ -22716,40 +22915,50 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             *sp++ = JS_NewInt32(ctx, opcode - OP_push_0);
             BREAK;
         CASE(OP_push_i8):
+            // 压入 8 位有符号整数
             *sp++ = JS_NewInt32(ctx, get_i8(pc));
             pc += 1;
             BREAK;
         CASE(OP_push_i16):
+            // 压入 16 位有符号整数
             *sp++ = JS_NewInt32(ctx, get_i16(pc));
             pc += 2;
             BREAK;
         CASE(OP_push_const8):
+            // 从常量池压入值（1 字节索引，用于小常量池）
             *sp++ = JS_DupValue(ctx, b->cpool[*pc++]);
             BREAK;
         CASE(OP_fclosure8):
+            // 创建闭包（1 字节常量池索引）
             *sp++ = js_closure(ctx, JS_DupValue(ctx, b->cpool[*pc++]), var_refs, sf, FALSE);
             if (unlikely(JS_IsException(sp[-1])))
                 goto exception;
             BREAK;
         CASE(OP_push_empty_string):
+            // 压入空字符串
             *sp++ = JS_AtomToString(ctx, JS_ATOM_empty_string);
             BREAK;
 #endif
         CASE(OP_push_atom_value):
+            // 将 atom 转换为值并压入（4 字节 atom 索引）
             *sp++ = JS_AtomToValue(ctx, get_u32(pc));
             pc += 4;
             BREAK;
         CASE(OP_undefined):
+            // 压入 undefined
             *sp++ = JS_UNDEFINED;
             BREAK;
         CASE(OP_null):
+            // 压入 null
             *sp++ = JS_NULL;
             BREAK;
         CASE(OP_push_this):
             /* OP_push_this is only called at the start of a function */
+            // 压入 this 值（需要处理非严格模式的 this 绑定）
             {
                 JSValue val;
                 if (!(b->js_mode & JS_MODE_STRICT)) {
+                    // 非严格模式：null/undefined 转为全局对象，其他转为对象
                     uint32_t tag = JS_VALUE_GET_TAG(this_obj);
                     if (likely(tag == JS_TAG_OBJECT))
                         goto normal_this;
@@ -22762,44 +22971,54 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                 } else {
                 normal_this:
+                    // 严格模式：直接使用 this
                     val = JS_DupValue(ctx, this_obj);
                 }
                 *sp++ = val;
             }
             BREAK;
         CASE(OP_push_false):
+            // 压入 false
             *sp++ = JS_FALSE;
             BREAK;
         CASE(OP_push_true):
+            // 压入 true
             *sp++ = JS_TRUE;
             BREAK;
         CASE(OP_object):
+            // 创建空对象 {}
             *sp++ = JS_NewObject(ctx);
             if (unlikely(JS_IsException(sp[-1])))
                 goto exception;
             BREAK;
         CASE(OP_special_object):
+            // 创建特殊对象（arguments, new.target, import.meta 等）
             {
                 int arg = *pc++;
                 switch(arg) {
                 case OP_SPECIAL_OBJECT_ARGUMENTS:
+                    // 创建 arguments 对象
                     *sp++ = js_build_arguments(ctx, argc, (JSValueConst *)argv);
                     if (unlikely(JS_IsException(sp[-1])))
                         goto exception;
                     break;
                 case OP_SPECIAL_OBJECT_MAPPED_ARGUMENTS:
+                    // 创建映射的 arguments（与命名参数同步更新）
                     *sp++ = js_build_mapped_arguments(ctx, argc, (JSValueConst *)argv,
                                                       sf, min_int(argc, b->arg_count));
                     if (unlikely(JS_IsException(sp[-1])))
                         goto exception;
                     break;
                 case OP_SPECIAL_OBJECT_THIS_FUNC:
+                    // 当前函数对象
                     *sp++ = JS_DupValue(ctx, sf->cur_func);
                     break;
                 case OP_SPECIAL_OBJECT_NEW_TARGET:
+                    // new.target（构造函数调用时的 new 目标）
                     *sp++ = JS_DupValue(ctx, new_target);
                     break;
                 case OP_SPECIAL_OBJECT_HOME_OBJECT:
+                    // super 调用的 home_object（用于方法中的 super）
                     {
                         JSObject *p1;
                         p1 = p->u.func.home_object;
@@ -22810,11 +23029,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     break;
                 case OP_SPECIAL_OBJECT_VAR_OBJECT:
+                    // 变量对象（with 语句使用）
                     *sp++ = JS_NewObjectProto(ctx, JS_NULL);
                     if (unlikely(JS_IsException(sp[-1])))
                         goto exception;
                     break;
                 case OP_SPECIAL_OBJECT_IMPORT_META:
+                    // import.meta 对象
                     *sp++ = js_import_meta(ctx);
                     if (unlikely(JS_IsException(sp[-1])))
                         goto exception;
@@ -22825,6 +23046,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_rest):
+            // 剩余参数 [...args]，创建包含剩余参数的数组
             {
                 int first = get_u16(pc);
                 pc += 2;
@@ -22835,37 +23057,45 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        /* ==================== 栈操作指令族 ==================== */
         CASE(OP_drop):
+            // 丢弃栈顶元素
             JS_FreeValue(ctx, sp[-1]);
             sp--;
             BREAK;
         CASE(OP_nip):
+            // 移除次栈顶元素：a b -> b
             JS_FreeValue(ctx, sp[-2]);
             sp[-2] = sp[-1];
             sp--;
             BREAK;
         CASE(OP_nip1): /* a b c -> b c */
+            // 移除第三个元素：a b c -> b c
             JS_FreeValue(ctx, sp[-3]);
             sp[-3] = sp[-2];
             sp[-2] = sp[-1];
             sp--;
             BREAK;
         CASE(OP_dup):
+            // 复制栈顶：a -> a a
             sp[0] = JS_DupValue(ctx, sp[-1]);
             sp++;
             BREAK;
         CASE(OP_dup2): /* a b -> a b a b */
+            // 复制栈顶两个元素
             sp[0] = JS_DupValue(ctx, sp[-2]);
             sp[1] = JS_DupValue(ctx, sp[-1]);
             sp += 2;
             BREAK;
         CASE(OP_dup3): /* a b c -> a b c a b c */
+            // 复制栈顶三个元素
             sp[0] = JS_DupValue(ctx, sp[-3]);
             sp[1] = JS_DupValue(ctx, sp[-2]);
             sp[2] = JS_DupValue(ctx, sp[-1]);
             sp += 3;
             BREAK;
         CASE(OP_dup1): /* a b -> a a b */
+            // 复制次栈顶到栈顶
             sp[0] = sp[-1];
             sp[-1] = JS_DupValue(ctx, sp[-2]);
             sp++;
