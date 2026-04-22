@@ -23984,6 +23984,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_ret):
+            /* 子程序返回指令：从子程序调用返回到调用点
+             * 栈操作：pop return_address → pc = return_address
+             * 用于实现 gosub/ret 子程序机制 */
             {
                 JSValue op1;
                 uint32_t pos;
@@ -24002,17 +24005,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_for_in_start):
+            /* for-in 循环初始化：枚举对象的可枚举属性
+             * 栈操作：obj → obj enumerator
+             * 调用 js_for_in_start 创建枚举器对象 */
             sf->cur_pc = pc;
             if (js_for_in_start(ctx, sp))
                 goto exception;
             BREAK;
         CASE(OP_for_in_next):
+            /* for-in 循环迭代：获取下一个属性名
+             * 栈操作：obj enumerator → obj enumerator key done
+             * 返回属性名和完成标志，sp += 2 表示压入两个值 */
             sf->cur_pc = pc;
             if (js_for_in_next(ctx, sp))
                 goto exception;
             sp += 2;
             BREAK;
         CASE(OP_for_of_start):
+            /* for-of 循环初始化：获取迭代器
+             * 栈操作：iterable → iterable iterator
+             * 调用 js_for_of_start 获取迭代器的 next 方法
+             * 压入 catch offset 用于异常处理（迭代器关闭）*/
             sf->cur_pc = pc;
             if (js_for_of_start(ctx, sp, FALSE))
                 goto exception;
@@ -24020,6 +24033,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             *sp++ = JS_NewCatchOffset(ctx, 0);
             BREAK;
         CASE(OP_for_of_next):
+            /* for-of 循环迭代：调用 iterator.next()
+             * 栈操作：iterable iterator catch_offset → iterable iterator catch_offset value done
+             * offset 参数用于异常时跳转到 catch 块 */
             {
                 int offset = -3 - pc[0];
                 pc += 1;
@@ -24030,12 +24046,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_for_await_of_next):
+            /* for-await-of 循环迭代：异步迭代器的 next 调用
+             * 用于 async/await 场景，返回 Promise
+             * 栈操作：类似 for_of_next，但处理异步结果 */
             sf->cur_pc = pc;
             if (js_for_await_of_next(ctx, sp))
                 goto exception;
             sp++;
             BREAK;
         CASE(OP_for_await_of_start):
+            /* for-await-of 循环初始化：异步迭代器设置
+             * 与 for_of_start 类似，但标记为异步模式 (TRUE)
+             * 用于处理 async iterable 对象 */
             sf->cur_pc = pc;
             if (js_for_of_start(ctx, sp, TRUE))
                 goto exception;
@@ -24043,12 +24065,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             *sp++ = JS_NewCatchOffset(ctx, 0);
             BREAK;
         CASE(OP_iterator_get_value_done):
+            /* 从迭代器结果对象提取 {value, done} 属性
+             * 栈操作：result_obj → value done
+             * 调用 js_iterator_get_value_done 解构迭代器返回值 */
             sf->cur_pc = pc;
             if (js_iterator_get_value_done(ctx, sp))
                 goto exception;
             sp += 1;
             BREAK;
         CASE(OP_iterator_check_object):
+            /* 验证迭代器返回值必须是对象类型
+             * 符合 ECMAScript 规范：IteratorResult 必须是对象
+             * 如果非对象则抛出 TypeError */
             if (unlikely(!JS_IsObject(sp[-1]))) {
                 JS_ThrowTypeError(ctx, "iterator must return an object");
                 goto exception;
@@ -24056,7 +24084,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_iterator_close):
-            /* iter_obj next catch_offset -> */
+            /* 关闭迭代器：在循环提前退出时调用 iterator.return()
+             * 栈操作：iter_obj next catch_offset → (empty)
+             * 1. 丢弃 catch offset（避免被异常捕获）
+             * 2. 释放 next 方法引用
+             * 3. 如果 iter_obj 非 undefined，调用 JS_IteratorClose 关闭迭代器
+             * 用于 for-of 循环的 break/continue/异常退出场景 */
             sp--; /* drop the catch offset to avoid getting caught by exception */
             JS_FreeValue(ctx, sp[-1]); /* drop the next method */
             sp--;
@@ -24069,6 +24102,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp--;
             BREAK;
         CASE(OP_nip_catch):
+            /* 清理 catch 块栈帧：移除 catch_offset 及其下方的所有值，保留返回值
+             * 栈操作：catch_offset ... values ret_val → ret_val
+             * 用于异常处理后清理栈帧，只保留最终返回值
+             * 循环释放 catch_offset 上方的所有值，直到找到 catch 标记 */
             {
                 JSValue ret_val;
                 /* catch_offset ... ret_val -> ret_eval */
@@ -24087,7 +24124,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_iterator_next):
-            /* stack: iter_obj next catch_offset val */
+            /* 调用迭代器的 next 方法：iterator.next(value)
+             * 栈操作：iter_obj next catch_offset val → iter_obj next catch_offset result
+             * sp[-3] = next 方法，sp[-4] = iter_obj，sp[-1] = 传递给 next 的值
+             * 用于 for-of 循环中获取下一个迭代值 */
             {
                 JSValue ret;
                 sf->cur_pc = pc;
@@ -24101,7 +24141,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_iterator_call):
-            /* stack: iter_obj next catch_offset val */
+            /* 调用迭代器的 return/throw 方法：用于迭代器关闭或异常传播
+             * 栈操作：iter_obj next catch_offset val → iter_obj next catch_offset result method_not_found_flag
+             * flags 参数：
+             *   bit 0: 0=调用 return 方法，1=调用 throw 方法
+             *   bit 1: 0=带参数调用，1=无参数调用
+             * 如果方法不存在 (undefined/null)，返回 TRUE 标志表示使用默认行为 */
             {
                 JSValue method, ret;
                 BOOL ret_flag;
@@ -25225,6 +25270,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
 
+/* 比较运算宏：生成各种比较操作码的实现
+ * 快速路径：两个操作数都是整数时直接比较
+ * 慢速路径：调用相应的 slow 函数处理浮点数、字符串、对象等
+ * 
+ * 生成的操作码：
+ * - OP_lt / OP_lte / OP_gt / OP_gte: 关系比较 (<, <=, >, >=)
+ * - OP_eq / OP_neq: 宽松相等/不等 (==, !=)，执行类型转换
+ * - OP_strict_eq / OP_strict_neq: 严格相等/不等 (===, !==)，无类型转换
+ */
 #define OP_CMP(opcode, binary_op, slow_call)              \
             CASE(opcode):                                 \
                 {                                         \
@@ -25232,9 +25286,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 op1 = sp[-2];                             \
                 op2 = sp[-1];                                   \
                 if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
+                    /* 快速路径：整数直接比较 */          \
                     sp[-2] = JS_NewBool(ctx, JS_VALUE_GET_INT(op1) binary_op JS_VALUE_GET_INT(op2)); \
                     sp--;                                               \
                 } else {                                                \
+                    /* 慢速路径：处理其他类型 */          \
                     sf->cur_pc = pc;                                    \
                     if (slow_call)                                      \
                         goto exception;                                 \
@@ -25253,24 +25309,38 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
 
         CASE(OP_in):
+            /* in 操作符：prop in obj，检查属性是否存在于对象中
+             * 栈操作：prop obj → boolean
+             * 调用 js_operator_in 处理原型链查找 */
             sf->cur_pc = pc;
             if (js_operator_in(ctx, sp))
                 goto exception;
             sp--;
             BREAK;
         CASE(OP_private_in):
+            /* #private in obj：检查私有字段是否存在于对象中
+             * 栈操作：private_name obj → boolean
+             * 用于 ES2022 私有字段检查语法 */
             sf->cur_pc = pc;
             if (js_operator_private_in(ctx, sp))
                 goto exception;
             sp--;
             BREAK;
         CASE(OP_instanceof):
+            /* instanceof 操作符：obj instanceof Constructor
+             * 栈操作：obj constructor → boolean
+             * 检查对象的原型链是否包含构造函数的 prototype
+             * 调用 js_operator_instanceof 处理 Symbol.hasInstance */
             sf->cur_pc = pc;
             if (js_operator_instanceof(ctx, sp))
                 goto exception;
             sp--;
             BREAK;
         CASE(OP_typeof):
+            /* typeof 操作符：返回操作数的类型字符串
+             * 栈操作：value → type_string
+             * 返回："undefined"|"boolean"|"number"|"string"|"function"|"object"|"symbol"|"bigint"
+             * 特殊处理：typeof null === "object" (历史遗留 bug) */
             {
                 JSValue op1;
                 JSAtom atom;
@@ -25282,12 +25352,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_delete):
+            /* delete 操作符：删除对象的属性
+             * 栈操作：obj prop → boolean
+             * 返回 true 表示删除成功或属性不存在
+             * 返回 false 表示属性不可配置 (不可删除) */
             sf->cur_pc = pc;
             if (js_operator_delete(ctx, sp))
                 goto exception;
             sp--;
             BREAK;
         CASE(OP_delete_var):
+            /* delete 变量：删除全局变量 (仅限 var 声明)
+             * 参数：atom (变量名)
+             * 栈操作：→ boolean
+             * 注意：let/const 声明的变量不可删除
+             * 严格模式下删除变量会抛出错误 */
             {
                 JSAtom atom;
                 int ret;
@@ -25304,6 +25383,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_to_object):
+            /* ToObject 转换：将原始类型转换为包装对象
+             * 栈操作：value → Object(value)
+             * 转换规则：
+             *   - number → Number
+             *   - string → String
+             *   - boolean → Boolean
+             *   - symbol → Symbol
+             *   - bigint → BigInt
+             *   - null/undefined → TypeError
+             *   - object → 直接返回
+             * 用于属性访问前的隐式转换 */
             if (JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_OBJECT) {
                 sf->cur_pc = pc;
                 ret_val = JS_ToObject(ctx, sp[-1]);
@@ -25315,12 +25405,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_to_propkey):
+            /* ToPropertyKey 转换：将值转换为属性键 (string 或 symbol)
+             * 栈操作：value → property_key
+             * ECMAScript 规范操作：ToPropertyKey
+             * 快速路径：如果已经是 int/string/symbol 则无需转换
+             * 慢速路径：调用 JS_ToPropertyKey 执行 ToPrimitive + ToString/Symbol 转换 */
             switch (JS_VALUE_GET_TAG(sp[-1])) {
             case JS_TAG_INT:
             case JS_TAG_STRING:
             case JS_TAG_SYMBOL:
+                /* 已经是有效的属性键类型，无需转换 */
                 break;
             default:
+                /* 需要转换为属性键 */
                 sf->cur_pc = pc;
                 ret_val = JS_ToPropertyKey(ctx, sp[-1]);
                 if (JS_IsException(ret_val))
@@ -25347,6 +25444,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_with_delete_var):
         CASE(OP_with_make_ref):
         CASE(OP_with_get_ref):
+            /* with 语句变量操作族：处理 with 块内的变量访问
+             * with 语句创建对象环境记录，属性访问优先在 with 对象上查找
+             * 参数：atom (属性名), diff (跳转偏移), is_with (是否检查 unscopable)
+             * 栈操作：obj → obj (保留或丢弃取决于是否找到属性)
+             * 
+             * 操作码变体：
+             * - OP_with_get_var: 获取变量值
+             * - OP_with_put_var: 设置变量值
+             * - OP_with_delete_var: 删除变量
+             * - OP_with_make_ref: 创建引用 (obj/propname 对)
+             * - OP_with_get_ref: 获取引用 (obj/method 对)
+             * 
+             * unscopable 检查：某些属性名被标记为不可在 with 中使用 */
             {
                 JSAtom atom;
                 int32_t diff;
@@ -25364,6 +25474,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
                 if (ret) {
                     if (is_with) {
+                        /* 检查属性是否在 Symbol.unscopables 中，如果是则跳过 with 查找 */
                         ret = js_has_unscopable(ctx, obj, atom);
                         if (unlikely(ret < 0))
                             goto exception;
@@ -25445,25 +25556,44 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_await):
+            /* await 表达式：暂停异步函数直到 Promise 解决
+             * 设置返回类型为 FUNC_RET_AWAIT，跳转到生成器退出流程
+             * 用于 async/await 语法糖的底层实现 */
             ret_val = JS_NewInt32(ctx, FUNC_RET_AWAIT);
             goto done_generator;
         CASE(OP_yield):
+            /* yield 表达式：暂停生成器并返回值给调用者
+             * 设置返回类型为 FUNC_RET_YIELD，保存当前执行状态
+             * 下次调用 next() 时从断点处恢复执行 */
             ret_val = JS_NewInt32(ctx, FUNC_RET_YIELD);
             goto done_generator;
         CASE(OP_yield_star):
         CASE(OP_async_yield_star):
+            /* yield* 表达式：委托给另一个迭代器/异步迭代器
+             * 设置返回类型为 FUNC_RET_YIELD_STAR
+             * 将外层生成器的控制权暂时交给内层迭代器
+             * async_yield_star 用于 async generator 场景 */
             ret_val = JS_NewInt32(ctx, FUNC_RET_YIELD_STAR);
             goto done_generator;
         CASE(OP_return_async):
+            /* 异步函数返回：返回 undefined 作为完成信号
+             * 用于 async 函数正常结束时的清理流程 */
             ret_val = JS_UNDEFINED;
             goto done_generator;
         CASE(OP_initial_yield):
+            /* 生成器初始 yield：标记生成器首次执行
+             * 设置返回类型为 FUNC_RET_INITIAL_YIELD
+             * 用于处理生成器启动时的特殊状态 */
             ret_val = JS_NewInt32(ctx, FUNC_RET_INITIAL_YIELD);
             goto done_generator;
 
         CASE(OP_nop):
             BREAK;
         CASE(OP_is_undefined_or_null):
+            /* 类型检查：value === null || value === undefined
+             * 栈操作：value → boolean
+             * 快速路径：直接检查 tag 是否为 JS_TAG_UNDEFINED 或 JS_TAG_NULL
+             * 用于可选链、空值合并等操作的底层实现 */
             if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_UNDEFINED ||
                 JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_NULL) {
                 goto set_true;
@@ -25472,12 +25602,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
 #if SHORT_OPCODES
         CASE(OP_is_undefined):
+            /* 类型检查：value === undefined (短操作码优化版) */
             if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_UNDEFINED) {
                 goto set_true;
             } else {
                 goto free_and_set_false;
             }
         CASE(OP_is_null):
+            /* 类型检查：value === null (短操作码优化版) */
             if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_NULL) {
                 goto set_true;
             } else {
@@ -25485,13 +25617,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             /* XXX: could merge to a single opcode */
         CASE(OP_typeof_is_undefined):
-            /* different from OP_is_undefined because of isHTMLDDA */
+            /* typeof 检查：typeof value === 'undefined'
+             * 与 OP_is_undefined 的区别：处理 isHTMLDDA 特殊情况
+             * 某些宿主对象可能有特殊的 typeof 行为 */
             if (js_operator_typeof(ctx, sp[-1]) == JS_ATOM_undefined) {
                 goto free_and_set_true;
             } else {
                 goto free_and_set_false;
             }
         CASE(OP_typeof_is_function):
+            /* typeof 检查：typeof value === 'function'
+             * 用于快速判断函数类型 */
             if (js_operator_typeof(ctx, sp[-1]) == JS_ATOM_function) {
                 goto free_and_set_true;
             } else {
@@ -25501,9 +25637,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, sp[-1]);
 #endif
         set_true:
+            /* 设置结果为 true：释放原值，压入 JS_TRUE */
             sp[-1] = JS_TRUE;
             BREAK;
         free_and_set_false:
+            /* 设置结果为 false：释放原值，压入 JS_FALSE */
             JS_FreeValue(ctx, sp[-1]);
             sp[-1] = JS_FALSE;
             BREAK;
