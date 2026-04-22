@@ -15124,6 +15124,31 @@ static js_limb_t mp_shr(js_limb_t *tab_r, const js_limb_t *tab, int n,
     return l & (((js_limb_t)1 << shift) - 1);
 }
 
+/* =============================================================================
+   js_bigint_new: 创建新的 BigInt 对象
+   =============================================================================
+   功能：分配并初始化一个新的 BigInt 对象
+   
+   参数：
+   - ctx: JS 上下文（用于内存分配和错误处理）
+   - len: limb 个数（大整数的位数）
+   
+   返回：新创建的 BigInt 指针，失败返回 NULL
+   
+   安全检查：
+   - 若 len > JS_BIGINT_MAX_SIZE（约 100 万位），抛出 RangeError
+   - 防止恶意代码分配超大整数导致 OOM
+   
+   内存布局：
+   +------------------+------------------+
+   | JSBigInt 头部    | tab[len] 数据    |
+   | (ref_count, len) | (limb 数组)      |
+   +------------------+------------------+
+   
+   引用计数：初始化为 1（新对象）
+   
+   时间复杂度：O(1) 分配，O(len) 清零（取决于 malloc 实现）
+   ============================================================================= */
 static JSBigInt *js_bigint_new(JSContext *ctx, int len)
 {
     JSBigInt *r;
@@ -15139,6 +15164,25 @@ static JSBigInt *js_bigint_new(JSContext *ctx, int len)
     return r;
 }
 
+/* =============================================================================
+   js_bigint_set_si: 设置短大整数（有符号单字）
+   =============================================================================
+   功能：将预分配的缓冲区初始化为有符号短大整数
+   
+   参数：
+   - buf: 预分配的 BigInt 缓冲区（通常在栈上）
+   - a: 有符号整数值（js_slimb_t，通常 32 或 64 位）
+   
+   返回：初始化后的 BigInt 指针
+   
+   用途：
+   - 快速创建小的 BigInt 值，无需动态分配
+   - 用于中间计算结果的临时存储
+   
+   引用计数：设为 0（栈上对象，不需要释放）
+   
+   时间复杂度：O(1)
+   ============================================================================= */
 static JSBigInt *js_bigint_set_si(JSBigIntBuf *buf, js_slimb_t a)
 {
     JSBigInt *r = (JSBigInt *)buf->big_int_buf;
@@ -15148,6 +15192,28 @@ static JSBigInt *js_bigint_set_si(JSBigIntBuf *buf, js_slimb_t a)
     return r;
 }
 
+/* =============================================================================
+   js_bigint_set_si64: 设置短大整数（有符号 64 位）
+   =============================================================================
+   功能：将预分配的缓冲区初始化为 64 位有符号整数
+   
+   参数：
+   - buf: 预分配的 BigInt 缓冲区
+   - a: 64 位有符号整数值
+   
+   返回：初始化后的 BigInt 指针
+   
+   实现策略（根据字长自适应）：
+   
+   情况 1：JS_LIMB_BITS == 64
+   - 直接调用 js_bigint_set_si（一个字就够了）
+   
+   情况 2：JS_LIMB_BITS == 32
+   - 若 a 在 32 位范围内：用 1 个 limb 存储
+   - 否则：用 2 个 limb 存储（低 32 位 + 高 32 位）
+   
+   时间复杂度：O(1)
+   ============================================================================= */
 static JSBigInt *js_bigint_set_si64(JSBigIntBuf *buf, int64_t a)
 {
 #if JS_LIMB_BITS == 64
@@ -15262,6 +15328,34 @@ static JSBigInt *js_bigint_new_di(JSContext *ctx, js_sdlimb_t a)
     return r;
 }
 
+/* =============================================================================
+   js_bigint_normalize1: BigInt 规范化（去除冗余高位）
+   =============================================================================
+   功能：去除 BigInt 高位的冗余 limb，压缩存储空间
+   
+   参数：
+   - ctx: JS 上下文
+   - a: 待规范化的 BigInt（引用计数必须为 1）
+   - l: 当前有效长度
+   
+   返回：规范化后的 BigInt（可能被 realloc 缩小）
+   
+   冗余判断规则（补码表示）：
+   - 正数：高位为 0 是冗余的（如 0x00000001 可压缩为 0x01）
+   - 负数：高位为 -1（全 1）是冗余的（如 0xFFFFFFFF 可压缩为 0xFF）
+   - 符号位检查：高位的符号必须与次高位一致
+   
+   具体条件：
+   - v != 0 && v != -1：高位既不是全 0 也不是全 1，必须保留
+   - (v & 1) != (a->tab[l-2] >> (JS_LIMB_BITS-1))：符号位不一致，必须保留
+   
+   为什么需要规范化？
+   - 运算过程中可能产生冗余高位（如加法进位后）
+   - 节省内存，提高后续运算效率
+   - 确保数值表示的唯一性
+   
+   时间复杂度：O(n) 扫描，可能 O(n) realloc
+   ============================================================================= */
 /* Remove redundant high order limbs. Warning: 'a' may be
    reallocated. Can never fail.
 */
@@ -15280,7 +15374,7 @@ static JSBigInt *js_bigint_normalize1(JSContext *ctx, JSBigInt *a, int l)
     }
     if (l != a->len) {
         JSBigInt *a1;
-        /* realloc to reduce the size */
+        /* realloc to reduce the size - 重新分配以缩小空间 */
         a->len = l;
         a1 = js_realloc(ctx, a, sizeof(JSBigInt) + l * sizeof(js_limb_t));
         if (a1)
@@ -15289,17 +15383,72 @@ static JSBigInt *js_bigint_normalize1(JSContext *ctx, JSBigInt *a, int l)
     return a;
 }
 
+/* =============================================================================
+   js_bigint_normalize: BigInt 规范化（便捷封装）
+   =============================================================================
+   功能：调用 js_bigint_normalize1 规范化整个 BigInt
+   
+   参数：
+   - ctx: JS 上下文
+   - a: 待规范化的 BigInt
+   
+   返回：规范化后的 BigInt
+   
+   这是 js_bigint_normalize1 的便捷封装，使用完整的 a->len 作为长度
+   ============================================================================= */
 static JSBigInt *js_bigint_normalize(JSContext *ctx, JSBigInt *a)
 {
     return js_bigint_normalize1(ctx, a, a->len);
 }
 
+/* =============================================================================
+   js_bigint_sign: 获取 BigInt 的符号位
+   =============================================================================
+   功能：返回 BigInt 的符号（0=正，1=负）
+   
+   参数：a - 输入 BigInt
+   
+   返回：0 或 1
+   
+   原理：
+   - 补码表示中，最高位的最高位是符号位
+   - 右移 JS_LIMB_BITS-1 位，将符号位移到最低位
+   
+   例如（32 位系统）：
+   - 0x7FFFFFFF >> 31 = 0（正数）
+   - 0xFFFFFFFF >> 31 = 1（负数）
+   
+   时间复杂度：O(1)
+   ============================================================================= */
 /* return 0 or 1 depending on the sign */
 static inline int js_bigint_sign(const JSBigInt *a)
 {
     return a->tab[a->len - 1] >> (JS_LIMB_BITS - 1);
 }
 
+/* =============================================================================
+   js_bigint_get_si_sat: BigInt 到有符号整数的饱和转换
+   =============================================================================
+   功能：将 BigInt 转换为有符号整数，超出范围时饱和截断
+   
+   参数：a - 输入 BigInt
+   
+   返回：
+   - 若 a 在范围内：返回实际值
+   - 若 a 太大：返回对应字长的最大值（INT32_MAX 或 INT64_MAX）
+   - 若 a 太小：返回对应字长的最小值（INT32_MIN 或 INT64_MIN）
+   
+   饱和转换规则：
+   - len == 1：直接返回（一定在范围内）
+   - len > 1 且为负：返回最小值
+   - len > 1 且为正：返回最大值
+   
+   用途：
+   - 将 BigInt 转换回普通整数时使用
+   - 防止溢出导致未定义行为
+   
+   时间复杂度：O(1)
+   ============================================================================= */
 static js_slimb_t js_bigint_get_si_sat(const JSBigInt *a)
 {
     if (a->len == 1) {
@@ -15319,6 +15468,32 @@ static js_slimb_t js_bigint_get_si_sat(const JSBigInt *a)
     }
 }
 
+/* =============================================================================
+   js_bigint_extend: BigInt 扩展（添加一个 limb）
+   =============================================================================
+   功能：在 BigInt 高位添加一个新的 limb，若冗余则规范化
+   
+   参数：
+   - ctx: JS 上下文
+   - r: 待扩展的 BigInt（引用计数必须为 1）
+   - op1: 要添加的高位 limb 值
+   
+   返回：扩展后的 BigInt，失败返回 NULL
+   
+   逻辑：
+   - 若 op1 是有效高位（非冗余）：realloc 扩大数组，添加 op1
+   - 若 op1 是冗余的：调用 normalize 压缩数组
+   
+   冗余判断（与 normalize 相同）：
+   - 有效：op1 != 0 && op1 != -1，或符号位不一致
+   - 冗余：否则
+   
+   用途：
+   - 运算过程中动态扩展 BigInt
+   - 处理进位导致的高位增长
+   
+   时间复杂度：O(1) 或 O(n)（若需 realloc）
+   ============================================================================= */
 /* add the op1 limb */
 static JSBigInt *js_bigint_extend(JSContext *ctx, JSBigInt *r,
                                   js_limb_t op1)
@@ -15337,12 +15512,54 @@ static JSBigInt *js_bigint_extend(JSContext *ctx, JSBigInt *r,
         r->len = n2 + 1;
         r->tab[n2] = op1;
     } else {
-        /* otherwise still need to normalize the result */
+        /* otherwise still need to normalize the result - 否则仍需规范化 */
         r = js_bigint_normalize(ctx, r);
     }
     return r;
 }
 
+/* =============================================================================
+   js_bigint_add: BigInt 加法/减法
+   =============================================================================
+   功能：计算 a + b（b_neg=0）或 a - b（b_neg=1）
+   
+   参数：
+   - ctx: JS 上下文
+   - a: 第一个操作数
+   - b: 第二个操作数
+   - b_neg: 0=加法，1=减法
+   
+   返回：结果 BigInt，失败返回 NULL
+   
+   算法原理（补码加减法统一处理）：
+   
+   1. 分配结果空间：max(a->len, b->len) 个 limb
+   
+   2. 公共部分（两个操作数都有的低位）：
+      - op2 = b->tab[i] ^ (-b_neg)
+        - 若 b_neg=0（加法）：op2 = b->tab[i]（不变）
+        - 若 b_neg=1（减法）：op2 = ~b->tab[i]（取反）
+      - carry 初始 = b_neg（减法时初始进位为 1，实现补码）
+      - 使用 ADDC 计算：r = op1 + op2 + carry
+   
+   3. 符号扩展部分（较长操作数的高位）：
+      - 若 a 更长：r[i] = a[i] + b_sign + carry
+        - b_sign = (-sign(b)) ^ (-b_neg)
+        - 加法：b_sign = -sign(b)（符号扩展）
+        - 减法：b_sign = -sign(b) ^ 1（取反后符号扩展）
+      - 若 b 更长：r[i] = a_sign + op2 + carry
+   
+   4. 最终进位处理（代码后续部分）：
+      - 若有进位：调用 js_bigint_extend 扩展高位
+   
+   为什么用异或和取反？
+   - 补码减法：a - b = a + (~b) + 1
+   - -b_neg：若 b_neg=1，则 -1 的二进制是全 1
+   - x ^ (-1) = ~x（按位取反）
+   - x ^ 0 = x（不变）
+   
+   时间复杂度：O(max(a->len, b->len))
+   ============================================================================= */
 /* return NULL in case of error. Compute a + b (b_neg = 0) or a - b
    (b_neg = 1) */
 /* XXX: optimize */
@@ -15359,16 +15576,16 @@ static JSBigInt *js_bigint_add(JSContext *ctx, const JSBigInt *a,
     if (!r)
         return NULL;
     /* XXX: optimize */
-    /* common part */
+    /* common part - 公共部分（两数重叠的低位）*/
     carry = b_neg;
     for(i = 0; i < n1; i++) {
         op1 = a->tab[i];
-        op2 = b->tab[i] ^ (-b_neg);
+        op2 = b->tab[i] ^ (-b_neg);  /* 减法时取反 */
         ADDC(r->tab[i], carry, op1, op2, carry);
     }
     a_sign = -js_bigint_sign(a);
     b_sign = (-js_bigint_sign(b)) ^ (-b_neg);
-    /* part with sign extension of one operand  */
+    /* part with sign extension of one operand - 符号扩展部分 */
     if (a->len > b->len) {
         for(i = n1; i < n2; i++) {
             op1 = a->tab[i];
@@ -15382,19 +15599,63 @@ static JSBigInt *js_bigint_add(JSContext *ctx, const JSBigInt *a,
     }
 
     /* part with sign extension for both operands. Extend the result
-       if necessary */
+       if necessary - 双符号扩展部分，必要时扩展结果 */
     return js_bigint_extend(ctx, r, a_sign + b_sign + carry);
 }
 
+/* =============================================================================
+   js_bigint_neg: BigInt 取负
+   =============================================================================
+   功能：计算 -a（相反数）
+   
+   参数：
+   - ctx: JS 上下文
+   - a: 输入 BigInt
+   
+   返回：-a，失败返回 NULL
+   
+   实现技巧：
+   - 利用 js_bigint_add 实现：-a = 0 - a = 0 + (~a) + 1
+   - b_neg=1 表示减法模式
+   
+   时间复杂度：O(a->len)
+   ============================================================================= */
 /* XXX: optimize */
 static JSBigInt *js_bigint_neg(JSContext *ctx, const JSBigInt *a)
 {
     JSBigIntBuf buf;
     JSBigInt *b;
-    b = js_bigint_set_si(&buf, 0);
-    return js_bigint_add(ctx, b, a, 1);
+    b = js_bigint_set_si(&buf, 0);  /* b = 0 */
+    return js_bigint_add(ctx, b, a, 1);  /* 0 - a */
 }
 
+/* =============================================================================
+   js_bigint_mul: BigInt 乘法
+   =============================================================================
+   功能：计算 a × b
+   
+   参数：
+   - ctx: JS 上下文
+   - a: 第一个乘数
+   - b: 第二个乘数
+   
+   返回：a × b，失败返回 NULL
+   
+   算法：
+   1. 分配结果空间：a->len + b->len 个 limb（最大可能位数）
+   2. 调用 mp_mul_basecase 计算无符号乘法
+   3. 修正负数操作数的影响：
+      - 若 a 为负：从高 a->len 位减去 b（相当于减去 |a|×b 的多余部分）
+      - 若 b 为负：从高 b->len 位减去 a
+   4. 规范化结果（去除冗余高位）
+   
+   为什么需要修正？
+   - mp_mul_basecase 按无符号数计算
+   - 补码负数的高位是全 1，乘法后会产生额外的"污染"
+   - 需要减去这些多余的部分
+   
+   时间复杂度：O(a->len × b->len)
+   ============================================================================= */
 static JSBigInt *js_bigint_mul(JSContext *ctx, const JSBigInt *a,
                                const JSBigInt *b)
 {
@@ -15405,7 +15666,7 @@ static JSBigInt *js_bigint_mul(JSContext *ctx, const JSBigInt *a,
         return NULL;
     mp_mul_basecase(r->tab, a->tab, a->len, b->tab, b->len);
     /* correct the result if negative operands (no overflow is
-       possible) */
+       possible) - 修正负数操作数的影响 */
     if (js_bigint_sign(a))
         mp_sub(r->tab + a->len, r->tab + a->len, b->tab, b->len, 0);
     if (js_bigint_sign(b))
