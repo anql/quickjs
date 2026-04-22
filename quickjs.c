@@ -16497,102 +16497,141 @@ static JSBigInt *js_bigint_from_string(JSContext *ctx,
     if (radix == 10) {
         int digits_per_limb = JS_LIMB_DIGITS;
         len = 1;
+        /* 非 2 的幂次进制：需要逐位乘法累加 */
         r->tab[0] = 0;
         for(;;) {
-            /* XXX: slow */
+            /* XXX: slow - 这里性能较差，每次处理 digits_per_limb 个十进制位 */
             v = 0;
+            /* 每次从字符串中读取 digits_per_limb 个数字，合并成一个整数值 v */
             for(i = 0; i < digits_per_limb; i++) {
-                c = to_digit(*p);
-                if (c >= radix)
+                c = to_digit(*p);  /* 将字符转换为数字值 */
+                if (c >= radix)    /* 超出进制范围则停止 */
                     break;
                 p++;
-                v = v * 10 + c;
+                v = v * 10 + c;    /* 累加：v = v * 10 + 新数字 */
             }
-            if (i == 0)
+            if (i == 0)  /* 没有读取到任何有效数字，结束 */
                 break;
             if (len == 1 && r->tab[0] == 0) {
+                /* 特殊情况：当前结果为 0，直接赋值 */
                 r->tab[0] = v;
             } else {
+                /* 一般情况：r = r * (10^digits_per_limb) + v */
+                /* js_pow_dec[i] 预计算了 10^(digits_per_limb*i) */
                 h = mp_mul1(r->tab, r->tab, len, js_pow_dec[i], v);
                 if (h != 0) {
+                    /* 如果有进位，扩展结果长度 */
                     r->tab[len++] = h;
                 }
             }
         }
-        /* add one extra limb to have the correct sign*/
+        /* 添加一个额外的 limb 以确保符号位正确（避免最高位被误解释为符号位）*/
         if ((r->tab[len - 1] >> (JS_LIMB_BITS - 1)) != 0)
             r->tab[len++] = 0;
         r->len = len;
     } else {
+        /* 2 的幂次进制（如 2、4、8、16 等）：无需乘法，直接位操作 */
         unsigned int bit_pos, shift, pos;
         
-        /* power of two base: no multiplication is needed */
-        r->len = n_limbs;
-        memset(r->tab, 0, sizeof(r->tab[0]) * n_limbs);
+        r->len = n_limbs;  /* 预先计算需要的 limb 数量 */
+        memset(r->tab, 0, sizeof(r->tab[0]) * n_limbs);  /* 清零 */
         for(i = 0; i < n_digits; i++) {
+            /* 从字符串末尾向前处理每个数字 */
             c = to_digit(p[n_digits - 1 - i]);
-            assert(c < radix);
-            bit_pos = i * log2_radix;
-            shift = bit_pos & (JS_LIMB_BITS - 1);
-            pos = bit_pos / JS_LIMB_BITS;
+            assert(c < radix);  /* 确保数字在合法范围内 */
+            
+            /* 计算该数字应该放置的位位置 */
+            bit_pos = i * log2_radix;  /* 第 i 个数字占据的起始位 */
+            shift = bit_pos & (JS_LIMB_BITS - 1);  /* 在当前 limb 内的偏移 */
+            pos = bit_pos / JS_LIMB_BITS;  /* 所在的 limb 索引 */
+            
+            /* 将数字 c 放置到对应位置 */
             r->tab[pos] |= c << shift;
-            /* if log2_radix does not divide JS_LIMB_BITS, needed an
-               additional op */
+            
+            /* 如果跨越了 limb 边界，需要额外处理高位部分 */
+            /* 例如：当 JS_LIMB_BITS=64，log2_radix=8（16 进制），shift=60 时，
+               c 的 8 位中有 4 位会跨越到下一个 limb */
             if (shift + log2_radix > JS_LIMB_BITS) {
                 r->tab[pos + 1] |= c >> (JS_LIMB_BITS - shift);
             }
         }
     }
+    
+    /* 规范化结果：移除前导零 limb */
     r = js_bigint_normalize(ctx, r);
-    /* XXX: could do it in place */
+    
+    /* 处理负号：如果是负数，对结果取反 */
+    /* XXX: could do it in place - 理论上可以原地取反优化 */
     if (is_neg) {
         JSBigInt *r1;
-        r1 = js_bigint_neg(ctx, r);
-        js_free(ctx, r);
+        r1 = js_bigint_neg(ctx, r);  /* 计算 -r */
+        js_free(ctx, r);             /* 释放原结果 */
         r = r1;
     }
     return r;
 }
 
-/* 2 <= base <= 36 */
+/* 进制转换用的数字字符表：支持 2-36 进制 */
+/* 0-9 对应 '0'-'9'，10-35 对应 'a'-'z' */
 static char const digits[36] = "0123456789abcdefghijklmnopqrstuvwxyz";
 
-/* special version going backwards */
-/* XXX: use dtoa.c */
+/**
+ * 将 64 位无符号整数转换为指定进制的字符串
+ * @param q 输出缓冲区的末尾位置（从后向前填充）
+ * @param n 要转换的数值
+ * @param base 进制（2-36）
+ * @return 转换后字符串的起始位置
+ * 
+ * 特殊优化：当 base=10 时，编译器可以将除法和取模优化为乘法
+ */
+/* special version going backwards - 从后向前填充，避免字符串反转 */
+/* XXX: use dtoa.c - 可以考虑复用 dtoa.c 中的实现 */
 static char *js_u64toa(char *q, int64_t n, unsigned int base)
 {
     int digit;
     if (base == 10) {
-        /* division by known base uses multiplication */
+        /* 十进制特殊情况：除以已知常数可用乘法优化 */
         do {
-            digit = (uint64_t)n % 10;
-            n = (uint64_t)n / 10;
-            *--q = '0' + digit;
+            digit = (uint64_t)n % 10;  /* 取最低位数字 */
+            n = (uint64_t)n / 10;       /* 去掉最低位 */
+            *--q = '0' + digit;         /* 从后向前写入字符 */
         } while (n != 0);
     } else {
+        /* 其他进制：通用算法 */
         do {
-            digit = (uint64_t)n % base;
-            n = (uint64_t)n / base;
-            *--q = digits[digit];
+            digit = (uint64_t)n % base;  /* 取最低位数字 */
+            n = (uint64_t)n / base;       /* 去掉最低位 */
+            *--q = digits[digit];         /* 查表转换为字符 */
         } while (n != 0);
     }
-    return q;
+    return q;  /* 返回字符串起始位置 */
 }
 
+/**
+ * 将 js_limb_t 类型的数值转换为固定长度的进制字符串
+ * @param q 输出缓冲区的末尾位置
+ * @param n 要转换的数值
+ * @param radix 进制（2-36）
+ * @param len 输出字符串的固定长度（不足补前导零）
+ * @return 转换后字符串的起始位置
+ * 
+ * 用于 BigInt 多精度数转换时，每个 limb 转换为固定长度的字符串段
+ */
 /* len >= 1. 2 <= radix <= 36 */
 static char *limb_to_a(char *q, js_limb_t n, unsigned int radix, int len)
 {
     int digit, i;
 
     if (radix == 10) {
-        /* specific case with constant divisor */
-        /* XXX: optimize */
+        /* 十进制特殊情况：常数除数可优化 */
+        /* XXX: optimize - 可进一步优化性能 */
         for(i = 0; i < len; i++) {
             digit = (js_limb_t)n % 10;
             n = (js_limb_t)n / 10;
             *--q = digit + '0';
         }
     } else {
+        /* 其他进制：通用算法 */
         for(i = 0; i < len; i++) {
             digit = (js_limb_t)n % radix;
             n = (js_limb_t)n / radix;
@@ -16604,6 +16643,19 @@ static char *limb_to_a(char *q, js_limb_t n, unsigned int radix, int len)
 
 #define JS_RADIX_MAX 36
 
+/**
+ * 每个 limb 能容纳的十进制位数表（针对 2-36 进制）
+ * 索引 = radix - 2，例如索引 0 对应 2 进制，索引 8 对应 10 进制
+ * 
+ * 计算公式：digits_per_limb = floor(JS_LIMB_BITS / log2(radix))
+ * 
+ * 例如 64 位系统下：
+ * - 2 进制：64/1 = 64 位/limb
+ * - 10 进制：64/log2(10) ≈ 64/3.32 ≈ 19.28，取 19 位/limb
+ * - 16 进制：64/4 = 16 位/limb
+ * 
+ * 用于优化 BigInt 与字符串的转换效率
+ */
 static const uint8_t digits_per_limb_table[JS_RADIX_MAX - 1] = {
 #if JS_LIMB_BITS == 32
 32,20,16,13,12,11,10,10, 9, 9, 8, 8, 8, 8, 8, 7, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
@@ -16612,6 +16664,16 @@ static const uint8_t digits_per_limb_table[JS_RADIX_MAX - 1] = {
 #endif
 };
 
+/**
+ * 各进制的基数表：radix^digits_per_limb
+ * 用于 BigInt 转字符串时的快速除法分块
+ * 
+ * 例如 10 进制（索引 8）：
+ * - 32 位：0x3b9aca00 = 10^9
+ * - 64 位：0x8ac7230489e80000 = 10^19
+ * 
+ * 这样每次可以处理一整个 limb 的十进制数字，而不是逐位处理
+ */
 static const js_limb_t radix_base_table[JS_RADIX_MAX - 1] = {
 #if JS_LIMB_BITS == 32
  0x00000000, 0xcfd41b91, 0x00000000, 0x48c27395,
@@ -16636,10 +16698,24 @@ static const js_limb_t radix_base_table[JS_RADIX_MAX - 1] = {
 #endif
 };
 
+/**
+ * BigInt 转换为指定进制的字符串
+ * @param ctx JS 上下文
+ * @param val BigInt 值（JS_TAG_SHORT_BIG_INT 或 JS_TAG_BIG_INT）
+ * @param radix 进制（2-36）
+ * @return 转换后的 JS 字符串
+ * 
+ * 算法核心思想：
+ * 1. 短 BigInt（64 位内）：直接用 i64toa_radix 转换
+ * 2. 大 BigInt：
+ *    - 2 的幂次进制：直接位提取，无需除法
+ *    - 其他进制：重复除以 radix_base，每次处理一个 limb 的数字块
+ */
 static JSValue js_bigint_to_string1(JSContext *ctx, JSValueConst val, int radix)
 {
+    /* 短 BigInt 情况：直接用优化的 64 位转换函数 */
     if (JS_VALUE_GET_TAG(val) == JS_TAG_SHORT_BIG_INT) {
-        char buf[66];
+        char buf[66];  /* 64 位二进制最多 64 位 + 符号位 + 结束符 */
         int len;
         len = i64toa_radix(buf, JS_VALUE_GET_SHORT_BIG_INT(val), radix);
         return js_new_string8_len(ctx, buf, len);
@@ -16652,113 +16728,180 @@ static JSValue js_bigint_to_string1(JSContext *ctx, JSValueConst val, int radix)
         
         assert(JS_VALUE_GET_TAG(val) == JS_TAG_BIG_INT);
         r = JS_VALUE_GET_PTR(val);
+        
+        /* 特殊情况：值为 0 */
         if (r->len == 1 && r->tab[0] == 0) {
-            /* '0' case */
             return js_new_string8_len(ctx, "0", 1);
         }
+        
+        /* 判断是否为 2 的幂次进制（2,4,8,16,32 等）*/
+        /* 位运算技巧：n & (n-1) == 0 当且仅当 n 是 2 的幂 */
         is_binary_radix = ((radix & (radix - 1)) == 0);
+        
+        /* 获取符号 */
         is_neg = js_bigint_sign(r);
+        
+        /* 如果是负数，先取绝对值 */
         if (is_neg) {
             tmp = js_bigint_neg(ctx, r);
             if (!tmp)
                 return JS_EXCEPTION;
             r = tmp;
         } else if (!is_binary_radix) {
-            /* need to modify 'r' */
+            /* 非 2 的幂次进制需要修改 r，先复制一份 */
+            /* 因为后续要做除法，会破坏原数据 */
             tmp = js_bigint_new(ctx, r->len);
             if (!tmp)
                 return JS_EXCEPTION;
             memcpy(tmp->tab, r->tab, r->len * sizeof(r->tab[0]));
             r = tmp;
         }
+        
+        /* 计算 log2(radix) 的整数部分 */
         log2_radix = 31 - clz32(radix); /* floor(log2(radix)) */
+        
+        /* 计算 BigInt 的有效位数（以 bit 为单位）*/
         n_bits = r->len * JS_LIMB_BITS - js_limb_safe_clz(r->tab[r->len - 1]);
-        /* n_digits is exact only if radix is a power of
-           two. Otherwise it is >= the exact number of digits */
+        
+        /* 估算输出字符串的长度（位数）*/
+        /* 对于 2 的幂次进制，这是精确值；否则是上界 */
         n_digits = (n_bits + log2_radix - 1) / log2_radix;
-        /* XXX: could directly build the JSString */
+        
+        /* 分配输出缓冲区：数字 + 符号位 + 结束符 */
+        /* XXX: could directly build the JSString - 可直接构建 JSString 优化 */
         buf = js_malloc(ctx, n_digits + is_neg + 1);
         if (!buf) {
             js_free(ctx, tmp);
             return JS_EXCEPTION;
         }
+        
+        /* 从缓冲区末尾向前填充（避免字符串反转）*/
         q = buf + n_digits + is_neg + 1;
         *--q = '\0';
         buf_end = q;
+        
         if (!is_binary_radix) {
+            /* 非 2 的幂次进制：重复除法 */
             int len;
             js_limb_t radix_base, v;
-            radix_base = radix_base_table[radix - 2];
+            radix_base = radix_base_table[radix - 2];  /* 获取该进制的基数 */
             len = r->len;
             for(;;) {
-                /* remove leading zero limbs */
+                /* 移除前导零 limb */
                 while (len > 1 && r->tab[len - 1] == 0)
                     len--;
+                
                 if (len == 1 && r->tab[0] < radix_base) {
+                    /* 剩余值小于基数，直接转换最后一个 limb */
                     v = r->tab[0];
                     if (v != 0) {
                         q = js_u64toa(q, v, radix);
                     }
                     break;
                 } else {
+                    /* 一般情况：r = r / radix_base，余数为 v */
+                    /* mp_div1: 多精度除以单精度 */
                     v = mp_div1(r->tab, r->tab, len, radix_base, 0);
+                    /* 将余数 v 转换为固定长度的字符串段 */
                     q = limb_to_a(q, v, radix, digits_per_limb_table[radix - 2]);
                 }
             }
         } else {
+            /* 2 的幂次进制：直接位提取，无需除法 */
             int i, shift;
             unsigned int bit_pos, pos, c;
 
-            /* radix is a power of two */
             for(i = 0; i < n_digits; i++) {
+                /* 计算第 i 个数字对应的位位置 */
                 bit_pos = i * log2_radix;
-                pos = bit_pos / JS_LIMB_BITS;
-                shift = bit_pos % JS_LIMB_BITS;
+                pos = bit_pos / JS_LIMB_BITS;     /* 所在 limb 索引 */
+                shift = bit_pos % JS_LIMB_BITS;   /* limb 内偏移 */
+                
+                /* 提取对应的位段 */
                 c = r->tab[pos] >> shift;
+                
+                /* 如果跨越 limb 边界，需要从下一个 limb 补充高位 */
                 if ((shift + log2_radix) > JS_LIMB_BITS &&
                     (pos + 1) < r->len) {
                     c |= r->tab[pos + 1] << (JS_LIMB_BITS - shift);
                 }
+                
+                /* 掩码提取有效位（例如 16 进制取低 4 位）*/
                 c &= (radix - 1);
                 *--q = digits[c];
             }
         }
+        
+        /* 添加负号 */
         if (is_neg)
             *--q = '-';
-        js_free(ctx, tmp);
-        res = js_new_string8_len(ctx, q, buf_end - q);
-        js_free(ctx, buf);
+        
+        js_free(ctx, tmp);  /* 释放临时副本 */
+        res = js_new_string8_len(ctx, q, buf_end - q);  /* 创建 JS 字符串 */
+        js_free(ctx, buf);   /* 释放临时缓冲区 */
         return res;
     }
 }
 
+/**
+ * 压缩 BigInt：如果可能，将多精度 BigInt 转换为短 BigInt（64 位内）
+ * @param ctx JS 上下文
+ * @param p 要压缩的 BigInt
+ * @return 压缩后的 JS 值（短 BigInt 或原样返回）
+ * 
+ * 优化策略：
+ * - 如果 BigInt 只有 1 个 limb（64 位系统下即 64 位），转换为短 BigInt
+ * - 短 BigInt 直接用 JSValue 的指针域存储数值，无需额外内存分配
+ * - 多 limb 的 BigInt 保持原样
+ */
 /* if possible transform a BigInt to short big and free it, otherwise
    return a normal bigint */
 static JSValue JS_CompactBigInt(JSContext *ctx, JSBigInt *p)
 {
     JSValue res;
     if (p->len == 1) {
+        /* 只有 1 个 limb，可以压缩为短 BigInt */
         res = __JS_NewShortBigInt(ctx, (js_slimb_t)p->tab[0]);
-        js_free(ctx, p);
+        js_free(ctx, p);  /* 释放原多精度结构 */
         return res;
     } else {
+        /* 多 limb，无法压缩，直接返回指针 */
         return JS_MKPTR(JS_TAG_BIG_INT, p);
     }
 }
 
+/* ============== 字符串转数字的解析标志 ============== */
+
+/** 只接受整数，不接受小数点和指数部分 */
 #define ATOD_INT_ONLY        (1 << 0)
+
+/** 接受二进制 (0b/0B) 和八进制 (0o/0O) 前缀，与 0x 并列 */
 /* accept Oo and Ob prefixes in addition to 0x prefix if radix = 0 */
 #define ATOD_ACCEPT_BIN_OCT  (1 << 2)
+
+/** 接受传统八进制表示：0 开头的数字序列（ES Annex B 兼容模式）*/
 /* accept O prefix as octal if radix == 0 and properly formed (Annex B) */
 #define ATOD_ACCEPT_LEGACY_OCTAL  (1 << 4)
+
+/** 接受数字分隔符 _ （如 1_000_000）*/
 /* accept _ between digits as a digit separator */
 #define ATOD_ACCEPT_UNDERSCORES  (1 << 5)
+
+/** 允许后缀覆盖类型（如 'n' 表示 BigInt）*/
 /* allow a suffix to override the type */
 #define ATOD_ACCEPT_SUFFIX    (1 << 6)
+
+/** 类型掩码：提取 ATOD_TYPE_* */
 /* default type */
 #define ATOD_TYPE_MASK        (3 << 7)
+
+/** 默认类型：Float64（普通数字）*/
 #define ATOD_TYPE_FLOAT64     (0 << 7)
+
+/** BigInt 类型 */
 #define ATOD_TYPE_BIG_INT     (1 << 7)
+
+/** 接受符号后的前缀：如 -0x1（负号在 0x 之前）*/
 /* accept -0x1 */
 #define ATOD_ACCEPT_PREFIX_AFTER_SIGN (1 << 10)
 
@@ -16955,11 +17098,34 @@ done:
     goto done;
 }
 
+/* ============== JavaScript 类型转换到数字 ============== */
+
+/**
+ * 类型转换标志枚举
+ * TON_FLAG_NUMBER: 标准 ToNumber，BigInt 会报错
+ * TON_FLAG_NUMERIC: 数值模式，允许 BigInt 通过
+ */
 typedef enum JSToNumberHintEnum {
     TON_FLAG_NUMBER,
     TON_FLAG_NUMERIC,
 } JSToNumberHintEnum;
 
+/**
+ * 将任意 JS 值转换为数字（带类型提示，释放原值）
+ * @param ctx JS 上下文
+ * @param val 要转换的值（调用后原值被释放）
+ * @param flag 转换模式
+ * @return 转换后的数字或异常
+ * 
+ * ECMAScript 规范实现：
+ * - BigInt: 仅在 NUMERIC 模式下允许，NUMBER 模式抛 TypeError
+ * - Object: 先调用 ToPrimitive(HINT_NUMBER)，再递归转换
+ * - String: 解析字符串，允许前导/后置空格
+ * - Symbol: 抛 TypeError（ECMAScript 规范规定）
+ * - undefined: 返回 NaN
+ * - null: 返回 0
+ * - boolean: 返回 0 或 1
+ */
 static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
                                    JSToNumberHintEnum flag)
 {
@@ -16971,31 +17137,37 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
     switch(tag) {
     case JS_TAG_BIG_INT:
     case JS_TAG_SHORT_BIG_INT:
+        /* BigInt 转 Number：仅在 NUMERIC 模式允许 */
         if (flag != TON_FLAG_NUMERIC) {
             JS_FreeValue(ctx, val);
             return JS_ThrowTypeError(ctx, "cannot convert bigint to number");
         }
-        ret = val;
+        ret = val;  /* NUMERIC 模式：直接返回 BigInt */
         break;
     case JS_TAG_FLOAT64:
     case JS_TAG_INT:
     case JS_TAG_EXCEPTION:
+        /* 已经是数字或异常，直接返回 */
         ret = val;
         break;
     case JS_TAG_BOOL:
     case JS_TAG_NULL:
+        /* boolean/null -> 0 或 1 */
         ret = JS_NewInt32(ctx, JS_VALUE_GET_INT(val));
         break;
     case JS_TAG_UNDEFINED:
+        /* undefined -> NaN */
         ret = JS_NAN;
         break;
     case JS_TAG_OBJECT:
+        /* 对象：先转换为原始值（数字提示），再递归处理 */
         val = JS_ToPrimitiveFree(ctx, val, HINT_NUMBER);
         if (JS_IsException(val))
             return JS_EXCEPTION;
         goto redo;
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
+        /* 字符串：解析为数字 */
         {
             const char *str;
             const char *p;
@@ -17006,14 +17178,17 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
             if (!str)
                 return JS_EXCEPTION;
             p = str;
-            p += skip_spaces(p);
+            p += skip_spaces(p);  /* 跳过前导空格 */
+            
             if ((p - str) == len) {
+                /* 空字符串或全空格 -> 0 */
                 ret = JS_NewInt32(ctx, 0);
             } else {
                 int flags = ATOD_ACCEPT_BIN_OCT;
                 ret = js_atof(ctx, p, &p, 0, flags);
                 if (!JS_IsException(ret)) {
-                    p += skip_spaces(p);
+                    p += skip_spaces(p);  /* 跳过后置空格 */
+                    /* 如果有剩余字符，说明格式错误 -> NaN */
                     if ((p - str) != len) {
                         JS_FreeValue(ctx, ret);
                         ret = JS_NAN;
@@ -17024,6 +17199,7 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
         }
         break;
     case JS_TAG_SYMBOL:
+        /* Symbol 不能转数字 */
         JS_FreeValue(ctx, val);
         return JS_ThrowTypeError(ctx, "cannot convert symbol to number");
     default:
@@ -17034,28 +17210,44 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
     return ret;
 }
 
+/**
+ * 标准 ToNumber 转换（释放原值）
+ * 对应 ECMAScript 规范的 ToNumber 抽象操作
+ */
 static JSValue JS_ToNumberFree(JSContext *ctx, JSValue val)
 {
     return JS_ToNumberHintFree(ctx, val, TON_FLAG_NUMBER);
 }
 
+/**
+ * ToNumeric 转换（释放原值）
+ * 允许 BigInt 通过，用于数值运算
+ */
 static JSValue JS_ToNumericFree(JSContext *ctx, JSValue val)
 {
     return JS_ToNumberHintFree(ctx, val, TON_FLAG_NUMERIC);
 }
 
+/**
+ * ToNumeric 转换（保留原值）
+ */
 static JSValue JS_ToNumeric(JSContext *ctx, JSValueConst val)
 {
     return JS_ToNumericFree(ctx, JS_DupValue(ctx, val));
 }
 
+/**
+ * 内部函数：将 JS 值转换为 double（释放原值）
+ * @param pres 输出参数：转换结果
+ * @return 0 成功，-1 失败（异常）
+ */
 static __exception int __JS_ToFloat64Free(JSContext *ctx, double *pres,
                                           JSValue val)
 {
     double d;
     uint32_t tag;
     
-    val = JS_ToNumberFree(ctx, val);
+    val = JS_ToNumberFree(ctx, val);  /* 先转为数字 */
     if (JS_IsException(val))
         goto fail;
     tag = JS_VALUE_GET_NORM_TAG(val);
@@ -17067,7 +17259,7 @@ static __exception int __JS_ToFloat64Free(JSContext *ctx, double *pres,
         d = JS_VALUE_GET_FLOAT64(val);
         break;
     default:
-        abort();
+        abort();  /* 不应该到达这里 */
     }
     *pres = d;
     return 0;
@@ -17076,32 +17268,52 @@ static __exception int __JS_ToFloat64Free(JSContext *ctx, double *pres,
     return -1;
 }
 
+/**
+ * 内联优化版：将 JS 值转换为 double（释放原值）
+ * 快速路径：直接处理 int/float64，避免函数调用开销
+ */
 static inline int JS_ToFloat64Free(JSContext *ctx, double *pres, JSValue val)
 {
     uint32_t tag;
 
     tag = JS_VALUE_GET_TAG(val);
     if (tag <= JS_TAG_NULL) {
+        /* 小整数/布尔/null：直接提取 */
         *pres = JS_VALUE_GET_INT(val);
         return 0;
     } else if (JS_TAG_IS_FLOAT64(tag)) {
+        /* 已经是 float64 */
         *pres = JS_VALUE_GET_FLOAT64(val);
         return 0;
     } else {
+        /* 其他类型：调用通用转换 */
         return __JS_ToFloat64Free(ctx, pres, val);
     }
 }
 
+/**
+ * 公共 API：将 JS 值转换为 double（保留原值）
+ */
 int JS_ToFloat64(JSContext *ctx, double *pres, JSValueConst val)
 {
     return JS_ToFloat64Free(ctx, pres, JS_DupValue(ctx, val));
 }
 
+/**
+ * 公共 API：将 JS 值转换为 JS 数字（保留原值）
+ */
 static JSValue JS_ToNumber(JSContext *ctx, JSValueConst val)
 {
     return JS_ToNumberFree(ctx, JS_DupValue(ctx, val));
 }
 
+/**
+ * 转换为整数（NaN/undefined 返回 0，释放原值）
+ * 与 JS_ToNumber 的区别：
+ * - NaN -> 0（而不是 NaN）
+ * - 浮点数截断为整数（trunc）
+ * - -0 转换为 +0
+ */
 /* same as JS_ToNumber() but return 0 in case of NaN/Undefined */
 static __maybe_unused JSValue JS_ToIntegerFree(JSContext *ctx, JSValue val)
 {
@@ -17115,14 +17327,17 @@ static __maybe_unused JSValue JS_ToIntegerFree(JSContext *ctx, JSValue val)
     case JS_TAG_BOOL:
     case JS_TAG_NULL:
     case JS_TAG_UNDEFINED:
+        /* 整数/布尔/null/undefined：直接转 int32 */
         ret = JS_NewInt32(ctx, JS_VALUE_GET_INT(val));
         break;
     case JS_TAG_FLOAT64:
         {
             double d = JS_VALUE_GET_FLOAT64(val);
             if (isnan(d)) {
+                /* NaN -> 0 */
                 ret = JS_NewInt32(ctx, 0);
             } else {
+                /* 截断小数部分，-0 转为 +0 */
                 /* convert -0 to +0 */
                 d = trunc(d) + 0.0;
                 ret = JS_NewFloat64(ctx, d);
@@ -17130,6 +17345,7 @@ static __maybe_unused JSValue JS_ToIntegerFree(JSContext *ctx, JSValue val)
         }
         break;
     default:
+        /* 其他类型：先转数字再递归 */
         val = JS_ToNumberFree(ctx, val);
         if (JS_IsException(val))
             return val;
@@ -17138,7 +17354,14 @@ static __maybe_unused JSValue JS_ToIntegerFree(JSContext *ctx, JSValue val)
     return ret;
 }
 
-/* Note: the integer value is satured to 32 bits */
+/**
+ * 转换为 32 位整数（饱和截断，释放原值）
+ * Saturation：超出范围时钳位到 INT32_MIN/MAX
+ * @param pres 输出参数
+ * @return 0 成功，-1 异常
+ * 
+ * Note: the integer value is saturated to 32 bits
+ */
 static int JS_ToInt32SatFree(JSContext *ctx, int *pres, JSValue val)
 {
     uint32_t tag;
@@ -17151,9 +17374,11 @@ static int JS_ToInt32SatFree(JSContext *ctx, int *pres, JSValue val)
     case JS_TAG_BOOL:
     case JS_TAG_NULL:
     case JS_TAG_UNDEFINED:
+        /* 直接提取整数值 */
         ret = JS_VALUE_GET_INT(val);
         break;
     case JS_TAG_EXCEPTION:
+        /* 异常：返回错误 */
         *pres = 0;
         return -1;
     case JS_TAG_FLOAT64:
@@ -17162,6 +17387,7 @@ static int JS_ToInt32SatFree(JSContext *ctx, int *pres, JSValue val)
             if (isnan(d)) {
                 ret = 0;
             } else {
+                /* 饱和处理：超出 32 位范围时钳位 */
                 if (d < INT32_MIN)
                     ret = INT32_MIN;
                 else if (d > INT32_MAX)
@@ -17172,6 +17398,7 @@ static int JS_ToInt32SatFree(JSContext *ctx, int *pres, JSValue val)
         }
         break;
     default:
+        /* 其他类型：先转数字再递归 */
         val = JS_ToNumberFree(ctx, val);
         if (JS_IsException(val)) {
             *pres = 0;
@@ -17183,21 +17410,32 @@ static int JS_ToInt32SatFree(JSContext *ctx, int *pres, JSValue val)
     return 0;
 }
 
+/**
+ * 公共 API：转换为 32 位整数（饱和，保留原值）
+ */
 int JS_ToInt32Sat(JSContext *ctx, int *pres, JSValueConst val)
 {
     return JS_ToInt32SatFree(ctx, pres, JS_DupValue(ctx, val));
 }
 
+/**
+ * 转换为 32 位整数（钳位到指定范围，保留原值）
+ * @param min 最小值
+ * @param max 最大值
+ * @param min_offset 负数偏移量（用于处理负索引）
+ */
 int JS_ToInt32Clamp(JSContext *ctx, int *pres, JSValueConst val,
                     int min, int max, int min_offset)
 {
     int res = JS_ToInt32SatFree(ctx, pres, JS_DupValue(ctx, val));
     if (res == 0) {
         if (*pres < min) {
+            /* 小于最小值：应用偏移后再次检查 */
             *pres += min_offset;
             if (*pres < min)
                 *pres = min;
         } else {
+            /* 大于最大值：钳位到 max */
             if (*pres > max)
                 *pres = max;
         }
@@ -17205,6 +17443,13 @@ int JS_ToInt32Clamp(JSContext *ctx, int *pres, JSValueConst val,
     return res;
 }
 
+/**
+ * 转换为 64 位整数（饱和截断，释放原值）
+ * @param pres 输出参数
+ * @return 0 成功，-1 异常
+ * 
+ * 注意：INT64_MAX 无法精确表示为 double，所以用 0x1p63 (2^63) 作为上界判断
+ */
 static int JS_ToInt64SatFree(JSContext *ctx, int64_t *pres, JSValue val)
 {
     uint32_t tag;
@@ -17216,6 +17461,7 @@ static int JS_ToInt64SatFree(JSContext *ctx, int64_t *pres, JSValue val)
     case JS_TAG_BOOL:
     case JS_TAG_NULL:
     case JS_TAG_UNDEFINED:
+        /* 小整数直接扩展 */
         *pres = JS_VALUE_GET_INT(val);
         return 0;
     case JS_TAG_EXCEPTION:
@@ -17227,6 +17473,7 @@ static int JS_ToInt64SatFree(JSContext *ctx, int64_t *pres, JSValue val)
             if (isnan(d)) {
                 *pres = 0;
             } else {
+                /* 饱和处理：钳位到 64 位范围 */
                 if (d < INT64_MIN)
                     *pres = INT64_MIN;
                 else if (d >= 0x1p63) /* must use INT64_MAX + 1 because INT64_MAX cannot be exactly represented as a double */
@@ -17237,6 +17484,7 @@ static int JS_ToInt64SatFree(JSContext *ctx, int64_t *pres, JSValue val)
         }
         return 0;
     default:
+        /* 其他类型：先转数字再递归 */
         val = JS_ToNumberFree(ctx, val);
         if (JS_IsException(val)) {
             *pres = 0;
@@ -17246,18 +17494,25 @@ static int JS_ToInt64SatFree(JSContext *ctx, int64_t *pres, JSValue val)
     }
 }
 
+/**
+ * 公共 API：转换为 64 位整数（饱和，保留原值）
+ */
 int JS_ToInt64Sat(JSContext *ctx, int64_t *pres, JSValueConst val)
 {
     return JS_ToInt64SatFree(ctx, pres, JS_DupValue(ctx, val));
 }
 
+/**
+ * 转换为 64 位整数（钳位到指定范围，保留原值）
+ * @param neg_offset 负数偏移量
+ */
 int JS_ToInt64Clamp(JSContext *ctx, int64_t *pres, JSValueConst val,
                     int64_t min, int64_t max, int64_t neg_offset)
 {
     int res = JS_ToInt64SatFree(ctx, pres, JS_DupValue(ctx, val));
     if (res == 0) {
         if (*pres < 0)
-            *pres += neg_offset;
+            *pres += neg_offset;  /* 处理负索引偏移 */
         if (*pres < min)
             *pres = min;
         else if (*pres > max)
@@ -17266,8 +17521,19 @@ int JS_ToInt64Clamp(JSContext *ctx, int64_t *pres, JSValueConst val,
     return res;
 }
 
-/* Same as JS_ToInt32Free() but with a 64 bit result. Return (<0, 0)
-   in case of exception */
+/**
+ * 转换为 64 位整数（快速路径，释放原值）
+ * 与 JS_ToInt64SatFree 的区别：
+ * - 使用位操作直接提取浮点数的整数部分，避免 fmod(x, 2^64) 开销
+ * - 对超大指数直接返回 0（相当于 mod 2^64）
+ * 
+ * 浮点数 IEEE 754 布局：
+ * - 符号位：1 bit (bit 63)
+ * - 指数位：11 bits (bits 52-62)，偏置 1023
+ * - 尾数位：52 bits (bits 0-51)，隐含前导 1
+ * 
+ * Return (<0, 0) in case of exception
+ */
 static int JS_ToInt64Free(JSContext *ctx, int64_t *pres, JSValue val)
 {
     uint32_t tag;
@@ -17289,25 +17555,35 @@ static int JS_ToInt64Free(JSContext *ctx, int64_t *pres, JSValue val)
             int e;
             d = JS_VALUE_GET_FLOAT64(val);
             u.d = d;
-            /* we avoid doing fmod(x, 2^64) */
+            
+            /* 提取指数部分（偏置前）*/
+            /* we avoid doing fmod(x, 2^64) - 避免昂贵的取模运算 */
             e = (u.u64 >> 52) & 0x7ff;
+            
             if (likely(e <= (1023 + 62))) {
-                /* fast case */
+                /* 快速路径：指数 <= 1085，直接截断 */
+                /* 此时数值在 int64 范围内，无精度损失 */
                 ret = (int64_t)d;
             } else if (e <= (1023 + 62 + 53)) {
+                /* 中等指数：需要手动提取整数部分 */
                 uint64_t v;
+                /* 提取尾数（包括隐含的 1）*/
                 /* remainder modulo 2^64 */
                 v = (u.u64 & (((uint64_t)1 << 52) - 1)) | ((uint64_t)1 << 52);
+                /* 左移指数 - 1023 - 52 位，得到整数值 */
                 ret = v << ((e - 1023) - 52);
+                /* 应用符号 */
                 /* take the sign into account */
                 if (u.u64 >> 63)
                     ret = -ret;
             } else {
+                /* 超大指数或 NaN/Inf：返回 0 */
                 ret = 0; /* also handles NaN and +inf */
             }
         }
         break;
     default:
+        /* 其他类型：先转数字再递归 */
         val = JS_ToNumberFree(ctx, val);
         if (JS_IsException(val)) {
             *pres = 0;
@@ -17319,11 +17595,18 @@ static int JS_ToInt64Free(JSContext *ctx, int64_t *pres, JSValue val)
     return 0;
 }
 
+/**
+ * 公共 API：转换为 64 位整数（保留原值）
+ */
 int JS_ToInt64(JSContext *ctx, int64_t *pres, JSValueConst val)
 {
     return JS_ToInt64Free(ctx, pres, JS_DupValue(ctx, val));
 }
 
+/**
+ * 扩展版 64 位转换：支持 BigInt
+ * 如果输入是 BigInt，调用 JS_ToBigInt64；否则普通转换
+ */
 int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val)
 {
     if (JS_IsBigInt(ctx, val))
@@ -17332,7 +17615,14 @@ int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val)
         return JS_ToInt64(ctx, pres, val);
 }
 
-/* return (<0, 0) in case of exception */
+/**
+ * 转换为 32 位整数（快速路径，释放原值）
+ * 与 JS_ToInt32SatFree 的区别：
+ * - 使用位操作直接提取，避免 fmod(x, 2^32) 开销
+ * - 对超大指数直接返回 0（相当于 mod 2^32）
+ * 
+ * Return (<0, 0) in case of exception
+ */
 static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val)
 {
     uint32_t tag;
@@ -17354,26 +17644,35 @@ static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val)
             int e;
             d = JS_VALUE_GET_FLOAT64(val);
             u.d = d;
-            /* we avoid doing fmod(x, 2^32) */
+            
+            /* 提取指数 */
+            /* we avoid doing fmod(x, 2^32) - 避免昂贵的取模运算 */
             e = (u.u64 >> 52) & 0x7ff;
+            
             if (likely(e <= (1023 + 30))) {
+                /* 快速路径：指数 <= 1053，直接截断 */
                 /* fast case */
                 ret = (int32_t)d;
             } else if (e <= (1023 + 30 + 53)) {
+                /* 中等指数：手动提取低 32 位 */
                 uint64_t v;
                 /* remainder modulo 2^32 */
                 v = (u.u64 & (((uint64_t)1 << 52) - 1)) | ((uint64_t)1 << 52);
+                /* 左移后右移 32 位，提取中间 32 位 */
                 v = v << ((e - 1023) - 52 + 32);
                 ret = v >> 32;
+                /* 应用符号 */
                 /* take the sign into account */
                 if (u.u64 >> 63)
                     ret = -ret;
             } else {
+                /* 超大指数或 NaN/Inf：返回 0 */
                 ret = 0; /* also handles NaN and +inf */
             }
         }
         break;
     default:
+        /* 其他类型：先转数字再递归 */
         val = JS_ToNumberFree(ctx, val);
         if (JS_IsException(val)) {
             *pres = 0;
@@ -17385,16 +17684,34 @@ static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val)
     return 0;
 }
 
+/**
+ * 公共 API：转换为 32 位整数（保留原值）
+ */
 int JS_ToInt32(JSContext *ctx, int32_t *pres, JSValueConst val)
 {
     return JS_ToInt32Free(ctx, pres, JS_DupValue(ctx, val));
 }
 
+/**
+ * 内联函数：转换为无符号 32 位整数
+ * 直接复用 JS_ToInt32Free（符号位解释不同而已）
+ */
 static inline int JS_ToUint32Free(JSContext *ctx, uint32_t *pres, JSValue val)
 {
     return JS_ToInt32Free(ctx, (int32_t *)pres, val);
 }
 
+/**
+ * 转换为 0-255 钳位整数（用于 Canvas/TypedArray）
+ * 对应 ECMAScript 的 ToUint8Clamp 抽象操作
+ * @param pres 输出参数
+ * @return 0 成功，-1 异常
+ * 
+ * 特殊规则：
+ * - NaN -> 0
+ * - 四舍五入（lrint）而非截断
+ * - 钳位到 [0, 255]
+ */
 static int JS_ToUint8ClampFree(JSContext *ctx, int32_t *pres, JSValue val)
 {
     uint32_t tag;
@@ -17408,6 +17725,7 @@ static int JS_ToUint8ClampFree(JSContext *ctx, int32_t *pres, JSValue val)
     case JS_TAG_NULL:
     case JS_TAG_UNDEFINED:
         res = JS_VALUE_GET_INT(val);
+        /* 钳位到 [0, 255] */
         res = max_int(0, min_int(255, res));
         break;
     case JS_TAG_FLOAT64:
@@ -17416,16 +17734,18 @@ static int JS_ToUint8ClampFree(JSContext *ctx, int32_t *pres, JSValue val)
             if (isnan(d)) {
                 res = 0;
             } else {
+                /* 钳位 + 四舍五入 */
                 if (d < 0)
                     res = 0;
                 else if (d > 255)
                     res = 255;
                 else
-                    res = lrint(d);
+                    res = lrint(d);  /* 四舍五入到最近整数 */
             }
         }
         break;
     default:
+        /* 其他类型：先转数字再递归 */
         val = JS_ToNumberFree(ctx, val);
         if (JS_IsException(val)) {
             *pres = 0;
