@@ -15984,8 +15984,34 @@ static JSBigInt *js_bigint_pow(JSContext *ctx, const JSBigInt *a, JSBigInt *b)
     return NULL;
 }
 
-/* return (mant, exp) so that abs(a) ~ mant*2^(exp - (limb_bits -
-   1). a must be != 0. */
+/* =============================================================================
+   js_bigint_get_mant_exp: 获取 BigInt 的尾数和指数（用于浮点转换）
+   =============================================================================
+   功能：将 BigInt 分解为尾数 (mantissa) 和指数 (exponent)，用于转换为 float64
+   
+   参数：
+   - ctx: JS 上下文
+   - pexp: 输出参数，返回指数
+   - a: 输入 BigInt（必须非零）
+   
+   返回：53 位尾数（用于 float64 的尾数部分）
+   
+   数学原理：
+   abs(a) ≈ mant × 2^(exp - (limb_bits - 1))
+   
+   算法步骤：
+   1. 计算 abs(a)：通过异或符号位 + 进位实现补码取绝对值
+   2. 提取高位：取最高 4 个 limb（64 位系统）或 2 个 limb（32 位系统）
+   3. 合并为 64 位：将提取的 limb 组合成 a1（高 64 位）和 a0（低 64 位）
+   4. 规范化：左移使最高位为 1，记录移位量
+   5. 计算指数：e = len × limb_bits - shift - 1
+   
+   为什么取 4 个 limb？
+   - float64 尾数 53 位 + 指数 11 位 + 符号 1 位 = 65 位
+   - 需要足够的精度来正确舍入
+   
+   时间复杂度：O(a->len)
+   ============================================================================= */
 static uint64_t js_bigint_get_mant_exp(JSContext *ctx,
                                        int *pexp, const JSBigInt *a)
 {
@@ -16045,15 +16071,64 @@ static uint64_t js_bigint_get_mant_exp(JSContext *ctx,
     return a1;
 }
 
-/* shift left with round to nearest, ties to even. n >= 1 */
+/* =============================================================================
+   shr_rndn: 带舍入的右移（最近舍入，偶数优先）
+   =============================================================================
+   功能：右移 n 位，使用"最近舍入，平局取偶数"规则（IEEE 754 默认舍入模式）
+   
+   参数：
+   - a: 输入值
+   - n: 移位位数（n >= 1）
+   
+   返回：舍入后的结果
+   
+   舍入原理：
+   - addend = ((a >> n) & 1) + ((1 << (n - 1)) - 1)
+   - (a >> n) & 1: 被移出的最高位（舍入位）
+   - (1 << (n - 1)) - 1: 低位掩码（用于判断是否超过一半）
+   - 加 addend 后右移：实现四舍五入
+   
+   为什么"平局取偶数"？
+   - 当恰好处于中间值时，舍入到最近的偶数
+   - 避免统计偏差（传统四舍五入会偏向正方向）
+   - IEEE 754 标准规定的默认舍入模式
+   
+   时间复杂度：O(1)
+   ============================================================================= */
 static uint64_t shr_rndn(uint64_t a, int n)
 {
     uint64_t addend = ((a >> n) & 1) + ((1 << (n - 1)) - 1);
     return (a + addend) >> n;
 }
 
-/* convert to float64 with round to nearest, ties to even. Return
-   +/-infinity if too large. */
+/* =============================================================================
+   js_bigint_to_float64: BigInt 转换为 float64（双精度浮点数）
+   =============================================================================
+   功能：将 BigInt 转换为 double，使用最近舍入（偶数优先）
+   
+   参数：
+   - ctx: JS 上下文
+   - a: 输入 BigInt
+   
+   返回：double 值，溢出时返回 +/-infinity
+   
+   转换步骤：
+   1. 快速路径：若只有 1 个 limb，直接转换（包括零）
+   2. 获取尾数和指数：调用 js_bigint_get_mant_exp
+   3. 溢出检查：若 e > 1023（float64 最大指数），返回 infinity
+   4. 舍入处理：
+      - 先右移 1 位避免舍入溢出
+      - 调用 shr_rndn 右移 10 位（64 位尾数 → 53 位）
+      - 若舍入导致进位（mant >= 2^53），再次右移并增加指数
+   5. 组装 float64：符号位 + 指数位 + 尾数位
+   
+   float64 格式：
+   - 符号位：1 位（最高位）
+   - 指数位：11 位（偏置 1023）
+   - 尾数位：52 位（隐含前导 1）
+   
+   时间复杂度：O(a->len)
+   ============================================================================= */
 static double js_bigint_to_float64(JSContext *ctx, const JSBigInt *a)
 {
     int sgn, e;
@@ -16085,8 +16160,38 @@ static double js_bigint_to_float64(JSContext *ctx, const JSBigInt *a)
                              mant);
 }
 
-/* return (1, NULL) if not an integer, (2, NULL) if NaN or Infinity,
-   (0, n) if an integer, (0, NULL) in case of memory error */
+/* =============================================================================
+   js_bigint_from_float64: float64 转换为 BigInt
+   =============================================================================
+   功能：将 double 转换为 BigInt，处理非整数、NaN、Infinity 等特殊情况
+   
+   参数：
+   - ctx: JS 上下文
+   - pres: 输出参数，返回状态码
+   - a1: 输入 double 值
+   
+   返回状态码（*pres）：
+   - 0: 成功转换，返回 BigInt
+   - 1: 不是整数（有小数部分），返回 NULL
+   - 2: NaN 或 Infinity，返回 NULL
+   - 0 + NULL: 内存错误
+   
+   转换步骤：
+   1. 解析 float64 格式：提取符号位、指数、尾数
+   2. 特殊值处理：
+      - NaN/Infinity（e == 2047）：返回状态 2
+      - 零（e == 0 && mant == 0）：返回 BigInt(0)
+   3. 指数检查：若 e < 0（0 < |a| < 1），不是整数，返回状态 1
+   4. 恢复隐含位：mant |= 1 << 52
+   5. 小数部分检查：若 e < 52，检查是否有小数位
+   6. 构建 BigInt：用 mant × 2^e 构建结果
+   
+   为什么 e < 52 时需要检查小数部分？
+   - float64 尾数 52 位，若指数小于 52，说明有小数位
+   - 通过掩码检查低位是否有非零值
+   
+   时间复杂度：O(1) 或 O(e/limb_bits)（左移操作）
+   ============================================================================= */
 static JSBigInt *js_bigint_from_float64(JSContext *ctx, int *pres, double a1)
 {
     uint64_t a = float64_as_uint64(a1);
@@ -16134,7 +16239,41 @@ static JSBigInt *js_bigint_from_float64(JSContext *ctx, int *pres, double a1)
     return js_bigint_shl(ctx, r, e);
 }
 
-/* return -1, 0, 1 or (2) (unordered) */
+/* =============================================================================
+   js_bigint_float64_cmp: BigInt 与 float64 比较
+   =============================================================================
+   功能：比较 BigInt 和 double 的大小
+   
+   参数：
+   - ctx: JS 上下文
+   - a: BigInt 操作数
+   - b: double 操作数
+   
+   返回：
+   - -1: a < b
+   - 0: a == b
+   - 1: a > b
+   - 2: 无序（NaN）
+   
+   比较策略：
+   1. 解析 float64 格式：提取符号、指数、尾数
+   2. 特殊值处理：
+      - NaN：返回 2（无序）
+      - Infinity：返回 +/-1
+      - 零：特殊处理（区分 +0 和 -0）
+   3. 符号比较：若符号不同，直接返回结果
+   4. 指数比较：
+      - 计算 BigInt 的指数 f（通过 js_bigint_get_mant_exp）
+      - 若 f != e，直接返回大小关系
+   5. 尾数比较：
+      - 对齐尾数（将 float64 尾数左移 11 位到 64 位）
+      - 比较尾数大小
+   
+   为什么不需要处理非规约数（denormals）？
+   - 我们只比较整数，非规约数都小于 1，不是整数
+   
+   时间复杂度：O(a->len)
+   ============================================================================= */
 static int js_bigint_float64_cmp(JSContext *ctx, const JSBigInt *a,
                                  double b)
 {
@@ -16188,7 +16327,37 @@ static int js_bigint_float64_cmp(JSContext *ctx, const JSBigInt *a,
     }
 }
 
-/* return -1, 0 or 1 */
+/* =============================================================================
+   js_bigint_cmp: BigInt 比较（两个 BigInt 比较）
+   =============================================================================
+   功能：比较两个 BigInt 的大小
+   
+   参数：
+   - ctx: JS 上下文
+   - a: 第一个 BigInt
+   - b: 第二个 BigInt
+   
+   返回：
+   - -1: a < b
+   - 0: a == b
+   - 1: a > b
+   
+   比较策略：
+   1. 符号比较：
+      - 若符号不同：负数 < 正数
+   2. 长度比较（同号情况）：
+      - 若长度不同：长度大的绝对值大
+      - 注意：负数时结论相反（长度大的反而小）
+   3. 逐位比较（长度相同）：
+      - 从高位到低位比较
+      - 找到第一个不同的 limb，决定大小关系
+   
+   为什么从高位开始比较？
+   - 高位决定数值大小，找到第一个不同位即可返回
+   - 避免遍历所有 limb，提高效率
+   
+   时间复杂度：O(min(a->len, b->len))（最坏情况）
+   ============================================================================= */
 static int js_bigint_cmp(JSContext *ctx, const JSBigInt *a,
                          const JSBigInt *b)
 {
@@ -16220,7 +16389,19 @@ static int js_bigint_cmp(JSContext *ctx, const JSBigInt *a,
     return res;
 }
 
-/* contains 10^i */
+/* =============================================================================
+   js_pow_dec: 10 的幂次表（用于十进制转换）
+   =============================================================================
+   功能：存储 10^0 到 10^JS_LIMB_DIGITS 的值
+   
+   用途：
+   - js_bigint_from_string: 十进制字符串转 BigInt 时，每次处理 JS_LIMB_DIGITS 位
+   - 避免重复计算 10 的幂次，提高效率
+   
+   JS_LIMB_DIGITS:
+   - 32 位系统：9（10^9 < 2^32）
+   - 64 位系统：19（10^19 < 2^64）
+   ============================================================================= */
 static const js_limb_t js_pow_dec[JS_LIMB_DIGITS + 1] = {
     1U,
     10U,
@@ -16246,8 +16427,37 @@ static const js_limb_t js_pow_dec[JS_LIMB_DIGITS + 1] = {
 #endif
 };
 
-/* syntax: [-]digits in base radix. Return NULL if memory error. radix
-   = 10, 2, 8 or 16. */
+/* =============================================================================
+   js_bigint_from_string: 字符串转换为 BigInt
+   =============================================================================
+   功能：将字符串解析为 BigInt，支持多种进制
+   
+   参数：
+   - ctx: JS 上下文
+   - str: 输入字符串（格式：[-]digits）
+   - radix: 进制（10, 2, 8, 16）
+   
+   返回：BigInt 指针，内存错误返回 NULL
+   
+   解析步骤：
+   1. 处理符号：若有 '-' 前缀，标记为负数
+   2. 跳过前导零：避免不必要的计算
+   3. 计算所需 limb 数：
+      - 十进制：n_bits = (n_digits × 27 + 7) / 8（log2(10) ≈ 3.32）
+      - 二进制/八进制/十六进制：n_bits = n_digits × log2(radix)
+   4. 分配 BigInt 空间
+   5. 进制转换：
+      - 十进制：逐段处理（每段 JS_LIMB_DIGITS 位），使用 mp_mul1 累加
+      - 2/8/16 进制（2 的幂次）：直接位填充，无需乘法
+   
+   为什么十进制和其他进制处理不同？
+   - 10 不是 2 的幂次，不能直接位操作
+   - 2/8/16 进制可以直接映射到二进制位，效率更高
+   
+   时间复杂度：
+   - 十进制：O(n²)（每次乘法 O(n)）
+   - 2 的幂次进制：O(n)
+   ============================================================================= */
 static JSBigInt *js_bigint_from_string(JSContext *ctx,
                                        const char *str, int radix)
 {
