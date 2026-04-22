@@ -36009,7 +36009,30 @@ static int js_create_module_bytecode_function(JSContext *ctx, JSModuleDef *m)
     return 0;
 }
 
-/* must be done before js_link_module() because of cyclic references */
+/* ============================================================================
+ * 模块函数创建 - js_create_module_function
+ * ============================================================================
+ * 功能：在模块链接之前创建模块函数，处理循环引用问题
+ * 
+ * 参数:
+ *   ctx  - JavaScript 上下文
+ *   m    - 模块定义结构体
+ * 
+ * 返回:
+ *   0  - 成功
+ *   -1 - 失败
+ * 
+ * 处理流程:
+ * 1. 检查模块函数是否已创建，避免重复创建
+ * 2. 区分 C 模块和字节码模块：
+ *    - C 模块：初始化导出变量，为每个局部导出创建变量引用
+ *    - 字节码模块：创建字节码函数对象
+ * 3. 递归处理所有依赖模块，确保依赖链上的模块函数都被创建
+ * 
+ * 为什么要在 js_link_module 之前调用？
+ *   因为模块可能存在循环引用，需要提前创建函数对象以便在链接阶段
+ *   可以引用这些函数，即使它们尚未完全初始化。
+ * ============================================================================ */
 static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
 {
     BOOL is_c_module;
@@ -36022,7 +36045,7 @@ static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
     is_c_module = (m->init_func != NULL);
 
     if (is_c_module) {
-        /* initialize the exported variables */
+        /* 初始化 C 模块的导出变量：为每个局部导出创建变量引用 */
         for(i = 0; i < m->export_entries_count; i++) {
             JSExportEntry *me = &m->export_entries[i];
             if (me->export_type == JS_EXPORT_TYPE_LOCAL) {
@@ -36033,13 +36056,13 @@ static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
             }
         }
     } else {
+        /* 字节码模块：创建模块字节码函数 */
         if (js_create_module_bytecode_function(ctx, m))
             return -1;
     }
     m->func_created = TRUE;
 
-    /* do it on the dependencies */
-
+    /* 递归处理依赖模块：确保所有依赖的模块函数都已创建 */
     for(i = 0; i < m->req_module_entries_count; i++) {
         JSReqModuleEntry *rme = &m->req_module_entries[i];
         if (js_create_module_function(ctx, rme->module) < 0)
@@ -36050,8 +36073,28 @@ static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
 }
 
 
-/* Prepare a module to be executed by resolving all the imported
-   variables. */
+/* ============================================================================
+ * 模块内部链接 - js_inner_module_linking
+ * ============================================================================
+ * 功能：通过解析所有导入变量来准备模块执行，实现模块间的依赖解析和变量绑定
+ * 
+ * 参数:
+ *   ctx         - JavaScript 上下文
+ *   m           - 当前要链接的模块
+ *   pstack_top  - 模块栈顶指针（用于检测循环依赖）
+ *   index       - DFS 遍历索引
+ * 
+ * 返回:
+ *   >=0 - 新的 DFS 索引
+ *   -1  - 失败（抛出异常）
+ * 
+ * 算法说明:
+ * 使用 Tarjan 算法的变体进行强连通分量检测，处理循环依赖：
+ * - dfs_index: DFS 遍历时的访问序号
+ * - dfs_ancestor_index: 能回溯到的最小祖先索引（用于检测环）
+ * 
+ * 模块状态流转: UNLINKED -> LINKING -> LINKED
+ * ============================================================================ */
 static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
                                    JSModuleDef **pstack_top, int index)
 {
@@ -36063,6 +36106,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
     BOOL is_c_module;
     JSValue ret_val;
 
+    /* 栈溢出检查：防止深度递归导致栈溢出 */
     if (js_check_stack_overflow(ctx->rt, 0)) {
         JS_ThrowStackOverflow(ctx);
         return -1;
@@ -36075,6 +36119,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
     }
 #endif
 
+    /* 状态检查：如果模块已链接或正在链接中，跳过处理（避免重复处理和循环依赖） */
     if (m->status == JS_MODULE_STATUS_LINKING ||
         m->status == JS_MODULE_STATUS_LINKED ||
         m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
@@ -36082,14 +36127,15 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
         return index;
 
     assert(m->status == JS_MODULE_STATUS_UNLINKED);
-    m->status = JS_MODULE_STATUS_LINKING;
-    m->dfs_index = index;
-    m->dfs_ancestor_index = index;
+    m->status = JS_MODULE_STATUS_LINKING;  /* 标记为正在链接 */
+    m->dfs_index = index;                   /* 设置 DFS 索引 */
+    m->dfs_ancestor_index = index;          /* 初始化祖先索引 */
     index++;
-    /* push 'm' on stack */
+    /* 将当前模块压入栈：用于追踪依赖链和检测循环 */
     m->stack_prev = *pstack_top;
     *pstack_top = m;
 
+    /* 递归处理所有依赖模块 */
     for(i = 0; i < m->req_module_entries_count; i++) {
         JSReqModuleEntry *rme = &m->req_module_entries[i];
         m1 = rme->module;
@@ -36100,6 +36146,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
                m1->status == JS_MODULE_STATUS_LINKED ||
                m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
                m1->status == JS_MODULE_STATUS_EVALUATED);
+        /* 循环依赖检测：如果依赖模块正在链接中，说明存在环，更新祖先索引 */
         if (m1->status == JS_MODULE_STATUS_LINKING) {
             m->dfs_ancestor_index = min_int(m->dfs_ancestor_index,
                                             m1->dfs_ancestor_index);
@@ -36112,7 +36159,8 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
         printf("instantiating module '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
     }
 #endif
-    /* check the indirect exports */
+    /* 检查间接导出 (indirect exports)：export { x } from "module"
+     * 需要解析这些导出，确保它们指向有效的目标 */
     for(i = 0; i < m->export_entries_count; i++) {
         JSExportEntry *me = &m->export_entries[i];
         if (me->export_type == JS_EXPORT_TYPE_INDIRECT &&
@@ -36121,6 +36169,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
             JSExportEntry *res_me;
             JSModuleDef *res_m, *m1;
             m1 = m->req_module_entries[me->u.req_module_idx].module;
+            /* 解析导出：找到实际导出的模块和条目 */
             ret = js_resolve_export(ctx, &res_m, &res_me, m1, me->local_name);
             if (ret != JS_RESOLVE_RES_FOUND) {
                 js_resolve_export_throw_error(ctx, ret, m, me->export_name);
@@ -36143,10 +36192,12 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
 
     is_c_module = (m->init_func != NULL);
 
+    /* 字节码模块处理：绑定导入变量到导出变量 */
     if (!is_c_module) {
         p = JS_VALUE_GET_OBJ(m->func_obj);
         var_refs = p->u.func.var_refs;
 
+        /* 遍历所有导入条目，建立导入和导出之间的引用关系 */
         for(i = 0; i < m->import_entries_count; i++) {
             mi = &m->import_entries[i];
 #ifdef DUMP_MODULE_RESOLVE
@@ -36156,8 +36207,8 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
 #endif
             m1 = m->req_module_entries[mi->req_module_idx].module;
             if (mi->is_star) {
+                /* 命名空间导入：import * as ns from "module" */
                 JSValue val;
-                /* name space import */
                 val = JS_GetModuleNamespace(ctx, m1);
                 if (JS_IsException(val))
                     goto fail;
@@ -36166,11 +36217,13 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
                 printf("namespace\n");
 #endif
             } else {
+                /* 普通导入或重命名导入：import { x } from "module" 或 import { x as y } from "module" */
                 JSResolveResultEnum ret;
                 JSExportEntry *res_me;
                 JSModuleDef *res_m;
                 JSObject *p1;
 
+                /* 解析导出：在依赖模块中找到对应的导出 */
                 ret = js_resolve_export(ctx, &res_m,
                                         &res_me, m1, mi->import_name);
                 if (ret != JS_RESOLVE_RES_FOUND) {
@@ -36178,9 +36231,9 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
                     goto fail;
                 }
                 if (res_me->local_name == JS_ATOM__star_) {
+                    /* 命名空间重导出：export * as ns from "module" */
                     JSValue val;
                     JSModuleDef *m2;
-                    /* name space import from */
                     m2 = res_m->req_module_entries[res_me->u.req_module_idx].module;
                     val = JS_GetModuleNamespace(ctx, m2);
                     if (JS_IsException(val))
@@ -36196,12 +36249,13 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
                     printf("namespace from\n");
 #endif
                 } else {
+                    /* 本地导出：直接引用导出模块的变量引用 */
                     var_ref = res_me->u.local.var_ref;
                     if (!var_ref) {
                         p1 = JS_VALUE_GET_OBJ(res_m->func_obj);
                         var_ref = p1->u.func.var_refs[res_me->u.local.var_idx];
                     }
-                    var_ref->header.ref_count++;
+                    var_ref->header.ref_count++;  /* 增加引用计数 */
                     var_refs[mi->var_idx] = var_ref;
 #ifdef DUMP_MODULE_RESOLVE
                     printf("local export (var_ref=%p)\n", var_ref);
@@ -36210,9 +36264,8 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
             }
         }
 
-        /* keep the exported variables in the module export entries (they
-           are used when the eval function is deleted and cannot be
-           initialized before in case imports are exported) */
+        /* 保持导出变量在模块导出条目中
+         * 这些变量在 eval 函数被删除后仍需要使用，且导入可能被导出 */
         for(i = 0; i < m->export_entries_count; i++) {
             JSExportEntry *me = &m->export_entries[i];
             if (me->export_type == JS_EXPORT_TYPE_LOCAL) {
@@ -36222,17 +36275,19 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
             }
         }
 
-        /* initialize the global variables */
+        /* 初始化全局变量：调用模块函数执行模块代码 */
         ret_val = JS_Call(ctx, m->func_obj, JS_TRUE, 0, NULL);
         if (JS_IsException(ret_val))
             goto fail;
         JS_FreeValue(ctx, ret_val);
     }
 
+    /* Tarjan 算法：当 dfs_index == dfs_ancestor_index 时，说明找到了一个强连通分量的根
+     * 弹出栈中所有属于这个强连通分量的模块，标记为已链接 */
     assert(m->dfs_ancestor_index <= m->dfs_index);
     if (m->dfs_index == m->dfs_ancestor_index) {
         for(;;) {
-            /* pop m1 from stack */
+            /* 从栈中弹出模块 m1 */
             m1 = *pstack_top;
             *pstack_top = m1->stack_prev;
             m1->status = JS_MODULE_STATUS_LINKED;
@@ -36249,8 +36304,26 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
     return -1;
 }
 
-/* Prepare a module to be executed by resolving all the imported
-   variables. */
+/* ============================================================================
+ * 模块链接 - js_link_module
+ * ============================================================================
+ * 功能：准备模块执行，解析所有导入变量，建立模块间的依赖关系
+ * 
+ * 参数:
+ *   ctx - JavaScript 上下文
+ *   m   - 要链接的模块
+ * 
+ * 返回:
+ *   0  - 成功
+ *   -1 - 失败
+ * 
+ * 处理流程:
+ * 1. 调用 js_inner_module_linking 进行递归链接
+ * 2. 如果失败，回滚所有已链接的模块状态（从 LINKING 恢复到 UNLINKED）
+ * 3. 成功后，模块状态变为 LINKED，可以开始执行
+ * 
+ * 模块状态流转：UNLINKED -> LINKED (或 EVALUATING_ASYNC)
+ * ============================================================================ */
 static int js_link_module(JSContext *ctx, JSModuleDef *m)
 {
     JSModuleDef *stack_top, *m1;
@@ -36266,7 +36339,9 @@ static int js_link_module(JSContext *ctx, JSModuleDef *m)
            m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
            m->status == JS_MODULE_STATUS_EVALUATED);
     stack_top = NULL;
+    /* 调用内部链接函数 */
     if (js_inner_module_linking(ctx, m, &stack_top, 0) < 0) {
+        /* 失败回滚：将栈中所有模块状态从 LINKING 恢复为 UNLINKED */
         while (stack_top != NULL) {
             m1 = stack_top;
             assert(m1->status == JS_MODULE_STATUS_LINKING);
