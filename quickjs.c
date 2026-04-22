@@ -50479,18 +50479,37 @@ static JSValue js_iterator_from(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+/* ===========================================================================
+ * Iterator Helper 相关 (ES2024 提案)
+ * 提供迭代器转换和过滤的高阶函数
+ * ======================================================================== */
+
+/* Iterator Helper 种类枚举
+ * 用于标识不同的迭代器转换操作类型
+ */
 typedef enum JSIteratorHelperKindEnum {
-    JS_ITERATOR_HELPER_KIND_DROP,
-    JS_ITERATOR_HELPER_KIND_EVERY,
-    JS_ITERATOR_HELPER_KIND_FILTER,
-    JS_ITERATOR_HELPER_KIND_FIND,
-    JS_ITERATOR_HELPER_KIND_FLAT_MAP,
-    JS_ITERATOR_HELPER_KIND_FOR_EACH,
-    JS_ITERATOR_HELPER_KIND_MAP,
-    JS_ITERATOR_HELPER_KIND_SOME,
-    JS_ITERATOR_HELPER_KIND_TAKE,
+    JS_ITERATOR_HELPER_KIND_DROP,      /* drop(n) - 跳过前 n 个元素 */
+    JS_ITERATOR_HELPER_KIND_EVERY,     /* every(pred) - 所有元素是否都满足条件 */
+    JS_ITERATOR_HELPER_KIND_FILTER,    /* filter(pred) - 过滤满足条件的元素 */
+    JS_ITERATOR_HELPER_KIND_FIND,      /* find(pred) - 查找第一个满足条件的元素 */
+    JS_ITERATOR_HELPER_KIND_FLAT_MAP,  /* flatMap(mapper) - 映射并展平 */
+    JS_ITERATOR_HELPER_KIND_FOR_EACH,  /* forEach(fn) - 对每个元素执行函数 */
+    JS_ITERATOR_HELPER_KIND_MAP,       /* map(mapper) - 映射转换 */
+    JS_ITERATOR_HELPER_KIND_SOME,      /* some(pred) - 是否有元素满足条件 */
+    JS_ITERATOR_HELPER_KIND_TAKE,      /* take(n) - 取前 n 个元素 */
 } JSIteratorHelperKindEnum;
 
+/* Iterator Helper 数据结构
+ * 存储迭代器辅助操作的上下文信息
+ * @member obj 被包装的原始迭代器对象
+ * @member next 原始迭代器的 next 方法
+ * @member func 谓词函数 (filter) 或映射函数 (flatMap, map)
+ * @member inner 内部值 (flatMap 用于存储嵌套迭代器)
+ * @member count 计数器 (drop/take 的限制数，或 filter/map/flatMap 的索引)
+ * @member kind Helper 操作类型
+ * @member executing 是否正在执行中 (防止重入调用)
+ * @member done 是否已完成
+ */
 typedef struct JSIteratorHelperData {
     JSValue obj;
     JSValue next;
@@ -50502,6 +50521,22 @@ typedef struct JSIteratorHelperData {
     uint8_t done : 1;
 } JSIteratorHelperData;
 
+/* 创建 Iterator Helper 对象
+ * 根据 magic 参数创建不同类型的迭代器辅助对象
+ * @param ctx JS 上下文
+ * @param this_val 被包装的迭代器对象 (this)
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @param magic Helper 类型标识
+ * @return 新创建的 Iterator Helper 对象，失败返回异常
+ * 
+ * 支持的类型:
+ * - DROP: 跳过前 n 个元素，argv[0] 为跳过数量
+ * - TAKE: 取前 n 个元素，argv[0] 为获取数量
+ * - FILTER: 过滤元素，argv[0] 为谓词函数
+ * - MAP: 映射转换，argv[0] 为映射函数
+ * - FLAT_MAP: 映射并展平，argv[0] 为映射函数
+ */
 static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv, int magic)
 {
@@ -50510,17 +50545,20 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
     int64_t count;
     JSIteratorHelperData *it;
 
+    /* 验证 this 值必须是对象 */
     if (!JS_IsObject(this_val))
         return JS_ThrowTypeErrorNotAnObject(ctx);
     func = JS_UNDEFINED;
     count = 0;
 
+    /* 根据类型处理参数 */
     switch(magic) {
     case JS_ITERATOR_HELPER_KIND_DROP:
     case JS_ITERATOR_HELPER_KIND_TAKE:
         {
             JSValue v;
             double dlimit;
+            /* 转换为数字并验证范围 */
             v = JS_ToNumber(ctx, argv[0]);
             if (JS_IsException(v))
                 goto fail;
@@ -50533,6 +50571,7 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
                 JS_FreeValue(ctx, v);
                 goto range_error;
             }
+            /* 处理 Infinity: 负无穷报错，正无穷设为 MAX_SAFE_INTEGER */
             if (!isfinite(dlimit)) {
                 JS_FreeValue(ctx, v);
                 if (dlimit < 0)
@@ -50540,12 +50579,14 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
                 else
                     count = MAX_SAFE_INTEGER;
             } else {
+                /* 转换为整数 */
                 v = JS_ToIntegerFree(ctx, v);
                 if (JS_IsException(v))
                     goto fail;
                 if (JS_ToInt64Free(ctx, &count, v))
                     goto fail;
             }
+            /* 负数报错 */
             if (count < 0)
                 goto range_error;
         }
@@ -50554,6 +50595,7 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
     case JS_ITERATOR_HELPER_KIND_FLAT_MAP:
     case JS_ITERATOR_HELPER_KIND_MAP:
         {
+            /* 验证函数参数 */
             func = argv[0];
             if (check_function(ctx, func))
                 goto fail;
@@ -50564,14 +50606,19 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
         break;
     }
 
+    /* 获取原始迭代器的 next 方法 */
     method = JS_GetProperty(ctx, this_val, JS_ATOM_next);
     if (JS_IsException(method))
         goto fail;
+    
+    /* 创建 Helper 对象 */
     obj = JS_NewObjectClass(ctx, JS_CLASS_ITERATOR_HELPER);
     if (JS_IsException(obj)) {
         JS_FreeValue(ctx, method);
         goto fail;
     }
+    
+    /* 分配并初始化数据结构 */
     it = js_malloc(ctx, sizeof(*it));
     if (!it) {
         JS_FreeValue(ctx, obj);
@@ -50588,13 +50635,28 @@ static JSValue js_create_iterator_helper(JSContext *ctx, JSValueConst this_val,
     it->done = 0;
     JS_SetOpaque(obj, it);
     return obj;
+    
 range_error:
     JS_ThrowRangeError(ctx, "must be positive");
 fail:
+    /* 失败时关闭迭代器 */
     JS_IteratorClose(ctx, this_val, TRUE);
     return JS_EXCEPTION;
 }
 
+/* Iterator 原型方法通用处理函数
+ * 处理 every, find, forEach, some 等消费型迭代器方法
+ * @param ctx JS 上下文
+ * @param this_val 迭代器对象 (this)
+ * @param argc 参数个数
+ * @param argv 参数数组 (argv[0] 为回调函数)
+ * @param magic 方法类型标识
+ * @return 根据方法类型返回不同结果:
+ *         - every: 所有元素满足条件返回 true，否则 false
+ *         - some: 有元素满足条件返回 true，否则 false
+ *         - find: 返回第一个满足条件的元素，未找到返回 undefined
+ *         - forEach: 始终返回 undefined
+ */
 static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv, int magic)
 {
@@ -50603,30 +50665,38 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
     int64_t idx;
     int done;
 
+    /* 验证 this 值必须是对象 */
     if (!JS_IsObject(this_val))
         return JS_ThrowTypeErrorNotAnObject(ctx);
     func = JS_UNDEFINED;
     method = JS_UNDEFINED;
     
+    /* 验证回调函数 */
     if (check_function(ctx, argv[0]))
         goto fail;
     func = JS_DupValue(ctx, argv[0]);
+    
+    /* 获取迭代器的 next 方法 */
     method = JS_GetProperty(ctx, this_val, JS_ATOM_next);
     if (JS_IsException(method))
         goto fail_no_close;
 
     r = JS_UNDEFINED;
 
+    /* 根据方法类型执行不同逻辑 */
     switch(magic) {
     case JS_ITERATOR_HELPER_KIND_EVERY:
         {
+            /* every: 所有元素都满足条件才返回 true */
             r = JS_TRUE;
             for (idx = 0; /*empty*/; idx++) {
+                /* 获取下一个元素 */
                 item = JS_IteratorNext(ctx, this_val, method, 0, NULL, &done);
                 if (JS_IsException(item))
                     goto fail_no_close;
                 if (done)
                     break;
+                /* 调用回调函数：callback(value, index) */
                 index_val = JS_NewInt64(ctx, idx);
                 args[0] = item;
                 args[1] = index_val;
@@ -50635,6 +50705,7 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
                 JS_FreeValue(ctx, index_val);
                 if (JS_IsException(ret))
                     goto fail;
+                /* 只要有一个不满足就返回 false */
                 if (!JS_ToBoolFree(ctx, ret)) {
                     if (JS_IteratorClose(ctx, this_val, FALSE) < 0)
                         r = JS_EXCEPTION;
@@ -50650,12 +50721,14 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
         break;
     case JS_ITERATOR_HELPER_KIND_FIND:
         {
+            /* find: 查找第一个满足条件的元素 */
             for (idx = 0; /*empty*/; idx++) {
                 item = JS_IteratorNext(ctx, this_val, method, 0, NULL, &done);
                 if (JS_IsException(item))
                     goto fail_no_close;
                 if (done)
                     break;
+                /* 调用回调函数：callback(value, index) */
                 index_val = JS_NewInt64(ctx, idx);
                 args[0] = item;
                 args[1] = index_val;
@@ -50665,12 +50738,13 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
                     JS_FreeValue(ctx, item);
                     goto fail;
                 }
+                /* 找到满足条件的元素 */
                 if (JS_ToBoolFree(ctx, ret)) {
                     if (JS_IteratorClose(ctx, this_val, FALSE) < 0) {
                         JS_FreeValue(ctx, item);
                         r = JS_EXCEPTION;
                     } else {
-                        r = item;
+                        r = item;  /* 返回找到的元素 */
                     }
                     break;
                 }
@@ -50683,12 +50757,14 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
         break;
     case JS_ITERATOR_HELPER_KIND_FOR_EACH:
         {
+            /* forEach: 对每个元素执行函数，无返回值 */
             for (idx = 0; /*empty*/; idx++) {
                 item = JS_IteratorNext(ctx, this_val, method, 0, NULL, &done);
                 if (JS_IsException(item))
                     goto fail_no_close;
                 if (done)
                     break;
+                /* 调用回调函数：callback(value, index) */
                 index_val = JS_NewInt64(ctx, idx);
                 args[0] = item;
                 args[1] = index_val;
@@ -50706,6 +50782,7 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
         break;
     case JS_ITERATOR_HELPER_KIND_SOME:
         {
+            /* some: 有元素满足条件就返回 true */
             r = JS_FALSE;
             for (idx = 0; /*empty*/; idx++) {
                 item = JS_IteratorNext(ctx, this_val, method, 0, NULL, &done);
@@ -50713,6 +50790,7 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
                     goto fail_no_close;
                 if (done)
                     break;
+                /* 调用回调函数：callback(value, index) */
                 index_val = JS_NewInt64(ctx, idx);
                 args[0] = item;
                 args[1] = index_val;
@@ -50721,6 +50799,7 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
                 JS_FreeValue(ctx, index_val);
                 if (JS_IsException(ret))
                     goto fail;
+                /* 只要有一个满足就返回 true */
                 if (JS_ToBoolFree(ctx, ret)) {
                     if (JS_IteratorClose(ctx, this_val, FALSE) < 0)
                         r = JS_EXCEPTION;
@@ -50742,7 +50821,9 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
     JS_FreeValue(ctx, func);
     JS_FreeValue(ctx, method);
     return r;
+    
  fail:
+    /* 异常时关闭迭代器 */
     JS_IteratorClose(ctx, this_val, TRUE);
  fail_no_close:
     JS_FreeValue(ctx, func);
@@ -50750,6 +50831,19 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+/* Iterator.prototype.reduce
+ * 对迭代器所有元素执行归约操作
+ * @param ctx JS 上下文
+ * @param this_val 迭代器对象 (this)
+ * @param argc 参数个数
+ * @param argv 参数数组 (argv[0] 为回调函数，argv[1] 可选初始值)
+ * @return 归约后的最终值
+ * 
+ * 回调函数签名：callback(accumulator, value, index)
+ * - accumulator: 累加器，初始值或上一次回调的返回值
+ * - value: 当前元素值
+ * - index: 当前元素索引
+ */
 static JSValue js_iterator_proto_reduce(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv)
 {
@@ -50758,36 +50852,49 @@ static JSValue js_iterator_proto_reduce(JSContext *ctx, JSValueConst this_val,
     int64_t idx;
     int done;
 
+    /* 验证 this 值必须是对象 */
     if (!JS_IsObject(this_val))
         return JS_ThrowTypeErrorNotAnObject(ctx);
     acc = JS_UNDEFINED;
     func = JS_UNDEFINED;
     method = JS_UNDEFINED;
+    
+    /* 验证回调函数 */
     if (check_function(ctx, argv[0]))
         goto exception;
     func = JS_DupValue(ctx, argv[0]);
+    
+    /* 获取迭代器的 next 方法 */
     method = JS_GetProperty(ctx, this_val, JS_ATOM_next);
     if (JS_IsException(method))
         goto exception;
+    
+    /* 处理初始值 */
     if (argc > 1) {
+        /* 有初始值：使用提供的初始值，从索引 0 开始 */
         acc = JS_DupValue(ctx, argv[1]);
         idx = 0;
     } else {
+        /* 无初始值：使用第一个元素作为初始值，从索引 1 开始 */
         acc = JS_IteratorNext(ctx, this_val, method, 0, NULL, &done);
         if (JS_IsException(acc))
             goto exception_no_close;
         if (done) {
+            /* 空迭代器且无初始值：报错 */
             JS_ThrowTypeError(ctx, "empty iterator");
             goto exception;
         }
         idx = 1;
     }
+    
+    /* 遍历迭代器所有元素 */
     for (/* empty */; /*empty*/; idx++) {
         item = JS_IteratorNext(ctx, this_val, method, 0, NULL, &done);
         if (JS_IsException(item))
             goto exception_no_close;
         if (done)
             break;
+        /* 调用回调函数：callback(accumulator, value, index) */
         index_val = JS_NewInt64(ctx, idx);
         args[0] = acc;
         args[1] = item;
@@ -50797,6 +50904,7 @@ static JSValue js_iterator_proto_reduce(JSContext *ctx, JSValueConst this_val,
         JS_FreeValue(ctx, index_val);
         if (JS_IsException(ret))
             goto exception;
+        /* 更新累加器 */
         JS_FreeValue(ctx, acc);
         acc = ret;
         index_val = JS_UNDEFINED;
@@ -50806,7 +50914,9 @@ static JSValue js_iterator_proto_reduce(JSContext *ctx, JSValueConst this_val,
     JS_FreeValue(ctx, func);
     JS_FreeValue(ctx, method);
     return acc;
+    
  exception:
+    /* 异常时关闭迭代器 */
     JS_IteratorClose(ctx, this_val, TRUE);
  exception_no_close:
     JS_FreeValue(ctx, acc);
@@ -50815,6 +50925,14 @@ static JSValue js_iterator_proto_reduce(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+/* Iterator.prototype.toArray
+ * 将迭代器转换为数组
+ * @param ctx JS 上下文
+ * @param this_val 迭代器对象 (this)
+ * @param argc 参数个数
+ * @param argv 参数数组 (未使用)
+ * @return 包含所有迭代元素的新数组
+ */
 static JSValue js_iterator_proto_toArray(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
 {
@@ -50823,28 +50941,38 @@ static JSValue js_iterator_proto_toArray(JSContext *ctx, JSValueConst this_val,
     int done;
 
     result = JS_UNDEFINED;
+    /* 验证 this 值必须是对象 */
     if (!JS_IsObject(this_val))
         return JS_ThrowTypeErrorNotAnObject(ctx);
+    
+    /* 获取迭代器的 next 方法 */
     method = JS_GetProperty(ctx, this_val, JS_ATOM_next);
     if (JS_IsException(method))
         return JS_EXCEPTION;
+    
+    /* 创建新数组 */
     result = JS_NewArray(ctx);
     if (JS_IsException(result))
         goto exception;
+    
+    /* 遍历迭代器，将元素添加到数组 */
     for (idx = 0; /*empty*/; idx++) {
         item = JS_IteratorNext(ctx, this_val, method, 0, NULL, &done);
         if (JS_IsException(item))
             goto exception;
         if (done)
             break;
+        /* 将元素添加到数组 */
         if (JS_DefinePropertyValueInt64(ctx, result, idx, item,
                                         JS_PROP_C_W_E | JS_PROP_THROW) < 0)
             goto exception;
     }
+    /* 设置数组长度 */
     if (JS_SetProperty(ctx, result, JS_ATOM_length, JS_NewUint32(ctx, idx)) < 0)
         goto exception;
     JS_FreeValue(ctx, method);
     return result;
+    
 exception:
     JS_FreeValue(ctx, result);
     JS_FreeValue(ctx, method);
@@ -50883,8 +51011,11 @@ static JSValue js_iterator_proto_set_toStringTag(JSContext *ctx, JSValueConst th
     return JS_UNDEFINED;
 }
 
-/* Iterator Helper */
+/* ===========================================================================
+ * Iterator Helper 最终化器和标记函数
+ * ======================================================================== */
 
+/* Iterator Helper 最终化器 - 释放 Helper 对象占用的资源 */
 static void js_iterator_helper_finalizer(JSRuntime *rt, JSValue val)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
@@ -50898,6 +51029,7 @@ static void js_iterator_helper_finalizer(JSRuntime *rt, JSValue val)
     }
 }
 
+/* Iterator Helper 标记函数 - GC 时标记引用的对象 */
 static void js_iterator_helper_mark(JSRuntime *rt, JSValueConst val,
                                    JS_MarkFunc *mark_func)
 {
@@ -50911,6 +51043,27 @@ static void js_iterator_helper_mark(JSRuntime *rt, JSValueConst val,
     }
 }
 
+/* ===========================================================================
+ * Iterator Helper next 方法 - 核心实现
+ * 根据 Helper 类型执行不同的迭代逻辑
+ * ======================================================================== */
+
+/* Iterator Helper 的 next 方法实现
+ * @param ctx JS 上下文
+ * @param this_val Helper 对象 (this)
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @param pdone 输出参数：是否完成迭代
+ * @param magic 调用类型 (GEN_MAGIC_NEXT 或 GEN_MAGIC_RETURN)
+ * @return 迭代结果 { value, done }
+ * 
+ * 支持的 Helper 类型:
+ * - DROP: 跳过前 count 个元素
+ * - FILTER: 过滤满足谓词函数的元素
+ * - FLAT_MAP: 映射并展平嵌套迭代器
+ * - MAP: 映射转换每个元素
+ * - TAKE: 取前 count 个元素
+ */
 static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv,
                                       int *pdone, int magic)
@@ -50920,9 +51073,12 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
 
     *pdone = FALSE;
 
+    /* 获取 Helper 数据结构 */
     it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_HELPER);
     if (!it)
         return JS_EXCEPTION;
+    
+    /* 检查是否已执行完成 */
     if (it->executing)
         return JS_ThrowTypeError(ctx, "cannot invoke a running iterator");
     if (it->done) {
@@ -50930,19 +51086,24 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
         return JS_UNDEFINED;
     }
 
+    /* 标记为执行中，防止重入调用 */
     it->executing = 1;
 
+    /* 根据 Helper 类型执行不同逻辑 */
     switch (it->kind) {
     case JS_ITERATOR_HELPER_KIND_DROP:
         {
+            /* DROP: 跳过前 count 个元素，之后返回剩余元素 */
             JSValue item, method;
             if (magic == GEN_MAGIC_NEXT) {
                 method = JS_DupValue(ctx, it->next);
             } else {
+                /* return 调用：获取原始迭代器的 return 方法 */
                 method = JS_GetProperty(ctx, it->obj, JS_ATOM_return);
                 if (JS_IsException(method))
                     goto fail;
             }
+            /* 跳过指定数量的元素 */
             while (it->count > 0) {
                 it->count--;
                 item = JS_IteratorNext(ctx, it->obj, method, 0, NULL, pdone);
@@ -50950,7 +51111,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                     JS_FreeValue(ctx, method);
                     goto fail_no_close;
                 }
-                JS_FreeValue(ctx, item);
+                JS_FreeValue(ctx, item);  /* 丢弃跳过的元素 */
                 if (magic == GEN_MAGIC_RETURN)
                     *pdone = TRUE;
                 if (*pdone) {
@@ -50960,6 +51121,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                 }
             }
 
+            /* 跳过完成后，返回下一个元素 */
             item = JS_IteratorNext(ctx, it->obj, method, 0, NULL, pdone);
             JS_FreeValue(ctx, method);
             if (JS_IsException(item))
@@ -50968,8 +51130,10 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
             goto done;
         }
         break;
+        
     case JS_ITERATOR_HELPER_KIND_FILTER:
         {
+            /* FILTER: 只返回满足谓词函数的元素 */
             JSValue item, method, selected, index_val;
             JSValueConst args[2];
             if (magic == GEN_MAGIC_NEXT) {
@@ -50980,16 +51144,19 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                     goto fail;
             }
         filter_again:
+            /* 获取下一个元素 */
             item = JS_IteratorNext(ctx, it->obj, method, 0, NULL, pdone);
             if (JS_IsException(item)) {
                 JS_FreeValue(ctx, method);
                 goto fail_no_close;
             }
+            /* 如果已完成或是 return 调用，直接返回 */
             if (*pdone || magic == GEN_MAGIC_RETURN) {
                 JS_FreeValue(ctx, method);
                 ret = item;
                 goto done;
             }
+            /* 调用谓词函数：predicate(value, index) */
             index_val = JS_NewInt64(ctx, it->count++);
             args[0] = item;
             args[1] = index_val;
@@ -51000,20 +51167,24 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                 JS_FreeValue(ctx, method);
                 goto fail;
             }
+            /* 满足条件则返回，否则继续过滤 */
             if (JS_ToBoolFree(ctx, selected)) {
                 JS_FreeValue(ctx, method);
                 ret = item;
                 goto done;
             }
             JS_FreeValue(ctx, item);
-            goto filter_again;
+            goto filter_again;  /* 继续过滤下一个元素 */
         }
         break;
+        
     case JS_ITERATOR_HELPER_KIND_FLAT_MAP:
         {
+            /* FLAT_MAP: 映射每个元素并展平嵌套迭代器 */
             JSValue item, method, index_val, iter;
             JSValueConst args[2];
         flat_map_again:
+            /* 如果没有内部迭代器，获取下一个外层元素 */
             if (JS_IsUndefined(it->inner)) {
                 if (magic == GEN_MAGIC_NEXT) {
                     method = JS_DupValue(ctx, it->next);
@@ -51030,6 +51201,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                     ret = item;
                     goto done;
                 }
+                /* 调用映射函数：mapper(value, index) */
                 index_val = JS_NewInt64(ctx, it->count++);
                 args[0] = item;
                 args[1] = index_val;
@@ -51038,11 +51210,13 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                 JS_FreeValue(ctx, index_val);
                 if (JS_IsException(ret))
                     goto fail;
+                /* 映射结果必须是对象（可迭代） */
                 if (!JS_IsObject(ret)) {
                     JS_FreeValue(ctx, ret);
                     JS_ThrowTypeError(ctx, "not an object");
                     goto fail;
                 }
+                /* 获取映射结果的迭代器 */
                 method = JS_GetProperty(ctx, ret, JS_ATOM_Symbol_iterator);
                 if (JS_IsException(method)) {
                     JS_FreeValue(ctx, ret);
@@ -51050,7 +51224,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                 }
                 if (JS_IsNull(method) || JS_IsUndefined(method)) {
                     JS_FreeValue(ctx, method);
-                    iter = ret;
+                    iter = ret;  /* 本身就是可迭代的 */
                 } else {
                     iter = JS_GetIterator2(ctx, ret, method);
                     JS_FreeValue(ctx, method);
@@ -51059,9 +51233,10 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                         goto fail;
                 }
 
-                it->inner = iter;
+                it->inner = iter;  /* 存储内部迭代器 */
             }
 
+            /* 从内部迭代器获取下一个元素 */
             if (magic == GEN_MAGIC_NEXT)
                 method = JS_GetProperty(ctx, it->inner, JS_ATOM_next);
             else
@@ -51073,6 +51248,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                 it->inner = JS_UNDEFINED;
                 goto fail;
             }
+            /* 处理 return 调用时内部迭代器无 return 方法的情况 */
             if (magic == GEN_MAGIC_RETURN && (JS_IsUndefined(method) || JS_IsNull(method))) {
                 goto inner_end;
             } else {
@@ -51081,9 +51257,10 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                 if (JS_IsException(item))
                     goto inner_fail;
             }
+            /* 内部迭代器完成，继续外层 */
             if (*pdone) {
             inner_end:
-                *pdone = FALSE; // The outer iterator must continue.
+                *pdone = FALSE;  /* 外层迭代器继续 */
                 JS_IteratorClose(ctx, it->inner, FALSE);
                 JS_FreeValue(ctx, it->inner);
                 it->inner = JS_UNDEFINED;
@@ -51093,8 +51270,10 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
             goto done;
         }
         break;
+        
     case JS_ITERATOR_HELPER_KIND_MAP:
         {
+            /* MAP: 对每个元素应用映射函数 */
             JSValue item, method, index_val;
             JSValueConst args[2];
             if (magic == GEN_MAGIC_NEXT) {
@@ -51104,6 +51283,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                 if (JS_IsException(method))
                     goto fail;
             }
+            /* 获取下一个元素 */
             item = JS_IteratorNext(ctx, it->obj, method, 0, NULL, pdone);
             JS_FreeValue(ctx, method);
             if (JS_IsException(item))
@@ -51112,6 +51292,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                 ret = item;
                 goto done;
             }
+            /* 调用映射函数：mapper(value, index) */
             index_val = JS_NewInt64(ctx, it->count++);
             args[0] = item;
             args[1] = index_val;
@@ -51123,10 +51304,13 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
             goto done;
         }
         break;
+        
     case JS_ITERATOR_HELPER_KIND_TAKE:
         {
+            /* TAKE: 只取前 count 个元素 */
             JSValue item, method;
             if (it->count > 0) {
+                /* 还有名额，继续取元素 */
                 if (magic == GEN_MAGIC_NEXT) {
                     method = JS_DupValue(ctx, it->next);
                 } else {
@@ -51143,6 +51327,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                 goto done;
             }
 
+            /* 名额用完，关闭迭代器并返回 done */
             *pdone = TRUE;
             if (JS_IteratorClose(ctx, it->obj, FALSE))
                 ret = JS_EXCEPTION;
@@ -51151,14 +51336,17 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
             goto done;
         }
         break;
+        
     default:
         abort();
     }
 
  done:
+    /* 更新状态 */
     it->done = magic == GEN_MAGIC_NEXT ? *pdone : 1;
     it->executing = 0;
     return ret;
+    
  fail:
     /* close the iterator object, preserving pending exception */
     JS_IteratorClose(ctx, it->obj, TRUE);
@@ -51261,8 +51449,23 @@ static const JSCFunctionListEntry js_array_iterator_proto_funcs[] = {
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Array Iterator", JS_PROP_CONFIGURABLE ),
 };
 
-/* Number */
+/* ===========================================================================
+ * Number 对象
+ * JavaScript 数字类型的构造函数和原型方法
+ * ======================================================================== */
 
+/* Number 构造函数
+ * @param ctx JS 上下文
+ * @param new_target new.target 值（用于判断是否通过 new 调用）
+ * @param argc 参数个数
+ * @param argv 参数数组 (argv[0] 为要转换的值)
+ * @return 数字值或 Number 对象
+ * 
+ * 行为:
+ * - 无参数：返回 0
+ * - 作为函数调用：返回原始数字值
+ * - 作为构造函数 (new)：返回 Number 对象
+ */
 static JSValue js_number_constructor(JSContext *ctx, JSValueConst new_target,
                                      int argc, JSValueConst *argv)
 {
@@ -51270,9 +51473,11 @@ static JSValue js_number_constructor(JSContext *ctx, JSValueConst new_target,
     if (argc == 0) {
         val = JS_NewInt32(ctx, 0);
     } else {
+        /* 转换为数值类型 */
         val = JS_ToNumeric(ctx, argv[0]);
         if (JS_IsException(val))
             return val;
+        /* 处理 BigInt 类型转换 */
         switch(JS_VALUE_GET_TAG(val)) {
         case JS_TAG_SHORT_BIG_INT:
             val = JS_NewInt64(ctx, JS_VALUE_GET_SHORT_BIG_INT(val));
@@ -51293,48 +51498,42 @@ static JSValue js_number_constructor(JSContext *ctx, JSValueConst new_target,
         }
     }
     if (!JS_IsUndefined(new_target)) {
+        /* 作为构造函数：创建 Number 对象 */
         obj = js_create_from_ctor(ctx, new_target, JS_CLASS_NUMBER);
         if (!JS_IsException(obj))
             JS_SetObjectData(ctx, obj, val);
         return obj;
     } else {
+        /* 作为函数：返回原始值 */
         return val;
     }
 }
 
-#if 0
-static JSValue js_number___toInteger(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv)
-{
-    return JS_ToIntegerFree(ctx, JS_DupValue(ctx, argv[0]));
-}
-
-static JSValue js_number___toLength(JSContext *ctx, JSValueConst this_val,
-                                    int argc, JSValueConst *argv)
-{
-    int64_t v;
-    if (JS_ToLengthFree(ctx, &v, JS_DupValue(ctx, argv[0])))
-        return JS_EXCEPTION;
-    return JS_NewInt64(ctx, v);
-}
-#endif
-
+/* Number.isNaN - 判断值是否为 NaN
+ * 与全局 isNaN 的区别：不进行类型转换
+ */
 static JSValue js_number_isNaN(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
+    /* 只有数字类型才可能是 NaN */
     if (!JS_IsNumber(argv[0]))
         return JS_FALSE;
     return js_global_isNaN(ctx, this_val, argc, argv);
 }
 
+/* Number.isFinite - 判断值是否为有限数
+ * 与全局 isFinite 的区别：不进行类型转换
+ */
 static JSValue js_number_isFinite(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv)
 {
+    /* 只有数字类型才判断是否有限 */
     if (!JS_IsNumber(argv[0]))
         return JS_FALSE;
     return js_global_isFinite(ctx, this_val, argc, argv);
 }
 
+/* Number.isInteger - 判断值是否为整数 */
 static JSValue js_number_isInteger(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
@@ -51346,10 +51545,14 @@ static JSValue js_number_isInteger(JSContext *ctx, JSValueConst this_val,
         return JS_NewBool(ctx, ret);
 }
 
+/* Number.isSafeInteger - 判断值是否为安全整数
+ * 安全整数范围：-(2^53-1) 到 2^53-1
+ */
 static JSValue js_number_isSafeInteger(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
     double d;
+    /* 只有数字类型才判断 */
     if (!JS_IsNumber(argv[0]))
         return JS_FALSE;
     if (unlikely(JS_ToFloat64(ctx, &d, argv[0])))
@@ -51357,6 +51560,7 @@ static JSValue js_number_isSafeInteger(JSContext *ctx, JSValueConst this_val,
     return JS_NewBool(ctx, is_safe_integer(d));
 }
 
+/* Number 静态方法列表 */
 static const JSCFunctionListEntry js_number_funcs[] = {
     /* global ParseInt and parseFloat should be defined already or delayed */
     JS_ALIAS_BASE_DEF("parseInt", "parseInt", 0 ),
@@ -51572,27 +51776,48 @@ static JSValue js_parseFloat(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
-/* Boolean */
+/* ===========================================================================
+ * Boolean 对象
+ * JavaScript 布尔类型的构造函数和原型方法
+ * ======================================================================== */
+
+/* Boolean 构造函数
+ * @param ctx JS 上下文
+ * @param new_target new.target 值
+ * @param argc 参数个数
+ * @param argv 参数数组 (argv[0] 为要转换的值)
+ * @return 布尔值或 Boolean 对象
+ */
 static JSValue js_boolean_constructor(JSContext *ctx, JSValueConst new_target,
                                      int argc, JSValueConst *argv)
 {
     JSValue val, obj;
+    /* 将参数转换为布尔值 */
     val = JS_NewBool(ctx, JS_ToBool(ctx, argv[0]));
     if (!JS_IsUndefined(new_target)) {
+        /* 作为构造函数：创建 Boolean 对象 */
         obj = js_create_from_ctor(ctx, new_target, JS_CLASS_BOOLEAN);
         if (!JS_IsException(obj))
             JS_SetObjectData(ctx, obj, val);
         return obj;
     } else {
+        /* 作为函数：返回原始值 */
         return val;
     }
 }
 
+/* 获取 Boolean 对象的原始值
+ * @param ctx JS 上下文
+ * @param this_val this 值（可以是原始布尔值或 Boolean 对象）
+ * @return 原始布尔值，失败返回异常
+ */
 static JSValue js_thisBooleanValue(JSContext *ctx, JSValueConst this_val)
 {
+    /* 直接是布尔值 */
     if (JS_VALUE_GET_TAG(this_val) == JS_TAG_BOOL)
         return JS_DupValue(ctx, this_val);
 
+    /* Boolean 对象：提取内部存储的布尔值 */
     if (JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT) {
         JSObject *p = JS_VALUE_GET_OBJ(this_val);
         if (p->class_id == JS_CLASS_BOOLEAN) {
@@ -51603,6 +51828,7 @@ static JSValue js_thisBooleanValue(JSContext *ctx, JSValueConst this_val)
     return JS_ThrowTypeError(ctx, "not a boolean");
 }
 
+/* Boolean.prototype.toString - 转换为字符串 "true" 或 "false" */
 static JSValue js_boolean_toString(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
@@ -51613,12 +51839,14 @@ static JSValue js_boolean_toString(JSContext *ctx, JSValueConst this_val,
                        JS_ATOM_true : JS_ATOM_false);
 }
 
+/* Boolean.prototype.valueOf - 返回原始布尔值 */
 static JSValue js_boolean_valueOf(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv)
 {
     return js_thisBooleanValue(ctx, this_val);
 }
 
+/* Boolean 原型方法列表 */
 static const JSCFunctionListEntry js_boolean_proto_funcs[] = {
     JS_CFUNC_DEF("toString", 0, js_boolean_toString ),
     JS_CFUNC_DEF("valueOf", 0, js_boolean_valueOf ),
