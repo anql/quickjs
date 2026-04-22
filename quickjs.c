@@ -38489,14 +38489,25 @@ static int resolve_pseudo_var(JSContext *ctx, JSFunctionDef *s,
     return var_idx;
 }
 
-/* test if 'var_name' is in the variable object on the stack. If is it
-   the case, handle it and jump to 'label_done' */
+/* 测试变量是否在栈上的变量对象中
+ * 用于处理 with 语句和 eval 的动态作用域
+ * 
+ * 如果变量在变量对象中，生成相应的访问代码并跳转到 label_done
+ * 
+ * 参数：
+ * - var_name: 变量名
+ * - op: 操作码类型
+ * - bc: 输出字节码缓冲区
+ * - plabel_done: 完成跳转标签的指针
+ * - is_with: 是否为 with 语句（true=with，false=var object）*/
 static void var_object_test(JSContext *ctx, JSFunctionDef *s,
                             JSAtom var_name, int op, DynBuf *bc,
                             int *plabel_done, BOOL is_with)
 {
+    /* 生成 with/var_object 作用域的变量访问操作码 */
     dbuf_putc(bc, get_with_scope_opcode(op));
     dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+    /* 创建跳转标签（如果尚未创建）*/
     if (*plabel_done < 0) {
         *plabel_done = new_label_fd(s);
         if (*plabel_done < 0) {
@@ -38510,6 +38521,11 @@ static void var_object_test(JSContext *ctx, JSFunctionDef *s,
     s->jump_size++;
 }
 
+/* 标记变量为已捕获（用于闭包）
+ * 当内部函数引用外部函数的变量时，该变量需要被"捕获"
+ * 捕获的变量会被提升到闭包中，通过 OP_get_var_ref/OP_put_var_ref 访问
+ * 
+ * 每个变量只捕获一次，var_ref_idx 用于闭包数组索引 */
 static inline void capture_var(JSFunctionDef *s, JSVarDef *vd)
 {
     if (!vd->is_captured) {
@@ -38518,7 +38534,25 @@ static inline void capture_var(JSFunctionDef *s, JSVarDef *vd)
     }
 }
 
-/* return the position of the next opcode or -1 if error */
+/* 解析作用域变量
+ * 将字节码中的 OP_scope_* 操作码解析为具体的变量访问操作码
+ * 
+ * 这是编译期的关键函数，负责：
+ * 1. 在当前作用域链中查找变量
+ * 2. 确定变量类型（局部变量/参数/闭包变量/全局变量）
+ * 3. 生成对应的字节码（OP_get_loc/OP_put_loc/OP_get_var_ref 等）
+ * 4. 处理 with 语句和 eval 的特殊情况
+ * 
+ * 参数：
+ * - var_name: 变量名（Atom）
+ * - scope_level: 作用域层级
+ * - op: 原始操作码（OP_scope_get_var/OP_scope_put_var 等）
+ * - bc: 输出字节码缓冲区
+ * - bc_buf: 原始字节码缓冲区
+ * - ls: 标签槽（用于跳转优化）
+ * - pos_next: 下一个操作码位置
+ * 
+ * 返回：下一个操作码位置，错误返回 -1 */
 static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                              JSAtom var_name, int scope_level, int op,
                              DynBuf *bc, uint8_t *bc_buf,
@@ -38533,7 +38567,9 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
     label_done = -1;
 
     /* XXX: could be simpler to use a specific function to
-       resolve the pseudo variables */
+       resolve the pseudo variables 
+       * TODO: 可以用更简单的函数来解析伪变量 */
+    /* 判断是否为伪变量（this/new.target/home_object 等）*/
     is_pseudo_var = (var_name == JS_ATOM_home_object ||
                      var_name == JS_ATOM_this_active_func ||
                      var_name == JS_ATOM_new_target ||
