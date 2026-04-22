@@ -19947,21 +19947,66 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
                                             BOOL is_neq)
 {
     JSValue op1, op2;
-    int res;
+    /* ============================================================================
+ * QJ-10 模块：操作符与字节码解释器核心 (行 20000-25000)
+ * ============================================================================
+ * 本模块包含：
+ * - 相等性比较操作符（==, !=, ===, !==）
+ * - 位运算操作符（>>, <<, &, |, ^, ~）
+ * - 操作符相关函数（in, instanceof, typeof, delete）
+ * - arguments 对象处理
+ * - for-in/for-of 迭代器协议
+ * - 闭包与变量引用管理
+ * - 字节码解释器核心（JS_CallInternal）- 包含所有操作码的处理
+ * ============================================================================
+ */
+
+/* -----------------------------------------------------------------------------
+ * js_eq_slow - JavaScript 相等性比较的慢速路径处理（== 和 != 操作符）
+ * -----------------------------------------------------------------------------
+ * 功能：实现 ECMAScript 规范中的 Abstract Equality Comparison 算法
+ *       处理类型不同的操作数之间的比较，包括类型转换
+ * 
+ * 参数：
+ *   ctx    - JS 上下文
+ *   sp     - 栈指针，sp[-2] 和 sp[-1] 是两个操作数
+ *   is_neq - 是否为不等比较（!=），TRUE 表示需要对结果取反
+ * 
+ * 返回值：
+ *   0  - 成功
+ *  -1  - 发生异常
+ * 
+ * 处理逻辑：
+ * 1. 如果两个操作数都是数字类型（INT/FLOAT64/BigInt），直接比较
+ * 2. 如果类型相同，使用严格相等比较（js_strict_eq2）
+ * 3. null 和 undefined 互相相等
+ * 4. 字符串和数字比较时，将字符串转换为数字
+ * 5. BigInt 和字符串比较时，将字符串转换为 BigInt
+ * 6. 布尔值转换为数字后比较
+ * 7. 对象和原始类型比较时，将对象转换为原始值（ToPrimitive）
+ * 8. IsHTMLDDA 对象在 == 比较中等同于 undefined
+ * -----------------------------------------------------------------------------
+ */
+int res;
     uint32_t tag1, tag2;
 
     op1 = sp[-2];
     op2 = sp[-1];
  redo:
+    /* 获取操作数的标准化类型标签 */
     tag1 = JS_VALUE_GET_NORM_TAG(op1);
     tag2 = JS_VALUE_GET_NORM_TAG(op2);
+    
+    /* 情况 1: 两个操作数都是数字类型 */
     if (tag_is_number(tag1) && tag_is_number(tag2)) {
         if (tag1 == JS_TAG_INT && tag2 == JS_TAG_INT) {
+            /* 两个都是整数，直接比较 */
             res = JS_VALUE_GET_INT(op1) == JS_VALUE_GET_INT(op2);
         } else if ((tag1 == JS_TAG_FLOAT64 &&
                     (tag2 == JS_TAG_INT || tag2 == JS_TAG_FLOAT64)) ||
                    (tag2 == JS_TAG_FLOAT64 &&
                     (tag1 == JS_TAG_INT || tag1 == JS_TAG_FLOAT64))) {
+            /* 至少一个是浮点数，转换为 double 后比较 */
             double d1, d2;
             if (tag1 == JS_TAG_FLOAT64) {
                 d1 = JS_VALUE_GET_FLOAT64(op1);
@@ -19975,21 +20020,31 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
             }
             res = (d1 == d2);
         } else {
+            /* BigInt 比较 */
             res = js_compare_bigint(ctx, OP_eq, op1, op2);
         }
-    } else if (tag1 == tag2) {
+    } 
+    /* 情况 2: 类型相同，使用严格相等比较 */
+    else if (tag1 == tag2) {
         res = js_strict_eq2(ctx, op1, op2, JS_EQ_STRICT);
-    } else if ((tag1 == JS_TAG_NULL && tag2 == JS_TAG_UNDEFINED) ||
-               (tag2 == JS_TAG_NULL && tag1 == JS_TAG_UNDEFINED)) {
+    } 
+    /* 情况 3: null 和 undefined 互相相等 */
+    else if ((tag1 == JS_TAG_NULL && tag2 == JS_TAG_UNDEFINED) ||
+             (tag2 == JS_TAG_NULL && tag1 == JS_TAG_UNDEFINED)) {
         res = TRUE;
-    } else if (tag_is_string(tag1) && tag_is_string(tag2)) {
+    } 
+    /* 情况 4: 两个都是字符串（包括 ropes） */
+    else if (tag_is_string(tag1) && tag_is_string(tag2)) {
         /* needed when comparing strings and ropes */
         res = js_strict_eq2(ctx, op1, op2, JS_EQ_STRICT);
-    } else if ((tag_is_string(tag1) && tag_is_number(tag2)) ||
-               (tag_is_string(tag2) && tag_is_number(tag1))) {
+    } 
+    /* 情况 5: 字符串和数字比较，将字符串转换为数字 */
+    else if ((tag_is_string(tag1) && tag_is_number(tag2)) ||
+             (tag_is_string(tag2) && tag_is_number(tag1))) {
 
         if (tag1 == JS_TAG_BIG_INT || tag1 == JS_TAG_SHORT_BIG_INT ||
             tag2 == JS_TAG_BIG_INT || tag2 == JS_TAG_SHORT_BIG_INT) {
+            /* BigInt 和字符串比较：将字符串转换为 BigInt */
             if (tag_is_string(tag1)) {
                 op1 = JS_StringToBigInt(ctx, op1);
                 if (JS_VALUE_GET_TAG(op1) != JS_TAG_BIG_INT &&
@@ -20008,6 +20063,7 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
                 }
             }
         } else {
+            /* 普通数字和字符串比较：将字符串转换为数字 */
             op1 = JS_ToNumericFree(ctx, op1);
             if (JS_IsException(op1)) {
                 JS_FreeValue(ctx, op2);
@@ -20020,13 +20076,17 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
             }
         }
         res = js_strict_eq2(ctx, op1, op2, JS_EQ_STRICT);
-    } else if (tag1 == JS_TAG_BOOL) {
+    } 
+    /* 情况 6: 布尔值转换为数字后比较 */
+    else if (tag1 == JS_TAG_BOOL) {
         op1 = JS_NewInt32(ctx, JS_VALUE_GET_INT(op1));
         goto redo;
     } else if (tag2 == JS_TAG_BOOL) {
         op2 = JS_NewInt32(ctx, JS_VALUE_GET_INT(op2));
         goto redo;
-    } else if ((tag1 == JS_TAG_OBJECT &&
+    } 
+    /* 情况 7: 对象和原始类型比较，将对象转换为原始值 */
+    else if ((tag1 == JS_TAG_OBJECT &&
                 (tag_is_number(tag2) || tag_is_string(tag2) || tag2 == JS_TAG_SYMBOL)) ||
                (tag2 == JS_TAG_OBJECT &&
                 (tag_is_number(tag1) || tag_is_string(tag1) || tag1 == JS_TAG_SYMBOL))) {
@@ -20041,7 +20101,9 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
             goto exception;
         }
         goto redo;
-    } else {
+    } 
+    /* 情况 8: IsHTMLDDA 对象在 == 比较中等同于 undefined */
+    else {
         /* IsHTMLDDA object is equivalent to undefined for '==' and '!=' */
         if ((JS_IsHTMLDDA(ctx, op1) &&
              (tag2 == JS_TAG_NULL || tag2 == JS_TAG_UNDEFINED)) ||
@@ -20101,6 +20163,31 @@ static no_inline int js_shr_slow(JSContext *ctx, JSValue *sp)
     return -1;
 }
 
+/* -----------------------------------------------------------------------------
+ * js_strict_eq2 - 严格相等比较的核心实现（=== 操作符）
+ * -----------------------------------------------------------------------------
+ * 功能：实现 ECMAScript 规范中的 Strict Equality Comparison 算法
+ *       支持多种相等性模式：严格相等、SameValue、SameValueZero
+ * 
+ * 参数：
+ *   ctx    - JS 上下文
+ *   op1    - 第一个操作数
+ *   op2    - 第二个操作数
+ *   eq_mode - 相等性模式：
+ *             JS_EQ_STRICT       - 严格相等（===）
+ *             JS_EQ_SAME_VALUE   - SameValue（用于 Object.is）
+ *             JS_EQ_SAME_VALUE_ZERO - SameValueZero（用于 Map/Set 键比较）
+ * 
+ * 返回值：
+ *   TRUE  - 两个值相等
+ *   FALSE - 两个值不相等
+ * 
+ * 关键差异：
+ * - 严格相等：+0 === -0 为 true，NaN === NaN 为 false
+ * - SameValue：+0 !== -0，NaN === NaN
+ * - SameValueZero：+0 === -0，NaN === NaN
+ * -----------------------------------------------------------------------------
+ */
 /* XXX: Should take JSValueConst arguments */
 static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
                           JSStrictEqModeEnum eq_mode)
@@ -20109,10 +20196,14 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
     int tag1, tag2;
     double d1, d2;
 
+    /* 获取操作数的标准化类型标签 */
     tag1 = JS_VALUE_GET_NORM_TAG(op1);
     tag2 = JS_VALUE_GET_NORM_TAG(op2);
+    
+    /* 根据第一个操作数的类型进行分支处理 */
     switch(tag1) {
     case JS_TAG_BOOL:
+        /* 布尔值比较：类型不同则不等，类型相同则比较整数值 */
         if (tag1 != tag2) {
             res = FALSE;
         } else {
@@ -20120,24 +20211,32 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
             goto done_no_free;
         }
         break;
+        
     case JS_TAG_NULL:
     case JS_TAG_UNDEFINED:
+        /* null 和 undefined：只有类型相同才相等 */
         res = (tag1 == tag2);
         break;
+        
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
+        /* 字符串比较：包括普通字符串和 rope 字符串 */
         {
             if (!tag_is_string(tag2)) {
                 res = FALSE;
             } else if (tag1 == JS_TAG_STRING && tag2 == JS_TAG_STRING) {
+                /* 两个都是普通字符串，直接比较 */
                 res = js_string_eq(ctx, JS_VALUE_GET_STRING(op1),
                                    JS_VALUE_GET_STRING(op2));
             } else {
+                /* 至少一个是 rope 字符串，使用 rope 比较 */
                 res = (js_string_rope_compare(ctx, op1, op2, TRUE) == 0);
             }
         }
         break;
+        
     case JS_TAG_SYMBOL:
+        /* Symbol 比较：比较指针（Symbol 是唯一的） */
         {
             JSAtomStruct *p1, *p2;
             if (tag1 != tag2) {
@@ -20149,13 +20248,17 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
             }
         }
         break;
+        
     case JS_TAG_OBJECT:
+        /* 对象比较：比较对象指针（引用相等） */
         if (tag1 != tag2)
             res = FALSE;
         else
             res = JS_VALUE_GET_OBJ(op1) == JS_VALUE_GET_OBJ(op2);
         break;
+        
     case JS_TAG_INT:
+        /* 整数比较：需要处理与浮点数的比较 */
         d1 = JS_VALUE_GET_INT(op1);
         if (tag2 == JS_TAG_INT) {
             d2 = JS_VALUE_GET_INT(op2);
@@ -20167,7 +20270,9 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
             res = FALSE;
         }
         break;
+        
     case JS_TAG_FLOAT64:
+        /* 浮点数比较 */
         d1 = JS_VALUE_GET_FLOAT64(op1);
         if (tag2 == JS_TAG_FLOAT64) {
             d2 = JS_VALUE_GET_FLOAT64(op2);
@@ -20177,25 +20282,32 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
             res = FALSE;
             break;
         }
+        
     number_test:
+        /* 数字比较的统一处理逻辑 */
         if (unlikely(eq_mode >= JS_EQ_SAME_VALUE)) {
             JSFloat64Union u1, u2;
             /* NaN is not always normalized, so this test is necessary */
             if (isnan(d1) || isnan(d2)) {
+                /* NaN 处理：SameValue 模式下 NaN === NaN */
                 res = isnan(d1) == isnan(d2);
             } else if (eq_mode == JS_EQ_SAME_VALUE_ZERO) {
                 res = (d1 == d2); /* +0 == -0 */
             } else {
+                /* SameValue 模式：+0 != -0，通过比较位模式实现 */
                 u1.d = d1;
                 u2.d = d2;
                 res = (u1.u64 == u2.u64); /* +0 != -0 */
             }
         } else {
+            /* 严格相等模式：NaN 返回 false，+0 == -0 */
             res = (d1 == d2); /* if NaN return false and +0 == -0 */
         }
         goto done_no_free;
+        
     case JS_TAG_SHORT_BIG_INT:
     case JS_TAG_BIG_INT:
+        /* BigInt 比较 */
         {
             JSBigIntBuf buf1, buf2;
             JSBigInt *p1, *p2;
@@ -20206,6 +20318,7 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
                 break;
             }
             
+            /* 处理短 BigInt（内联存储）和长 BigInt（堆存储） */
             if (JS_VALUE_GET_TAG(op1) == JS_TAG_SHORT_BIG_INT)
                 p1 = js_bigint_set_short(&buf1, op1);
             else
@@ -20217,10 +20330,12 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
             res = (js_bigint_cmp(ctx, p1, p2) == 0);
         }
         break;
+        
     default:
         res = FALSE;
         break;
     }
+    /* 释放操作数（如果不是通过 goto done_no_free 跳过） */
     JS_FreeValue(ctx, op1);
     JS_FreeValue(ctx, op2);
  done_no_free:
@@ -20335,17 +20450,36 @@ static __exception int js_operator_private_in(JSContext *ctx, JSValue *sp)
     return 0;
 }
 
+/* -----------------------------------------------------------------------------
+ * js_has_unscopable - 检查 with 语句中的 unscopables 标记
+ * -----------------------------------------------------------------------------
+ * 功能：检查对象是否在 Symbol.unscopables 中标记了指定属性
+ *       用于 with 语句中确定是否应该跳过该属性
+ * 
+ * 参数：
+ *   ctx  - JS 上下文
+ *   obj  - with 对象
+ *   atom - 属性名
+ * 
+ * 返回值：
+ *   1  - 属性被标记为 unscopable，应该跳过
+ *   0  - 属性未被标记，可以访问
+ *  -1  - 发生异常
+ * -----------------------------------------------------------------------------
+ */
 static __exception int js_has_unscopable(JSContext *ctx, JSValueConst obj,
                                          JSAtom atom)
 {
     JSValue arr, val;
     int ret;
 
+    /* 获取对象的 Symbol.unscopables 属性 */
     arr = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_unscopables);
     if (JS_IsException(arr))
         return -1;
     ret = 0;
     if (JS_IsObject(arr)) {
+        /* 检查该属性是否在 unscopables 中标记为 true */
         val = JS_GetProperty(ctx, arr, atom);
         ret = JS_ToBoolFree(ctx, val);
     }
@@ -20353,22 +20487,56 @@ static __exception int js_has_unscopable(JSContext *ctx, JSValueConst obj,
     return ret;
 }
 
+/* -----------------------------------------------------------------------------
+ * js_operator_instanceof - instanceof 操作符实现
+ * -----------------------------------------------------------------------------
+ * 功能：实现 ECMAScript 的 instanceof 操作符
+ *       检查对象是否在另一个对象的原型链上
+ * 
+ * 参数：
+ *   ctx - JS 上下文
+ *   sp  - 栈指针，sp[-2] 是对象，sp[-1] 是构造函数
+ * 
+ * 返回值：
+ *   0  - 成功
+ *  -1  - 发生异常
+ * -----------------------------------------------------------------------------
+ */
 static __exception int js_operator_instanceof(JSContext *ctx, JSValue *sp)
 {
     JSValue op1, op2;
     BOOL ret;
 
-    op1 = sp[-2];
-    op2 = sp[-1];
+    op1 = sp[-2];  /* 待检查的对象 */
+    op2 = sp[-1];  /* 构造函数 */
     ret = JS_IsInstanceOf(ctx, op1, op2);
     if (ret < 0)
         return ret;
     JS_FreeValue(ctx, op1);
     JS_FreeValue(ctx, op2);
-    sp[-2] = JS_NewBool(ctx, ret);
+    sp[-2] = JS_NewBool(ctx, ret);  /* 将结果压回栈 */
     return 0;
 }
 
+/* -----------------------------------------------------------------------------
+ * js_operator_typeof - typeof 操作符实现
+ * -----------------------------------------------------------------------------
+ * 功能：实现 ECMAScript 的 typeof 操作符
+ *       返回操作数的类型字符串
+ * 
+ * 参数：
+ *   ctx  - JS 上下文
+ *   op1  - 操作数
+ * 
+ * 返回值：
+ *   类型对应的 Atom（bigint/number/undefined/boolean/string/function/object/symbol）
+ * 
+ * 特殊处理：
+ * - IsHTMLDDA 对象返回 "undefined"（历史遗留特性）
+ * - 函数对象返回 "function"（而不是 "object"）
+ * - null 返回 "object"（历史遗留 bug）
+ * -----------------------------------------------------------------------------
+ */
 static __exception int js_operator_typeof(JSContext *ctx, JSValueConst op1)
 {
     JSAtom atom;
@@ -20399,8 +20567,10 @@ static __exception int js_operator_typeof(JSContext *ctx, JSValueConst op1)
             JSObject *p;
             p = JS_VALUE_GET_OBJ(op1);
             if (unlikely(p->is_HTMLDDA))
+                /* IsHTMLDDA 是浏览器宿主的特殊对象，typeof 返回 "undefined" */
                 atom = JS_ATOM_undefined;
             else if (JS_IsFunction(ctx, op1))
+                /* 函数对象 typeof 返回 "function" */
                 atom = JS_ATOM_function;
             else
                 goto obj_type;
@@ -20408,6 +20578,7 @@ static __exception int js_operator_typeof(JSContext *ctx, JSValueConst op1)
         break;
     case JS_TAG_NULL:
     obj_type:
+        /* null typeof 返回 "object"（历史遗留 bug） */
         atom = JS_ATOM_object;
         break;
     case JS_TAG_SYMBOL:
@@ -20420,14 +20591,29 @@ static __exception int js_operator_typeof(JSContext *ctx, JSValueConst op1)
     return atom;
 }
 
+/* -----------------------------------------------------------------------------
+ * js_operator_delete - delete 操作符实现
+ * -----------------------------------------------------------------------------
+ * 功能：实现 ECMAScript 的 delete 操作符
+ *       删除对象的属性
+ * 
+ * 参数：
+ *   ctx - JS 上下文
+ *   sp  - 栈指针，sp[-2] 是对象，sp[-1] 是属性名
+ * 
+ * 返回值：
+ *   0  - 成功
+ *  -1  - 发生异常
+ * -----------------------------------------------------------------------------
+ */
 static __exception int js_operator_delete(JSContext *ctx, JSValue *sp)
 {
     JSValue op1, op2;
     JSAtom atom;
     int ret;
 
-    op1 = sp[-2];
-    op2 = sp[-1];
+    op1 = sp[-2];  /* 目标对象 */
+    op2 = sp[-1];  /* 属性名 */
     atom = JS_ValueToAtom(ctx, op2);
     if (unlikely(atom == JS_ATOM_NULL))
         return -1;
@@ -20441,6 +20627,17 @@ static __exception int js_operator_delete(JSContext *ctx, JSValue *sp)
     return 0;
 }
 
+/* -----------------------------------------------------------------------------
+ * js_throw_type_error - 抛出类型错误的辅助函数
+ * -----------------------------------------------------------------------------
+ * 功能：用于 arguments.callee 的 getter/setter
+ *       在非严格模式下调用且无参数时返回 undefined（ES5 兼容性）
+ *       其他情况抛出 TypeError
+ * 
+ * 注意：这不是 100% 兼容的实现，但 Mozilla 使用类似的实现来确保
+ *       非严格模式下的调用者不会抛出异常（ES5 兼容性）
+ * -----------------------------------------------------------------------------
+ */
 /* XXX: not 100% compatible, but mozilla seems to use a similar
    implementation to ensure that caller in non strict mode does not
    throw (ES5 compatibility) */
@@ -20454,6 +20651,12 @@ static JSValue js_throw_type_error(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* -----------------------------------------------------------------------------
+ * js_function_proto_fileName - 函数原型 fileName 属性的 getter
+ * -----------------------------------------------------------------------------
+ * 功能：返回函数定义所在的文件名（调试信息）
+ * -----------------------------------------------------------------------------
+ */
 static JSValue js_function_proto_fileName(JSContext *ctx,
                                           JSValueConst this_val)
 {
@@ -20464,6 +20667,15 @@ static JSValue js_function_proto_fileName(JSContext *ctx,
     return JS_UNDEFINED;
 }
 
+/* -----------------------------------------------------------------------------
+ * js_function_proto_lineNumber - 函数原型 lineNumber 属性的 getter
+ * -----------------------------------------------------------------------------
+ * 功能：返回函数定义所在的行号/列号（调试信息）
+ * 
+ * 参数：
+ *   is_col - TRUE 返回列号，FALSE 返回行号
+ * -----------------------------------------------------------------------------
+ */
 static JSValue js_function_proto_lineNumber(JSContext *ctx,
                                             JSValueConst this_val, int is_col)
 {
@@ -20479,6 +20691,23 @@ static JSValue js_function_proto_lineNumber(JSContext *ctx,
     return JS_UNDEFINED;
 }
 
+/* ============================================================================
+ * Arguments 对象处理
+ * ============================================================================
+ * arguments 对象是 JavaScript 函数中的特殊对象，包含传入函数的所有参数
+ * 分为两种类型：
+ * - 普通 arguments：参数与函数内部变量不绑定
+ * - Mapped arguments：在非严格模式下，参数与内部变量双向绑定
+ * ============================================================================
+ */
+
+/* -----------------------------------------------------------------------------
+ * js_arguments_define_own_property - arguments 对象的 defineOwnProperty 陷阱
+ * -----------------------------------------------------------------------------
+ * 功能：处理 arguments 对象的属性定义
+ *       当重定义已存在的数值索引属性时，将 fast array 转换为普通数组
+ * -----------------------------------------------------------------------------
+ */
 static int js_arguments_define_own_property(JSContext *ctx,
                                             JSValueConst this_obj,
                                             JSAtom prop, JSValueConst val,
@@ -20502,6 +20731,25 @@ static const JSClassExoticMethods js_arguments_exotic_methods = {
     .define_own_property = js_arguments_define_own_property,
 };
 
+/* -----------------------------------------------------------------------------
+ * js_build_arguments - 构建普通 arguments 对象
+ * -----------------------------------------------------------------------------
+ * 功能：创建 arguments 对象，用于非映射参数的情况
+ * 
+ * 参数：
+ *   ctx  - JS 上下文
+ *   argc - 参数个数
+ *   argv - 参数数组
+ * 
+ * 返回值：
+ *   arguments 对象
+ * 
+ * 属性：
+ * - length: 参数个数
+ * - Symbol.iterator: 数组迭代器
+ * - callee: 抛出 TypeError 的 getter/setter（严格模式）
+ * -----------------------------------------------------------------------------
+ */
 static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
 {
     JSValue val, *tab;
