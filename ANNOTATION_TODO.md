@@ -241,6 +241,8 @@
 | 2026-04-23 | quickjs.c | 47500 | 50000 | 2500 | 45,950 | 70.8% | QJ-19 模块完成（Error 内置对象/Array 构造函数与静态方法/Array 实例方法：at/with/concat/every/some/map/filter/reduce/includes/indexOf/sort/toSorted/toReversed 等） |
 | 2026-04-23 | quickjs.c | 50000 | 53000 | 3000 | 48,950 | 73.4% | QJ-20 模块部分（Iterator Helper: drop/filter/flatMap/map/take/every/find/forEach/some/reduce/toArray 等核心实现） |
 | 2026-04-23 | quickjs.c | 53000 | 54500 | 1500 | 50,450 | 74.7% | QJ-20 模块继续（Number 对象：构造函数/静态方法 isNaN/isFinite/isInteger/isSafeBoolean 对象：构造函数/原型方法） |
+| 2026-04-23 | quickjs.c | 64000 | 64700 | 700 | 51,150 | 75.8% | QJ-21 模块完成（TypedArray 基础操作：验证/边界检查/属性访问器/公共 API） |
+| 2026-04-23 | quickjs.c | 64700 | 65200 | 500 | 51,650 | 76.5% | QJ-22 模块部分（TypedArray 迭代与转换：at/with/set 方法） |
 
 ---
 

@@ -64015,6 +64015,34 @@ static const JSCFunctionListEntry js_shared_array_buffer_proto_funcs[] = {
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "SharedArrayBuffer", JS_PROP_CONFIGURABLE ),
 };
 
+/* ============================================================================
+ * QJ-21: TypedArray 基础操作
+ * 功能：TypedArray 对象的验证、边界检查、属性访问
+ * 行号范围：64000-64500
+ * ============================================================================ */
+
+/**
+ * get_typed_array - 验证并获取 TypedArray 对象
+ * @ctx: JS 上下文
+ * @this_val: 要验证的 JS 值
+ * 
+ * 功能：
+ * - 检查 this_val 是否为对象类型
+ * - 检查对象的 class_id 是否在 TypedArray 范围内
+ *   (JS_CLASS_UINT8C_ARRAY 到 JS_CLASS_FLOAT64_ARRAY)
+ * - 如果不是 TypedArray，抛出 TypeError 并返回 NULL
+ * 
+ * 返回：
+ * - 成功：JSObject 指针
+ * - 失败：NULL 并抛出异常
+ * 
+ * 支持的 TypedArray 类型：
+ * - Uint8ClampedArray, Int8Array, Uint8Array
+ * - Int16Array, Uint16Array
+ * - Int32Array, Uint32Array
+ * - BigInt64Array, BigUint64Array
+ * - Float16Array, Float32Array, Float64Array
+ */
 static JSObject *get_typed_array(JSContext *ctx, JSValueConst this_val)
 {
     JSObject *p;
@@ -64030,6 +64058,25 @@ static JSObject *get_typed_array(JSContext *ctx, JSValueConst this_val)
     return p;
 }
 
+/**
+ * typed_array_is_oob - 检查 TypedArray 是否越界或已分离
+ * @p: TypedArray 对象指针（必须是 TypedArray，不能是 DataView）
+ * 
+ * 功能：
+ * - 检查底层 ArrayBuffer 是否已分离（detached）
+ * - 检查 TypedArray 的偏移量是否超出缓冲区范围
+ * - 检查 TypedArray 的长度是否超出缓冲区剩余空间
+ * - 对于可调整大小的 ArrayBuffer（RAB），需要额外检查实际元素范围
+ * 
+ * 返回：
+ * - TRUE: 越界或已分离，不能安全访问
+ * - FALSE: 可以安全访问
+ * 
+ * 注意：
+ * - 此函数不抛出异常，仅返回状态
+ * - 调用前必须确保 p 是有效的 TypedArray 对象
+ * - 对于 track_rab=true 的情况，长度可能动态变化，只检查偏移量
+ */
 // is the typed array detached or out of bounds relative to its RAB?
 // |p| must be a typed array, *not* a DataView
 static BOOL typed_array_is_oob(JSObject *p)
@@ -64058,6 +64105,35 @@ static BOOL typed_array_is_oob(JSObject *p)
     return end > len;
 }
 
+/**
+ * js_typed_array_get_length_unsafe - 获取 TypedArray 长度（不安全版本）
+ * @ctx: JS 上下文
+ * @obj: TypedArray 对象
+ * 
+ * 功能：
+ * - 验证 obj 是否为有效的 TypedArray
+ * - 检查是否越界（OOB - Out Of Bounds）
+ * - 返回元素个数（不是字节数）
+ * 
+ * 返回：
+ * - 成功：元素个数（int）
+ * - 失败：-1 并抛出 TypeErrorArrayBufferOOB 异常
+ * 
+ * ⚠️ 安全警告：
+ * - 此函数返回的长度仅在当前调用栈中有效
+ * - 一旦再次进入 JS 代码（如调用 JS_GetProperty、JS_ToIndex 等），
+ *   JS 代码可能分离（detach）或调整大小（resize）底层 ArrayBuffer
+ * - 此时之前获取的长度值将失效，继续使用会导致未定义行为
+ * 
+ * 安全做法：
+ * - 如需安全访问元素，使用 JS_GetProperty、JS_GetPropertyInt64、
+ *   JS_SetProperty 等 API，它们会进行边界检查
+ * - 或直接使用 js_get_fast_array_element
+ * 
+ * 典型用途：
+ * - 在纯 C 代码中快速迭代 TypedArray 元素
+ * - 在执行任何 JS 调用之前先获取长度并缓存
+ */
 // Be *very* careful if you touch the typed array's memory directly:
 // the length is only valid until the next call into JS land because
 // JS code can detach or resize the backing array buffer. Functions
@@ -64079,6 +64155,23 @@ static int js_typed_array_get_length_unsafe(JSContext *ctx, JSValueConst obj)
     return p->u.array.count;
 }
 
+/**
+ * validate_typed_array - 验证 TypedArray 是否可用
+ * @ctx: JS 上下文
+ * @this_val: TypedArray 对象
+ * 
+ * 功能：
+ * - 验证 this_val 是否为有效的 TypedArray
+ * - 检查是否越界（OOB）
+ * 
+ * 返回：
+ * - 成功：0
+ * - 失败：-1 并抛出 TypeErrorArrayBufferOOB 异常
+ * 
+ * 用途：
+ * - 在 TypedArray 方法开始时进行参数验证
+ * - 比 js_typed_array_get_length_unsafe 更轻量（不返回长度）
+ */
 static int validate_typed_array(JSContext *ctx, JSValueConst this_val)
 {
     JSObject *p;
@@ -64092,6 +64185,23 @@ static int validate_typed_array(JSContext *ctx, JSValueConst this_val)
     return 0;
 }
 
+/**
+ * js_typed_array_get_length - TypedArray.prototype.length 的 getter
+ * @ctx: JS 上下文
+ * @this_val: TypedArray 对象
+ * 
+ * 功能：
+ * - 获取 TypedArray 的元素个数
+ * - 返回 JS 数值（Int32）
+ * 
+ * 返回：
+ * - 成功：JS_NewInt32(ctx, count)
+ * - 失败：JS_EXCEPTION 并抛出异常
+ * 
+ * 注意：
+ * - 此函数不检查越界，因为 length 访问器在分离时返回 0
+ * - 与 js_typed_array_get_length_unsafe 不同，这是安全的属性访问器
+ */
 static JSValue js_typed_array_get_length(JSContext *ctx,
                                          JSValueConst this_val)
 {
@@ -64102,6 +64212,23 @@ static JSValue js_typed_array_get_length(JSContext *ctx,
     return JS_NewInt32(ctx, p->u.array.count);
 }
 
+/**
+ * js_typed_array_get_buffer - TypedArray.prototype.buffer 的 getter
+ * @ctx: JS 上下文
+ * @this_val: TypedArray 对象
+ * 
+ * 功能：
+ * - 获取 TypedArray 底层的 ArrayBuffer 对象
+ * - 返回缓冲区的引用（增加引用计数）
+ * 
+ * 返回：
+ * - 成功：ArrayBuffer 对象（引用计数 +1）
+ * - 失败：JS_EXCEPTION 并抛出异常
+ * 
+ * 注意：
+ * - 返回的对象需要调用者负责释放（JS_FreeValue）
+ * - 即使缓冲区已分离，仍然返回该缓冲区对象
+ */
 static JSValue js_typed_array_get_buffer(JSContext *ctx,
                                          JSValueConst this_val)
 {
@@ -64114,6 +64241,33 @@ static JSValue js_typed_array_get_buffer(JSContext *ctx,
     return JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
 }
 
+/**
+ * js_typed_array_get_byteLength - TypedArray.prototype.byteLength 的 getter
+ * @ctx: JS 上下文
+ * @this_val: TypedArray 对象
+ * 
+ * 功能：
+ * - 获取 TypedArray 占用的字节数
+ * - 计算公式：byteLength = elementCount * bytesPerElement
+ * 
+ * 返回：
+ * - 成功：字节数（Uint32 或 Int64）
+ * - 越界：返回 0（不抛出异常，符合规范）
+ * - 失败：JS_EXCEPTION 并抛出异常
+ * 
+ * 特殊情况处理：
+ * - track_rab=true：底层是可调整大小的 ArrayBuffer（RAB）
+ *   - byteLength 可能动态变化，需要根据当前元素个数重新计算
+ *   - 返回：elementCount << size_log2（即 elementCount * bytesPerElement）
+ * - track_rab=false：底层是固定大小的 ArrayBuffer
+ *   - 直接返回缓存的 ta->length 值
+ * 
+ * 元素大小对照表：
+ * - Int8Array, Uint8Array, Uint8ClampedArray: 1 字节
+ * - Int16Array, Uint16Array, Float16Array: 2 字节
+ * - Int32Array, Uint32Array, Float32Array: 4 字节
+ * - BigInt64Array, BigUint64Array, Float64Array: 8 字节
+ */
 static JSValue js_typed_array_get_byteLength(JSContext *ctx,
                                              JSValueConst this_val)
 {
@@ -64133,6 +64287,28 @@ static JSValue js_typed_array_get_byteLength(JSContext *ctx,
     return JS_NewInt64(ctx, (int64_t)p->u.array.count << size_log2);
 }
 
+/**
+ * js_typed_array_get_byteOffset - TypedArray.prototype.byteOffset 的 getter
+ * @ctx: JS 上下文
+ * @this_val: TypedArray 对象
+ * 
+ * 功能：
+ * - 获取 TypedArray 在底层 ArrayBuffer 中的起始偏移量（字节）
+ * - 当 TypedArray 通过 view 方式创建时，offset 可能不为 0
+ * 
+ * 示例：
+ *   const buffer = new ArrayBuffer(100);
+ *   const view = new Uint8Array(buffer, 10, 50);  // byteOffset = 10
+ * 
+ * 返回：
+ * - 成功：偏移量（Uint32）
+ * - 越界：返回 0（不抛出异常，符合规范）
+ * - 失败：JS_EXCEPTION 并抛出异常
+ * 
+ * 注意：
+ * - 偏移量在创建时确定，之后不会改变
+ * - 即使底层 ArrayBuffer 被调整大小，offset 仍保持不变
+ */
 static JSValue js_typed_array_get_byteOffset(JSContext *ctx,
                                              JSValueConst this_val)
 {
@@ -64147,6 +64323,37 @@ static JSValue js_typed_array_get_byteOffset(JSContext *ctx,
     return JS_NewUint32(ctx, ta->offset);
 }
 
+/**
+ * JS_NewTypedArray - C API：创建新的 TypedArray
+ * @ctx: JS 上下文
+ * @argc: 参数个数
+ * @argv: 参数数组（与 JS 构造函数参数相同）
+ * @type: TypedArray 类型枚举
+ * 
+ * 功能：
+ * - 根据指定类型创建 TypedArray 对象
+ * - 支持多种构造方式：
+ *   1. new TypeArray(length) - 创建指定长度的数组
+ *   2. new TypeArray(buffer, offset, length) - 基于 ArrayBuffer 创建视图
+ *   3. new TypeArray(typedArray) - 从另一个 TypedArray 复制
+ *   4. new TypeArray(object) - 从可迭代对象或类数组对象创建
+ * 
+ * 参数：
+ * - type: JS_TYPED_ARRAY_UINT8C 到 JS_TYPED_ARRAY_FLOAT64
+ * 
+ * 返回：
+ * - 成功：新创建的 TypedArray 对象
+ * - 失败：JS_EXCEPTION 并抛出 RangeError 或 TypeError
+ * 
+ * 示例：
+ *   JSValue args[1] = { JS_NewInt32(ctx, 10) };
+ *   JSValue arr = JS_NewTypedArray(ctx, 1, args, JS_TYPED_ARRAY_UINT8);
+ *   // 等价于 JS: new Uint8Array(10)
+ * 
+ * 注意：
+ * - 这是 C API，不是 JS 可调用的函数
+ * - 内部调用 js_typed_array_constructor 实现
+ */
 JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
                          JSTypedArrayEnum type)
 {
@@ -64157,6 +64364,44 @@ JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
                                       JS_CLASS_UINT8C_ARRAY + type);
 }
 
+/**
+ * JS_GetTypedArrayBuffer - C API：获取 TypedArray 的底层缓冲区信息
+ * @ctx: JS 上下文
+ * @obj: TypedArray 对象
+ * @pbyte_offset: 输出参数，字节偏移量（可为 NULL）
+ * @pbyte_length: 输出参数，字节长度（可为 NULL）
+ * @pbytes_per_element: 输出参数，每个元素的字节数（可为 NULL）
+ * 
+ * 功能：
+ * - 获取 TypedArray 关联的 ArrayBuffer
+ * - 可选地返回偏移量、长度和元素大小
+ * 
+ * 返回：
+ * - 成功：ArrayBuffer 对象（引用计数 +1）
+ * - 失败：
+ *   - 不是 TypedArray：JS_EXCEPTION + TypeError
+ *   - 缓冲区已分离：JS_EXCEPTION + TypeErrorArrayBufferOOB
+ * 
+ * 输出参数说明：
+ * - pbyte_offset: TypedArray 在缓冲区中的起始位置（字节）
+ * - pbyte_length: TypedArray 占用的总字节数
+ * - pbytes_per_element: 每个元素占用的字节数
+ *   - 计算方式：1 << typed_array_size_log2(class_id)
+ *   - 例如：Uint8Array=1, Int16Array=2, Float32Array=4, BigInt64Array=8
+ * 
+ * 注意：
+ * - 返回的 ArrayBuffer 需要调用者负责释放（JS_FreeValue）
+ * - 所有输出参数都是可选的，传入 NULL 表示不需要该信息
+ * 
+ * 示例：
+ *   size_t offset, length, elem_size;
+ *   JSValue buffer = JS_GetTypedArrayBuffer(ctx, typedArray,
+ *                                           &offset, &length, &elem_size);
+ *   if (!JS_IsException(buffer)) {
+ *       // 可以直接访问底层内存：abuf->data + offset
+ *       JS_FreeValue(ctx, buffer);
+ *   }
+ */
 /* Return the buffer associated to the typed array or an exception if
    it is not a typed array or if the buffer is detached. pbyte_offset,
    pbyte_length or pbytes_per_element can be NULL. */
@@ -64277,6 +64522,43 @@ fail:
     return JS_EXCEPTION;
 }
 
+/* ============================================================================
+ * QJ-22: TypedArray 迭代与转换
+ * 功能：元素访问、批量操作、类型转换
+ * 行号范围：64500-65000
+ * ============================================================================ */
+
+/**
+ * js_typed_array_at - TypedArray.prototype.at(index)
+ * @ctx: JS 上下文
+ * @this_val: TypedArray 对象
+ * @argc: 参数个数
+ * @argv: 参数数组 [index]
+ * 
+ * 功能：
+ * - 支持负索引的 TypedArray 元素访问
+ * - at(-1) 返回最后一个元素，at(-2) 返回倒数第二个，以此类推
+ * - 这是 ES2022 新增的 Array/TyperArray 方法
+ * 
+ * 参数：
+ * - index: 要访问的索引（支持负数）
+ * 
+ * 返回：
+ * - 有效索引：对应元素的值
+ * - 越界：JS_UNDEFINED（不抛出异常）
+ * - 失败：JS_EXCEPTION 并抛出异常
+ * 
+ * 实现细节：
+ * - 负索引转换：idx = len + idx（例如：len=10, idx=-1 → 9）
+ * - 两次获取长度：防止在 JS_ToInt64Sat 调用期间 ArrayBuffer 被修改
+ * - 使用 JS_GetPropertyInt64 进行安全的元素访问
+ * 
+ * 示例：
+ *   const arr = new Uint8Array([10, 20, 30, 40, 50]);
+ *   arr.at(0);    // 10
+ *   arr.at(-1);   // 50
+ *   arr.at(10);   // undefined
+ */
 static JSValue js_typed_array_at(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
@@ -64304,6 +64586,44 @@ static JSValue js_typed_array_at(JSContext *ctx, JSValueConst this_val,
     return JS_GetPropertyInt64(ctx, this_val, idx);
 }
 
+/**
+ * js_typed_array_with - TypedArray.prototype.with(index, value)
+ * @ctx: JS 上下文
+ * @this_val: TypedArray 对象
+ * @argc: 参数个数
+ * @argv: 参数数组 [index, value]
+ * 
+ * 功能：
+ * - 返回一个新的 TypedArray，其中指定索引处的元素被替换为新值
+ * - 原 TypedArray 保持不变（不可变操作）
+ * - 这是 ES2023 新增的 Array/TypedArray 方法
+ * 
+ * 参数：
+ * - index: 要替换的索引（支持负数）
+ * - value: 新值（会自动转换为 TypedArray 的元素类型）
+ * 
+ * 返回：
+ * - 成功：新的 TypedArray 对象（指定位置已替换）
+ * - 失败：JS_EXCEPTION 并抛出异常
+ * 
+ * 实现细节：
+ * - 支持负索引：idx = len + idx
+ * - 使用 JS_ToPrimitive 将 value 转换为数字（HINT_NUMBER）
+ * - 调用 js_typed_array_constructor_ta 创建同类型的新数组
+ * - 使用 JS_SetPropertyInt64 设置新值（会进行类型转换和范围检查）
+ * 
+ * 注意：
+ * - 在创建新数组前检查越界，防止无效操作
+ * - 创建后再次检查越界，防止在转换过程中 ArrayBuffer 被修改
+ * 
+ * 示例：
+ *   const arr = new Uint8Array([10, 20, 30, 40, 50]);
+ *   const newArr = arr.with(2, 99);
+ *   // arr = [10, 20, 30, 40, 50]  (不变)
+ *   // newArr = [10, 20, 99, 40, 50]
+ *   
+ *   arr.with(-1, 100);  // [10, 20, 30, 40, 100]
+ */
 static JSValue js_typed_array_with(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
@@ -64346,6 +64666,41 @@ static JSValue js_typed_array_with(JSContext *ctx, JSValueConst this_val,
     return arr;
 }
 
+/**
+ * js_typed_array_set - TypedArray.prototype.set(array, offset)
+ * @ctx: JS 上下文
+ * @this_val: 目标 TypedArray
+ * @argc: 参数个数
+ * @argv: 参数数组 [sourceArray, offset]
+ * 
+ * 功能：
+ * - 将源数组（TypedArray 或类数组对象）的元素复制到目标 TypedArray
+ * - 从指定的偏移量开始写入
+ * 
+ * 参数：
+ * - sourceArray: 源数组（TypedArray 或可迭代对象）
+ * - offset: 可选，起始偏移量（默认 0）
+ * 
+ * 返回：
+ * - 成功：JS_UNDEFINED
+ * - 失败：JS_EXCEPTION 并抛出异常
+ * 
+ * 实现细节：
+ * - 委托给 js_typed_array_set_internal 实现核心逻辑
+ * - 支持两种源类型：
+ *   1. TypedArray：同类型时使用 memmove 快速复制
+ *   2. 类数组对象：逐个元素读取并转换类型
+ * 
+ * 示例：
+ *   const target = new Uint8Array(10);
+ *   const source = new Uint8Array([1, 2, 3, 4, 5]);
+ *   target.set(source);      // [1,2,3,4,5,0,0,0,0,0]
+ *   target.set(source, 3);   // [0,0,0,1,2,3,4,5,0,0]
+ * 
+ * 注意：
+ * - 如果源数组过长导致越界，抛出 RangeError
+ * - 支持 TypedArray 之间的重叠复制（使用 memmove）
+ */
 static JSValue js_typed_array_set(JSContext *ctx,
                                   JSValueConst this_val,
                                   int argc, JSValueConst *argv)
@@ -65296,8 +65651,35 @@ static JSValue js_typed_array_subarray(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
-/* TypedArray.prototype.sort */
+/* ============================================================================
+ * QJ-23: TypedArray 排序与比较
+ * 功能：元素比较、排序算法、索引查找
+ * 行号范围：65200-65700
+ * ============================================================================ */
 
+/**
+ * js_cmp_doubles - 双精度浮点数比较函数
+ * @x: 第一个操作数
+ * @y: 第二个操作数
+ * 
+ * 功能：
+ * - 实现 ECMAScript 规范定义的浮点数比较语义
+ * - 处理 NaN、正负零等特殊值
+ * 
+ * 比较规则：
+ * 1. NaN 大于任何值（包括其他 NaN）
+ * 2. 正零 (+0) 大于负零 (-0)
+ * 3. 其他情况按数值大小比较
+ * 
+ * 返回：
+ * - x < y: -1
+ * - x > y: +1
+ * - x == y: 0
+ * 
+ * 注意：
+ * - 此函数用于 TypedArray 的 sort 方法
+ * - 符合 IEEE 754 浮点数比较规范
+ */
 static int js_cmp_doubles(double x, double y)
 {
     if (isnan(x))    return isnan(y) ? 0 : +1;
@@ -65309,55 +65691,114 @@ static int js_cmp_doubles(double x, double y)
     else             return signbit(y) ? 1 : 0;
 }
 
+/* ==================== TypedArray 原生比较函数族 ====================
+ * 用于 TypedArray.sort() 的无比较器快速路径
+ * 每种类型都有专用的比较函数，避免类型转换开销
+ * 
+ * 参数约定：
+ * - a, b: 指向元素的指针
+ * - opaque: 未使用（保持与 rqsort 签名兼容）
+ * 
+ * 返回值：
+ * - *a < *b: 负数
+ * - *a > *b: 正数
+ * - *a == *b: 0
+ * ====================================================================== */
+
+/**
+ * js_TA_cmp_int8 - Int8Array 元素比较
+ * 直接相减（不会溢出，因为 int8 范围小）
+ */
 static int js_TA_cmp_int8(const void *a, const void *b, void *opaque) {
     return *(const int8_t *)a - *(const int8_t *)b;
 }
 
+/**
+ * js_TA_cmp_uint8 - Uint8Array/Uint8ClampedArray 元素比较
+ * 直接相减（不会溢出）
+ */
 static int js_TA_cmp_uint8(const void *a, const void *b, void *opaque) {
     return *(const uint8_t *)a - *(const uint8_t *)b;
 }
 
+/**
+ * js_TA_cmp_int16 - Int16Array 元素比较
+ * 直接相减
+ */
 static int js_TA_cmp_int16(const void *a, const void *b, void *opaque) {
     return *(const int16_t *)a - *(const int16_t *)b;
 }
 
+/**
+ * js_TA_cmp_uint16 - Uint16Array 元素比较
+ * 直接相减
+ */
 static int js_TA_cmp_uint16(const void *a, const void *b, void *opaque) {
     return *(const uint16_t *)a - *(const uint16_t *)b;
 }
 
+/**
+ * js_TA_cmp_int32 - Int32Array 元素比较
+ * 使用三目运算避免溢出：(y < x) - (y > x)
+ * 等价于：x > y ? 1 : (x < y ? -1 : 0)
+ */
 static int js_TA_cmp_int32(const void *a, const void *b, void *opaque) {
     int32_t x = *(const int32_t *)a;
     int32_t y = *(const int32_t *)b;
     return (y < x) - (y > x);
 }
 
+/**
+ * js_TA_cmp_uint32 - Uint32Array 元素比较
+ * 使用三目运算避免溢出
+ */
 static int js_TA_cmp_uint32(const void *a, const void *b, void *opaque) {
     uint32_t x = *(const uint32_t *)a;
     uint32_t y = *(const uint32_t *)b;
     return (y < x) - (y > x);
 }
 
+/**
+ * js_TA_cmp_int64 - BigInt64Array 元素比较
+ * 使用三目运算避免溢出
+ */
 static int js_TA_cmp_int64(const void *a, const void *b, void *opaque) {
     int64_t x = *(const int64_t *)a;
     int64_t y = *(const int64_t *)b;
     return (y < x) - (y > x);
 }
 
+/**
+ * js_TA_cmp_uint64 - BigUint64Array 元素比较
+ * 使用三目运算避免溢出
+ */
 static int js_TA_cmp_uint64(const void *a, const void *b, void *opaque) {
     uint64_t x = *(const uint64_t *)a;
     uint64_t y = *(const uint64_t *)b;
     return (y < x) - (y > x);
 }
 
+/**
+ * js_TA_cmp_float16 - Float16Array 元素比较
+ * 转换为 double 后使用 js_cmp_doubles 比较
+ */
 static int js_TA_cmp_float16(const void *a, const void *b, void *opaque) {
     return js_cmp_doubles(fromfp16(*(const uint16_t *)a),
                           fromfp16(*(const uint16_t *)b));
 }
 
+/**
+ * js_TA_cmp_float32 - Float32Array 元素比较
+ * 使用 js_cmp_doubles 比较（处理 NaN 和正负零）
+ */
 static int js_TA_cmp_float32(const void *a, const void *b, void *opaque) {
     return js_cmp_doubles(*(const float *)a, *(const float *)b);
 }
 
+/**
+ * js_TA_cmp_float64 - Float64Array 元素比较
+ * 直接使用 js_cmp_doubles 比较
+ */
 static int js_TA_cmp_float64(const void *a, const void *b, void *opaque) {
     return js_cmp_doubles(*(const double *)a, *(const double *)b);
 }
