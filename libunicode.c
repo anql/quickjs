@@ -2201,16 +2201,50 @@ int unicode_prop(CharRange *cr, const char *prop_name)
 
 #endif /* CONFIG_ALL_UNICODE */
 
-/*---- lre codepoint categorizing functions ----*/
+/* ============================================================
+ * LRE (LibRegexp) 字符分类函数
+ * ============================================================
+ * 
+ * 功能：提供正则表达式引擎所需的字符分类查询表
+ * 用途：\s, \d, \w, \D, \W, \S 等字符类的快速判断
+ */
 
-#define S  UNICODE_C_SPACE
-#define D  UNICODE_C_DIGIT
-#define X  UNICODE_C_XDIGIT
-#define U  UNICODE_C_UPPER
-#define L  UNICODE_C_LOWER
-#define _  UNICODE_C_UNDER
-#define d  UNICODE_C_DOLLAR
+/* 宏定义：字符分类位掩码标识符 */
+#define S  UNICODE_C_SPACE    /* 空白字符 */
+#define D  UNICODE_C_DIGIT    /* 数字字符 */
+#define X  UNICODE_C_XDIGIT   /* 十六进制数字 */
+#define U  UNICODE_C_UPPER    /* 大写字母 */
+#define L  UNICODE_C_LOWER    /* 小写字母 */
+#define _  UNICODE_C_UNDER    /* 下划线 */
+#define d  UNICODE_C_DOLLAR   /* 美元符号 */
 
+/*
+ * 【ASCII 字符分类表】
+ * 功能：256 个 ASCII 字符的分类位图
+ * 
+ * 布局：每行 16 个字符（0x10 个），共 16 行
+ * 分类位：
+ *   - UNICODE_C_SPACE: 空白字符 (\s)
+ *   - UNICODE_C_DIGIT: 十进制数字 (\d)
+ *   - UNICODE_C_XDIGIT: 十六进制数字 (\x)
+ *   - UNICODE_C_UPPER: 大写字母
+ *   - UNICODE_C_LOWER: 小写字母
+ *   - UNICODE_C_UNDER: 下划线 (_)
+ *   - UNICODE_C_DOLLAR: 美元符号 ($)
+ * 
+ * 表结构详解：
+ * 第 0-3 行 (0x00-0x3F): 控制字符、标点、数字、大写字母
+ * 第 4-7 行 (0x40-0x7F): 大写字母、下划线、小写字母
+ * 第 8-15 行 (0x80-0xFF): 扩展 ASCII（大部分无分类）
+ * 
+ * 示例：
+ *   0x09-0x0D: 空白字符（制表符、换行等）
+ *   0x30-0x39: 数字 0-9 (X|D)
+ *   0x41-0x5A: 大写字母 A-Z (X|U)
+ *   0x61-0x7A: 小写字母 a-z (X|L)
+ *   0x5F: 下划线 (_)
+ *   0x24: 美元符号 ($)
+ */
 uint8_t const lre_ctype_bits[256] = {
     0, 0, 0, 0, 0, 0, 0, 0,
     0, S, S, S, S, S, 0, 0,
@@ -2261,7 +2295,31 @@ uint8_t const lre_ctype_bits[256] = {
 #undef _
 #undef d
 
-/* code point ranges for Zs,Zl or Zp property */
+/*
+ * 【Unicode 空白字符范围表】
+ * 功能：存储 Unicode 中所有空白字符（Zs/Zl/Zp 属性）的码点范围
+ * 
+ * 数据格式：
+ *   - 第 1 个元素：范围对的数量（10 个范围对 = 20 个元素）
+ *   - 后续元素：成对的 [起始码点，结束码点 +1)
+ * 
+ * 包含的空白字符：
+ *   0x0009-0x000D: ASCII 控制空白（TAB, LF, VT, FF, CR）
+ *   0x0020: 普通空格 (SPACE)
+ *   0x00A0: 不换行空格 (NBSP)
+ *   0x1680: Ogham 空格标记
+ *   0x2000-0x200A: 各种宽度空格（En Quad 到 Hair Space）
+ *   0x2028: 行分隔符 (LINE SEPARATOR, Zl)
+ *   0x2029: 段落分隔符 (PARAGRAPH SEPARATOR, Zp)
+ *   0x202F: 窄不换行空格 (NNBSP)
+ *   0x205F: 中等数学空格 (MMSP)
+ *   0x3000: 表意文字空格（中文全角空格）
+ *   0xFEFF: 零宽不换行空格（BOM）
+ * 
+ * 注意：
+ *   - 范围是左闭右开 [start, end)
+ *   - 只包含非 ASCII 部分（ASCII 部分由 lre_ctype_bits 处理）
+ */
 static const uint16_t char_range_s[] = {
     10,
     0x0009, 0x000D + 1,
@@ -2279,6 +2337,26 @@ static const uint16_t char_range_s[] = {
     0xFEFF, 0xFEFF + 1,
 };
 
+/*
+ * 【判断非 ASCII 空白字符】
+ * 功能：检查一个 Unicode 码点是否是空白字符（非 ASCII 部分）
+ * 参数：c - Unicode 字符码点
+ * 返回：TRUE=是空白字符，FALSE=不是
+ * 
+ * 实现逻辑：
+ * 1. 从索引 5 开始遍历 char_range_s（跳过 ASCII 范围）
+ * 2. 使用二分查找的简化版（线性扫描，因为表很小）
+ * 3. 如果 c 落在某个范围内，返回 TRUE
+ * 4. 如果遍历完所有范围都没找到，返回 FALSE
+ * 
+ * 性能优化：
+ *   - ASCII 空白字符（0x00-0x7F）由 lre_ctype_bits 快速查询
+ *   - 本函数只处理非 ASCII 字符，减少查表范围
+ * 
+ * 应用场景：
+ *   - 正则表达式 \s 字符类
+ *   - JavaScript 的 trim()、split(/\s+/) 等字符串操作
+ */
 BOOL lre_is_space_non_ascii(uint32_t c)
 {
     size_t i, n;
@@ -2295,138 +2373,219 @@ BOOL lre_is_space_non_ascii(uint32_t c)
     return FALSE;
 }
 
-#define SEQ_MAX_LEN 16
+#define SEQ_MAX_LEN 16  /* 表情符号序列最大长度 */
 
+/*
+ * 【Unicode 序列属性处理函数】
+ * 功能：根据序列属性类型，生成对应的 Unicode 字符序列（主要是 Emoji）
+ * 参数：
+ *   - seq_prop_idx: 序列属性索引（如 Basic_Emoji, RGI_Emoji_Flag_Sequence 等）
+ *   - cb: 回调函数，每生成一个序列就调用一次
+ *   - opaque: 回调函数的用户数据
+ *   - cr: 临时字符范围缓冲区
+ * 返回：0=成功，-1=错误，-2=未找到属性
+ * 
+ * 什么是 Unicode 序列：
+ *   - 单个码点无法表示的字符（如国旗、复杂表情）
+ *   - 由多个码点组合而成（基础表情 + 修饰符 + ZWJ 连接符）
+ * 
+ * Emoji 序列类型详解：
+ * 
+ * 1. Basic_Emoji (基础表情)
+ *    - 单一码点的表情符号
+ *    - 部分带 U+FE0F (变体选择符) 的显式表情
+ * 
+ * 2. RGI_Emoji_Modifier_Sequence (肤色修饰序列)
+ *    - 基础表情 + 肤色修饰符 (U+1F3FB~U+1F3FF)
+ *    - 例如：👋 + 肤色 = 👋🏻/👋🏼/👋🏽/👋🏾/👋🏿
+ * 
+ * 3. RGI_Emoji_Flag_Sequence (国旗序列)
+ *    - 两个区域指示符号组合成国旗
+ *    - 例如：🇺 + 🇸 = 🇺🇸 (美国国旗)
+ *    - 编码：0x1F1E6 + 字母索引 (A=0, B=1, ...)
+ * 
+ * 4. RGI_Emoji_ZWJ_Sequence (ZWJ 连接序列)
+ *    - 使用 U+200D (零宽连接符) 连接多个表情
+ *    - 例如：👨 + ZWJ + 🍳 = 👨‍🍳 (男厨师)
+ *    - 支持发色修饰 (U+1F9B0~U+1F9B3) 和肤色修饰
+ * 
+ * 5. RGI_Emoji_Tag_Sequence (标签序列)
+ *    - 使用 U+E0000~U+E007F 标签字符编码子国旗
+ *    - 例如：🏴󠁧󠁢󠁥󠁮󠁧󠁿 (英格兰)、🏴󠁧󠁢󠁳󠁣󠁴󠁿 (苏格兰)
+ *    - 格式：🏴 + 标签序列 + 取消标签 (U+E007F)
+ * 
+ * 6. Emoji_Keycap_Sequence (按键帽序列)
+ *    - 数字/符号 + U+FE0F + U+20E3 (组合封闭符)
+ *    - 例如：1⃣, 2⃣, #⃣, *⃣
+ * 
+ * 7. RGI_Emoji (RGI 推荐表情)
+ *    - 以上所有序列的并集
+ *    - RGI = Recommended for General Interchange
+ */
 static int unicode_sequence_prop1(int seq_prop_idx, UnicodeSequencePropCB *cb, void *opaque,
                                   CharRange *cr)
 {
     int i, c, j;
-    uint32_t seq[SEQ_MAX_LEN];
+    uint32_t seq[SEQ_MAX_LEN];  /* 存储生成的序列 */
     
     switch(seq_prop_idx) {
     case UNICODE_SEQUENCE_PROP_Basic_Emoji:
+        /* 基础表情：单一码点表情 */
         if (unicode_prop1(cr, UNICODE_PROP_Basic_Emoji1) < 0)
             return -1;
         for(i = 0; i < cr->len; i += 2) {
             for(c = cr->points[i]; c < cr->points[i + 1]; c++) {
                 seq[0] = c;
-                cb(opaque, seq, 1);
+                cb(opaque, seq, 1);  /* 单码点序列 */
             }
         }
 
         cr->len = 0;
 
+        /* 带变体选择符的表情 (显式表情样式) */
         if (unicode_prop1(cr, UNICODE_PROP_Basic_Emoji2) < 0)
             return -1;
         for(i = 0; i < cr->len; i += 2) {
             for(c = cr->points[i]; c < cr->points[i + 1]; c++) {
                 seq[0] = c;
-                seq[1] = 0xfe0f;
-                cb(opaque, seq, 2);
+                seq[1] = 0xfe0f;  /* U+FE0F: VARIATION SELECTOR-16 (表情样式) */
+                cb(opaque, seq, 2);  /* 双码点序列 */
             }
         }
 
         break;
     case UNICODE_SEQUENCE_PROP_RGI_Emoji_Modifier_Sequence:
+        /* 肤色修饰序列：基础表情 + 5 种肤色修饰符 */
         if (unicode_prop1(cr, UNICODE_PROP_Emoji_Modifier_Base) < 0)
             return -1;
         for(i = 0; i < cr->len; i += 2) {
             for(c = cr->points[i]; c < cr->points[i + 1]; c++) {
                 for(j = 0; j < 5; j++) {
-                    seq[0] = c;
-                    seq[1] = 0x1f3fb + j;
+                    seq[0] = c;  /* 基础表情（如 👋） */
+                    seq[1] = 0x1f3fb + j;  /* 肤色：U+1F3FB~U+1F3FF (5 种) */
                     cb(opaque, seq, 2);
                 }
             }
         }
         break;
     case UNICODE_SEQUENCE_PROP_RGI_Emoji_Flag_Sequence:
+        /* 国旗序列：两个区域指示符号组合 */
         if (unicode_prop1(cr, UNICODE_PROP_RGI_Emoji_Flag_Sequence) < 0)
             return -1;
         for(i = 0; i < cr->len; i += 2) {
             for(c = cr->points[i]; c < cr->points[i + 1]; c++) {
                 int c0, c1;
-                c0 = c / 26;
-                c1 = c % 26;
-                seq[0] = 0x1F1E6 + c0;
+                /* 将索引转换为两个区域指示符 */
+                c0 = c / 26;  /* 第一个字母 (0-25 对应 A-Z) */
+                c1 = c % 26;  /* 第二个字母 */
+                seq[0] = 0x1F1E6 + c0;  /* U+1F1E6~U+1F1FF: 区域指示符 A-Z */
                 seq[1] = 0x1F1E6 + c1;
                 cb(opaque, seq, 2);
             }
         }
         break;
     case UNICODE_SEQUENCE_PROP_RGI_Emoji_ZWJ_Sequence:
+        /* ZWJ 连接序列：最复杂的表情类型 */
         {
             int len, code, pres, k, mod, mod_count, mod_pos[2], hc_pos, n_mod, n_hc, mod1;
             int mod_idx, hc_idx, i0, i1;
             const uint8_t *tab = unicode_rgi_emoji_zwj_sequence;
             
+            /* 遍历压缩编码的 ZWJ 序列模板表 */
             for(i = 0; i < countof(unicode_rgi_emoji_zwj_sequence);) {
-                len = tab[i++];
-                k = 0;
-                mod = 0;
-                mod_count = 0;
-                hc_pos = -1;
+                len = tab[i++];  /* 序列模板长度（码点数量） */
+                k = 0;  /* 当前序列写入位置 */
+                mod = 0;  /* 修饰符类型 (0=无，1=肤色，2=双肤色，3=混合肤色) */
+                mod_count = 0;  /* 修饰符位置计数 */
+                hc_pos = -1;  /* 发色修饰符位置 (Hair Color) */
+                
+                /* 解析序列模板的每个码点 */
                 for(j = 0; j < len; j++) {
+                    /* 读取 16 位编码值（小端序） */
                     code = tab[i++];
                     code |= tab[i++] << 8;
-                    pres = code >> 15;
-                    mod1 = (code >> 13) & 3;
-                    code &= 0x1fff;
+                    
+                    pres = code >> 15;  /* 位 15: 是否需要 U+FE0F 变体选择符 */
+                    mod1 = (code >> 13) & 3;  /* 位 13-14: 修饰符类型 */
+                    code &= 0x1fff;  /* 位 0-12: 压缩的码点值 */
+                    
+                    /* 解压缩码点 */
                     if (code < 0x1000) {
-                        c = code + 0x2000;
+                        c = code + 0x2000;  /* U+2000~U+2FFF */
                     } else {
-                        c = 0x1f000 + (code - 0x1000);
+                        c = 0x1f000 + (code - 0x1000);  /* U+1F000~ */
                     }
+                    
+                    /* 记录发色修饰符位置 (U+1F9B0~U+1F9B3) */
                     if (c == 0x1f9b0)
                         hc_pos = k;
+                    
                     seq[k++] = c;
+                    
+                    /* 处理肤色修饰符占位符 */
                     if (mod1 != 0) {
                         assert(mod_count < 2);
                         mod = mod1;
                         mod_pos[mod_count++] = k;
-                        seq[k++] = 0; /* will be filled later */
+                        seq[k++] = 0; /* 占位符，稍后填充具体肤色值 */
                     }
+                    
+                    /* 添加变体选择符 (如果需要) */
                     if (pres) {
-                        seq[k++] = 0xfe0f;
+                        seq[k++] = 0xfe0f;  /* U+FE0F: 表情样式 */
                     }
+                    
+                    /* 添加 ZWJ 连接符 (除最后一个码点外) */
                     if (j < len - 1) {
-                        seq[k++] = 0x200d;
+                        seq[k++] = 0x200d;  /* U+200D: ZERO WIDTH JOINER */
                     }
                 }
 
-                /* genrate all the variants */
+                /* 生成所有变体组合 */
+                /* 根据修饰符类型计算变体数量 */
                 switch(mod) {
                 case 1:
+                    /* 单肤色修饰：5 种肤色 */
                     n_mod = 5;
                     break;
                 case 2:
+                    /* 双肤色修饰：5×5=25 种组合 */
                     n_mod = 25;
                     break;
                 case 3:
+                    /* 混合肤色修饰：5×4=20 种组合 (排除相同肤色) */
                     n_mod = 20;
                     break;
                 default:
+                    /* 无肤色修饰 */
                     n_mod = 1;
                     break;
                 }
+                /* 计算发色变体数量 */
                 if (hc_pos >= 0)
-                    n_hc = 4;
+                    n_hc = 4;  /* 4 种发色：U+1F9B0~U+1F9B3 */
                 else
                     n_hc = 1;
+                
+                /* 生成所有发色×肤色的组合 */
                 for(hc_idx = 0; hc_idx < n_hc; hc_idx++) {
                     for(mod_idx = 0; mod_idx < n_mod; mod_idx++) {
+                        /* 设置发色修饰符 */
                         if (hc_pos >= 0)
-                            seq[hc_pos] = 0x1f9b0 + hc_idx;
+                            seq[hc_pos] = 0x1f9b0 + hc_idx;  /* 🦰/🦱/🦳/🦲 */
                         
+                        /* 设置肤色修饰符 */
                         switch(mod) {
                         case 1:
+                            /* 单肤色：直接映射 */
                             seq[mod_pos[0]] = 0x1f3fb + mod_idx;
                             break;
                         case 2:
                         case 3:
-                            i0 = mod_idx / 5;
-                            i1 = mod_idx % 5;
-                            /* avoid identical values */
+                            /* 双肤色：分解为两个索引 */
+                            i0 = mod_idx / 5;  /* 第一个肤色索引 (0-4) */
+                            i1 = mod_idx % 5;  /* 第二个肤色索引 (0-4) */
+                            /* mod=3 时避免两个肤色相同 */
                             if (mod == 3 && i0 >= i1)
                                 i0++;
                             seq[mod_pos[0]] = 0x1f3fb + i0;
@@ -2436,10 +2595,12 @@ static int unicode_sequence_prop1(int seq_prop_idx, UnicodeSequencePropCB *cb, v
                             break;
                         }
 #if 0
+                        /* 调试输出：打印生成的序列 */
                         for(j = 0; j < k; j++)
                             printf(" %04x", seq[j]);
                         printf("\n");
 #endif                
+                        /* 调用回调函数处理生成的序列 */
                         cb(opaque, seq, k);
                     }
                 }
@@ -2447,57 +2608,91 @@ static int unicode_sequence_prop1(int seq_prop_idx, UnicodeSequencePropCB *cb, v
         }
         break;
     case UNICODE_SEQUENCE_PROP_RGI_Emoji_Tag_Sequence:
+        /* 标签序列：子国旗（英格兰、苏格兰等） */
         {
             for(i = 0; i < countof(unicode_rgi_emoji_tag_sequence);) {
                 j = 0;
-                seq[j++] = 0x1F3F4;
+                seq[j++] = 0x1F3F4;  /* U+1F3F4: 黑旗 🏴 */
                 for(;;) {
                     c = unicode_rgi_emoji_tag_sequence[i++];
                     if (c == 0x00)
                         break;
+                    /* 标签字符：U+E0000~U+E007F (私有区) */
                     seq[j++] = 0xe0000 + c;
                 }
-                seq[j++] = 0xe007f;
+                seq[j++] = 0xe007f;  /* U+E007F: CANCEL TAG (结束标记) */
                 cb(opaque, seq, j);
             }
         }
         break;
     case UNICODE_SEQUENCE_PROP_Emoji_Keycap_Sequence:
+        /* 按键帽序列：数字/符号 + 变体符 + 组合封闭符 */
         if (unicode_prop1(cr, UNICODE_PROP_Emoji_Keycap_Sequence) < 0)
             return -1;
         for(i = 0; i < cr->len; i += 2) {
             for(c = cr->points[i]; c < cr->points[i + 1]; c++) {
-                seq[0] = c;
-                seq[1] = 0xfe0f;
-                seq[2] = 0x20e3;
+                seq[0] = c;  /* 基础字符 (0-9, #, *) */
+                seq[1] = 0xfe0f;  /* U+FE0F: 变体选择符 */
+                seq[2] = 0x20e3;  /* U+20E3: COMBINING ENCLOSING KEYCAP ⃣ */
                 cb(opaque, seq, 3);
             }
         }
         break;
     case UNICODE_SEQUENCE_PROP_RGI_Emoji:
-        /* all prevous sequences */
+        /* RGI Emoji 全集：遍历以上所有序列类型 */
         for(i = UNICODE_SEQUENCE_PROP_Basic_Emoji; i <= UNICODE_SEQUENCE_PROP_RGI_Emoji_ZWJ_Sequence; i++) {
             int ret;
             ret = unicode_sequence_prop1(i, cb, opaque, cr);
             if (ret < 0)
                 return ret;
-            cr->len = 0;
+            cr->len = 0;  /* 清空临时缓冲区 */
         }
         break;
     default:
-        return -2;
+        return -2;  /* 未找到指定的序列属性 */
     }
     return 0;
 }
 
-/* build a unicode sequence property */
-/* return -2 if not found, -1 if other error. 'cr' is used as temporary memory. */
+/*
+ * 【Unicode 序列属性查询入口函数】
+ * 功能：根据属性名称生成对应的 Unicode 字符序列
+ * 参数：
+ *   - prop_name: 属性名称字符串（如 "RGI_Emoji", "Basic_Emoji" 等）
+ *   - cb: 回调函数，每生成一个序列就调用一次
+ *   - opaque: 回调函数的用户数据
+ *   - cr: 临时字符范围缓冲区
+ * 返回：
+ *   - 0: 成功
+ *   - -1: 其他错误
+ *   - -2: 未找到指定的属性名称
+ * 
+ * 工作流程：
+ * 1. 在属性名称表中查找 prop_name 对应的索引
+ * 2. 调用 unicode_sequence_prop1 处理具体的序列生成
+ * 
+ * 支持的属性名称：
+ *   - Basic_Emoji
+ *   - RGI_Emoji_Modifier_Sequence
+ *   - RGI_Emoji_Flag_Sequence
+ *   - RGI_Emoji_ZWJ_Sequence
+ *   - RGI_Emoji_Tag_Sequence
+ *   - Emoji_Keycap_Sequence
+ *   - RGI_Emoji (全集)
+ * 
+ * 应用场景：
+ *   - 正则表达式引擎的 Unicode 属性支持
+ *   - \p{RGI_Emoji} 等属性匹配
+ *   - 表情符号过滤和验证
+ */
 int unicode_sequence_prop(const char *prop_name, UnicodeSequencePropCB *cb, void *opaque,
                           CharRange *cr)
 {
     int seq_prop_idx;
+    /* 在属性名称表中查找索引 */
     seq_prop_idx = unicode_find_name(unicode_sequence_prop_name_table, prop_name);
     if (seq_prop_idx < 0)
-        return -2;
+        return -2;  /* 未找到属性 */
+    /* 调用具体处理函数 */
     return unicode_sequence_prop1(seq_prop_idx, cb, opaque, cr);
 }
