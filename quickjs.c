@@ -47781,8 +47781,11 @@ static const JSCFunctionListEntry js_function_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("columnNumber", js_function_proto_lineNumber, NULL, 1 ),
 };
 
-/* Error class */
+/* ==================== Error 错误类 ==================== */
+/* 实现 ECMAScript Error 对象及其子类 (EvalError, RangeError, ReferenceError, 
+   SyntaxError, TypeError, URIError, InternalError, AggregateError) */
 
+/* 将可迭代对象转换为数组 - 用于 AggregateError 的错误列表收集 */
 static JSValue iterator_to_array(JSContext *ctx, JSValueConst items)
 {
     JSValue iter, next_method = JS_UNDEFINED;
@@ -47821,6 +47824,19 @@ static JSValue iterator_to_array(JSContext *ctx, JSValueConst items)
     goto done;
 }
 
+/* Error 构造函数 - 创建错误对象
+ * @param ctx 运行时上下文
+ * @param new_target new.target 值，用于确定构造函数
+ * @param argc 参数个数
+ * @param argv 参数数组 [message, options]
+ * @param magic 错误类型标识 (JS_AGGREGATE_ERROR 等)
+ * @return 新创建的错误对象
+ * 
+ * 支持语法:
+ *   new Error(message, options)
+ *   new TypeError(message, options)
+ *   new AggregateError(errors, message, options)
+ */
 static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv, int magic)
 {
@@ -47828,11 +47844,16 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
     JSValueConst message, options;
     int arg_index;
 
+    /* 获取当前激活的函数作为 new_target */
     if (JS_IsUndefined(new_target))
         new_target = JS_GetActiveFunction(ctx);
+    
+    /* 获取原型对象 */
     proto = JS_GetProperty(ctx, new_target, JS_ATOM_prototype);
     if (JS_IsException(proto))
         return proto;
+    
+    /* 如果原型不是对象，使用内置原型 */
     if (!JS_IsObject(proto)) {
         JSContext *realm;
         JSValueConst proto1;
@@ -47848,12 +47869,17 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
         }
         proto = JS_DupValue(ctx, proto1);
     }
+    
+    /* 创建错误对象实例 */
     obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_ERROR);
     JS_FreeValue(ctx, proto);
     if (JS_IsException(obj))
         return obj;
+    
+    /* AggregateError 的第一个参数是 errors 列表，跳过它获取 message */
     arg_index = (magic == JS_AGGREGATE_ERROR);
 
+    /* 设置 message 属性 */
     message = argv[arg_index++];
     if (!JS_IsUndefined(message)) {
         msg = JS_ToString(ctx, message);
@@ -47863,6 +47889,7 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     }
 
+    /* 处理 options 参数中的 cause 属性 (ES2022) */
     if (arg_index < argc) {
         options = argv[arg_index];
         if (JS_IsObject(options)) {
@@ -47879,6 +47906,7 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
         }
     }
 
+    /* AggregateError 特殊处理：设置 errors 属性 */
     if (magic == JS_AGGREGATE_ERROR) {
         JSValue error_list = iterator_to_array(ctx, argv[0]);
         if (JS_IsException(error_list))
@@ -47887,7 +47915,7 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     }
 
-    /* skip the Error() function in the backtrace */
+    /* 构建堆栈回溯，跳过 Error() 函数本身 */
     build_backtrace(ctx, obj, NULL, 0, 0, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
     return obj;
  exception:
@@ -47895,13 +47923,20 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
     return JS_EXCEPTION;
 }
 
+/* Error.prototype.toString - 将错误对象转换为字符串表示
+ * 格式："name: message" 或 "name" 或 "message"
+ * @return 错误字符串表示
+ */
 static JSValue js_error_toString(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
     JSValue name, msg;
 
+    /* this 值必须是对象 */
     if (!JS_IsObject(this_val))
         return JS_ThrowTypeErrorNotAnObject(ctx);
+    
+    /* 获取 name 属性，默认为 "Error" */
     name = JS_GetProperty(ctx, this_val, JS_ATOM_name);
     if (JS_IsUndefined(name))
         name = JS_AtomToString(ctx, JS_ATOM_Error);
@@ -47910,6 +47945,7 @@ static JSValue js_error_toString(JSContext *ctx, JSValueConst this_val,
     if (JS_IsException(name))
         return JS_EXCEPTION;
 
+    /* 获取 message 属性，默认为空字符串 */
     msg = JS_GetProperty(ctx, this_val, JS_ATOM_message);
     if (JS_IsUndefined(msg))
         msg = JS_AtomToString(ctx, JS_ATOM_empty_string);
@@ -47919,11 +47955,17 @@ static JSValue js_error_toString(JSContext *ctx, JSValueConst this_val,
         JS_FreeValue(ctx, name);
         return JS_EXCEPTION;
     }
+    
+    /* 拼接 name 和 message，中间用 ": " 分隔 */
     if (!JS_IsEmptyString(name) && !JS_IsEmptyString(msg))
         name = JS_ConcatString3(ctx, "", name, ": ");
     return JS_ConcatString(ctx, name, msg);
 }
 
+/* ==================== Error 内置对象 ==================== */
+/* Error 是所有错误类型的基类，提供统一的错误处理接口 */
+
+/* Error.prototype.toString 方法定义表 */
 static const JSCFunctionListEntry js_error_proto_funcs[] = {
     JS_CFUNC_DEF("toString", 0, js_error_toString ),
     JS_PROP_STRING_DEF("name", "Error", JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE ),
@@ -47959,9 +48001,10 @@ static const JSCFunctionListEntry js_error_funcs[] = {
     JS_CFUNC_DEF("isError", 1, js_error_isError),
 };
 
-/* AggregateError */
+/* ==================== AggregateError 聚合错误 ==================== */
+/* ES2021 新增，用于表示多个错误包装在一起的错误 */
 
-/* used by C code. */
+/* AggregateError 构造函数 - 供 C 代码直接调用 */
 static JSValue js_aggregate_error_constructor(JSContext *ctx,
                                               JSValueConst errors)
 {
@@ -47977,8 +48020,20 @@ static JSValue js_aggregate_error_constructor(JSContext *ctx,
     return obj;
 }
 
-/* Array */
+/* ==================== Array 数组内置对象 ==================== */
+/* 实现 ECMAScript Array 对象及其所有方法
+ * 包括：构造函数、静态方法、实例方法、迭代器、排序、扁平化等 */
 
+/* 复制子数组 - 用于数组元素的内部移动操作 (push/unshift/splice 等)
+ * @param obj 目标数组对象
+ * @param to_pos 目标起始位置
+ * @param from_pos 源起始位置
+ * @param count 要复制的元素个数
+ * @param dir 方向：+1 向前，-1 向后
+ * @return 0 成功，-1 失败
+ * 
+ * 优化：对 fast_array 使用内存级操作 (memmove) 提升性能
+ */
 static int JS_CopySubArray(JSContext *ctx,
                            JSValueConst obj, int64_t to_pos,
                            int64_t from_pos, int64_t count, int dir)
@@ -47989,6 +48044,7 @@ static int JS_CopySubArray(JSContext *ctx,
     int fromPresent;
 
     p = NULL;
+    /* 检查是否为 fast_array 以启用快速路径 */
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
         p = JS_VALUE_GET_OBJ(obj);
         if (p->class_id != JS_CLASS_ARRAY || !p->fast_array) {
@@ -48076,6 +48132,19 @@ fail:
     return JS_EXCEPTION;
 }
 
+/* Array.from - 从类数组或可迭代对象创建新数组
+ * 语法：Array.from(items[, mapfn[, thisArg]])
+ * @param items 类数组对象或可迭代对象
+ * @param mapfn 可选的映射函数
+ * @param thisArg mapfn 的 this 绑定
+ * @return 新创建的数组
+ * 
+ * 处理流程:
+ * 1. 检查 items 是否可迭代 (有 Symbol.iterator)
+ * 2. 如果可迭代，使用迭代器协议逐个获取元素
+ * 3. 如果不可迭代，当作类数组对象处理 (通过 length 属性)
+ * 4. 如果提供 mapfn，对每个元素调用映射函数
+ */
 static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -48195,12 +48264,18 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
     return r;
 }
 
+/* Array.of - 从可变参数创建新数组
+ * 语法：Array.of(...elements)
+ * 与 Array 构造函数不同：Array.of(3) => [3], 而 Array(3) => [empty × 3]
+ * @return 包含所有参数的新数组
+ */
 static JSValue js_array_of(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
 {
     JSValue obj, args[1];
     int i;
 
+    /* 支持子类化：如果 this_val 是构造函数，调用它 */
     if (JS_IsConstructor(ctx, this_val)) {
         args[0] = JS_NewInt32(ctx, argc);
         obj = JS_CallConstructor(ctx, this_val, 1, (JSValueConst *)args);
@@ -48209,6 +48284,7 @@ static JSValue js_array_of(JSContext *ctx, JSValueConst this_val,
     }
     if (JS_IsException(obj))
         return JS_EXCEPTION;
+    /* 将所有参数复制到数组中 */
     for(i = 0; i < argc; i++) {
         if (JS_CreateDataPropertyUint32(ctx, obj, i, JS_DupValue(ctx, argv[i]),
                                         JS_PROP_THROW) < 0) {
@@ -48223,6 +48299,10 @@ static JSValue js_array_of(JSContext *ctx, JSValueConst this_val,
     return obj;
 }
 
+/* Array.isArray - 判断值是否为数组
+ * 语法：Array.isArray(value)
+ * @return true 如果是数组，否则 false
+ */
 static JSValue js_array_isArray(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
@@ -48240,6 +48320,19 @@ static JSValue js_get_this(JSContext *ctx,
     return JS_DupValue(ctx, this_val);
 }
 
+/* ArraySpeciesCreate - 创建用于数组派生对象的构造函数
+ * 实现 ES6 Species 模式，支持子类化
+ * @param obj 源数组对象
+ * @param len_val 长度值
+ * @return 新创建的数组实例
+ * 
+ * 算法:
+ * 1. 如果 obj 不是数组，返回普通数组
+ * 2. 获取 obj.constructor
+ * 3. 获取 constructor[@@species]
+ * 4. 如果 species 为 null/undefined，使用 Array 构造函数
+ * 5. 否则调用 species 构造函数
+ */
 static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
                                      JSValueConst len_val)
 {
@@ -48247,14 +48340,19 @@ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
     int res;
     JSContext *realm;
 
+    /* 检查是否为数组 */
     res = JS_IsArray(ctx, obj);
     if (res < 0)
         return JS_EXCEPTION;
     if (!res)
         return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
+    
+    /* 获取 constructor */
     ctor = JS_GetProperty(ctx, obj, JS_ATOM_constructor);
     if (JS_IsException(ctor))
         return ctor;
+    
+    /* 处理跨 realm 的构造函数 (web 兼容性) */
     if (JS_IsConstructor(ctx, ctor)) {
         /* legacy web compatibility */
         realm = JS_GetFunctionRealm(ctx, ctor);
@@ -48268,6 +48366,8 @@ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
             ctor = JS_UNDEFINED;
         }
     }
+    
+    /* 获取 @@species */
     if (JS_IsObject(ctor)) {
         species = JS_GetProperty(ctx, ctor, JS_ATOM_Symbol_species);
         JS_FreeValue(ctx, ctor);
@@ -48277,6 +48377,8 @@ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
         if (JS_IsNull(ctor))
             ctor = JS_UNDEFINED;
     }
+    
+    /* 调用构造函数创建数组 */
     if (JS_IsUndefined(ctor)) {
         return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
     } else {
@@ -48307,6 +48409,11 @@ static int JS_isConcatSpreadable(JSContext *ctx, JSValueConst obj)
     return JS_IsArray(ctx, obj);
 }
 
+/* Array.prototype.at - 通过索引获取数组元素 (ES2022)
+ * 支持负索引：arr.at(-1) 获取最后一个元素
+ * @param index 索引 (可正可负)
+ * @return 索引处的元素，越界返回 undefined
+ */
 static JSValue js_array_at(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
 {
@@ -48322,6 +48429,7 @@ static JSValue js_array_at(JSContext *ctx, JSValueConst this_val,
     if (JS_ToInt64Sat(ctx, &idx, argv[0]))
         goto exception;
 
+    /* 负索引处理：从末尾开始计算 */
     if (idx < 0)
         idx = len + idx;
     if (idx < 0 || idx >= len) {
@@ -48342,6 +48450,12 @@ static JSValue js_array_at(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+/* Array.prototype.with - 返回一个新数组，其中指定索引处的元素被替换
+ * ES2023 新增，不可变版本：arr.with(index, value)
+ * @param index 要替换的索引 (支持负数)
+ * @param value 新值
+ * @return 新数组，原数组不变
+ */
 static JSValue js_array_with(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -48359,14 +48473,17 @@ static JSValue js_array_with(JSContext *ctx, JSValueConst this_val,
     if (JS_ToInt64Sat(ctx, &idx, argv[0]))
         goto exception;
 
+    /* 负索引处理 */
     if (idx < 0)
         idx = len + idx;
 
+    /* 索引越界检查 */
     if (idx < 0 || idx >= len) {
         JS_ThrowRangeError(ctx, "invalid array index: %" PRId64, idx);
         goto exception;
     }
 
+    /* 创建新数组 */
     arr = js_allocate_fast_array(ctx, len);
     if (JS_IsException(arr))
         goto exception;
@@ -48374,6 +48491,7 @@ static JSValue js_array_with(JSContext *ctx, JSValueConst this_val,
     p = JS_VALUE_GET_OBJ(arr);
     i = 0;
     pval = p->u.array.u.values;
+    /* 复制元素并在指定位置替换 */
     if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
         for (; i < idx; i++, pval++)
             *pval = JS_DupValue(ctx, arrp[i]);
@@ -48466,17 +48584,29 @@ exception:
     return JS_EXCEPTION;
 }
 
-#define special_every    0
-#define special_some     1
-#define special_forEach  2
-#define special_map      3
-#define special_filter   4
-#define special_TA       8
+/* ==================== 数组迭代方法特殊标记 ==================== */
+/* 用于 js_array_every 函数的多路复用，通过 magic 值区分不同方法 */
+#define special_every    0      /* every: 所有元素都满足条件 */
+#define special_some     1      /* some: 至少一个元素满足条件 */
+#define special_forEach  2      /* forEach: 遍历每个元素 */
+#define special_map      3      /* map: 映射每个元素 */
+#define special_filter   4      /* filter: 过滤元素 */
+#define special_TA       8      /* TypedArray 标志 */
 
 static JSValue js_typed_array___speciesCreate(JSContext *ctx,
                                               JSValueConst this_val,
                                               int argc, JSValueConst *argv);
 
+/* 数组迭代方法通用实现 - 通过 special 参数区分 every/some/map/filter/forEach
+ * @param special 方法标识 (special_every | special_some | special_map | special_filter | special_forEach)
+ *               可叠加 special_TA 表示 TypedArray
+ * @return 根据方法返回不同结果:
+ *         - every: boolean (所有元素测试通过返回 true)
+ *         - some: boolean (至少一个元素测试通过返回 true)
+ *         - map: 新数组 (包含映射结果)
+ *         - filter: 新数组 (包含过滤后的元素)
+ *         - forEach: undefined
+ */
 static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int special)
 {
@@ -48761,6 +48891,12 @@ static JSValue js_array_fill(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+/* Array.prototype.includes - 检查数组是否包含某个值 (ES2016)
+ * 使用 Same-value-zero 算法，与 indexOf 不同：NaN === NaN
+ * @param searchElement 要搜索的值
+ * @param fromIndex 起始索引 (可选，默认 0)
+ * @return true 如果找到，否则 false
+ */
 static JSValue js_array_includes(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
@@ -48781,6 +48917,7 @@ static JSValue js_array_includes(JSContext *ctx, JSValueConst this_val,
             if (JS_ToInt64Clamp(ctx, &n, argv[1], 0, len, len))
                 goto exception;
         }
+        /* 快速路径：fast_array 直接比较 */
         if (js_get_fast_array(ctx, obj, &arrp, &count)) {
             for (; n < count; n++) {
                 if (js_strict_eq2(ctx, JS_DupValue(ctx, argv[0]),
@@ -48791,6 +48928,7 @@ static JSValue js_array_includes(JSContext *ctx, JSValueConst this_val,
                 }
             }
         }
+        /* 慢速路径：处理稀疏数组和原型链 */
         for (; n < len; n++) {
             val = JS_GetPropertyInt64(ctx, obj, n);
             if (JS_IsException(val))
@@ -49241,10 +49379,13 @@ static JSValue js_array_reverse(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
-// Note: a.toReversed() is a.slice().reverse() with the twist that a.slice()
-// leaves holes in sparse arrays intact whereas a.toReversed() replaces them
-// with undefined, thus in effect creating a dense array.
-// Does not use Array[@@species], always returns a base Array.
+/* Array.prototype.toReversed - 返回反转后的新数组 (ES2023)
+ * 不可变版本：不修改原数组
+ * 与 reverse() 的区别:
+ * - toReversed 返回新数组，原数组不变
+ * - toReversed 将稀疏数组的空洞替换为 undefined (创建稠密数组)
+ * - 不使用 Array[@@species]，始终返回基础 Array
+ */
 static JSValue js_array_toReversed(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
@@ -49259,6 +49400,7 @@ static JSValue js_array_toReversed(JSContext *ctx, JSValueConst this_val,
     if (js_get_length64(ctx, &len, obj))
         goto exception;
 
+    /* 创建新数组 */
     arr = js_allocate_fast_array(ctx, len);
     if (JS_IsException(arr))
         goto exception;
@@ -49266,13 +49408,14 @@ static JSValue js_array_toReversed(JSContext *ctx, JSValueConst this_val,
     if (len > 0) {
         p = JS_VALUE_GET_OBJ(arr);
 
+        /* 从后向前复制元素 */
         i = len - 1;
         pval = p->u.array.u.values;
         if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
             for (; i >= 0; i--, pval++)
                 *pval = JS_DupValue(ctx, arrp[i]);
         } else {
-            // Query order is observable; test262 expects descending order.
+            /* 查询顺序是可观察的；test262 期望降序查询 */
             for (; i >= 0; i--, pval++) {
                 if (-1 == JS_TryGetPropertyInt64(ctx, obj, i, pval))
                     goto exception;
@@ -49617,21 +49760,35 @@ exception:
     return JS_EXCEPTION;
 }
 
-/* Array sort */
+/* ==================== 数组排序 ==================== */
+/* 实现 Array.prototype.sort 和 toSorted 方法
+ * 使用稳定的排序算法，支持自定义比较函数 */
 
+/* 值槽 - 用于排序时暂存元素及其元数据 */
 typedef struct ValueSlot {
-    JSValue val;
-    JSString *str;
-    int64_t pos;
+    JSValue val;        /* 元素值 */
+    JSString *str;      /* 缓存的字符串表示 (用于默认排序) */
+    int64_t pos;        /* 原始位置 (用于稳定排序) */
 } ValueSlot;
 
+/* 排序上下文 - 在比较函数间传递状态 */
 struct array_sort_context {
-    JSContext *ctx;
-    int exception;
-    int has_method;
-    JSValueConst method;
+    JSContext *ctx;         /* 运行时上下文 */
+    int exception;          /* 异常标志 */
+    int has_method;         /* 是否有自定义比较函数 */
+    JSValueConst method;    /* 比较函数 */
 };
 
+/* 通用数组比较函数 - 用于 qsort
+ * @param a, b 待比较的元素槽
+ * @param opaque 排序上下文
+ * @return 负数 (a<b), 0 (a==b), 正数 (a>b)
+ * 
+ * 比较策略:
+ * 1. 有比较函数：调用用户提供的 compareFn(a, b)
+ * 2. 无比较函数：转换为字符串后字典序比较
+ * 3. 相同值：比较原始位置保证稳定性
+ */
 static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
     struct array_sort_context *psc = opaque;
     JSContext *ctx = psc->ctx;
@@ -49645,9 +49802,7 @@ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
         return 0;
 
     if (psc->has_method) {
-        /* custom sort function is specified as returning 0 for identical
-         * objects: avoid method call overhead.
-         */
+        /* 自定义比较函数：相同对象直接返回相等 (性能优化) */
         if (!memcmp(&ap->val, &bp->val, sizeof(ap->val)))
             goto cmp_same;
         argv[0] = ap->val;
@@ -49665,9 +49820,8 @@ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
             cmp = (val > 0) - (val < 0);
         }
     } else {
-        /* Not supposed to bypass ToString even for identical objects as
-         * tested in test262/test/built-ins/Array/prototype/sort/bug_596_1.js
-         */
+        /* 默认排序：转换为字符串后字典序比较
+         * 注意：即使相同对象也要调用 ToString (test262 要求) */
         if (!ap->str) {
             JSValue str = JS_ToString(ctx, ap->val);
             if (JS_IsException(str))
@@ -49685,7 +49839,7 @@ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
     if (cmp != 0)
         return cmp;
 cmp_same:
-    /* make sort stable: compare array offsets */
+    /* 稳定排序：比较原始位置 */
     return (ap->pos > bp->pos) - (ap->pos < bp->pos);
 
 exception:
@@ -49693,6 +49847,18 @@ exception:
     return 0;
 }
 
+/* Array.prototype.sort - 原地排序数组
+ * 语法：arr.sort([compareFunction])
+ * @param compareFunction 可选的比较函数 (a, b) => 负数/0/正数
+ * @return 排序后的原数组 (修改原数组)
+ * 
+ * 算法流程:
+ * 1. 收集所有已定义的元素到临时数组 (跳过空洞和 undefined)
+ * 2. 使用 rqsort 进行稳定排序
+ * 3. 将排序后的元素写回原数组
+ * 4. undefined 元素移到末尾
+ * 5. 删除超出新长度的元素
+ */
 static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -49703,6 +49869,7 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
     int64_t i, len, undefined_count = 0;
     int present;
 
+    /* 初始化比较函数 */
     if (!JS_IsUndefined(asc.method)) {
         if (check_function(ctx, asc.method))
             goto exception;
@@ -49712,8 +49879,9 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
     if (js_get_length64(ctx, &len, obj))
         goto exception;
 
-    /* XXX: should special case fast arrays */
+    /* 收集所有已定义的元素 */
     for (i = 0; i < len; i++) {
+        /* 动态扩展数组容量 */
         if (pos >= array_size) {
             size_t new_size, slack;
             ValueSlot *new_array;
@@ -49729,15 +49897,17 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
         if (present < 0)
             goto exception;
         if (present == 0)
-            continue;
+            continue;  /* 跳过空洞 */
         if (JS_IsUndefined(array[pos].val)) {
             undefined_count++;
-            continue;
+            continue;  /* undefined 单独计数 */
         }
         array[pos].str = NULL;
-        array[pos].pos = i;
+        array[pos].pos = i;  /* 记录原始位置用于稳定排序 */
         pos++;
     }
+    
+    /* 执行排序 */
     rqsort(array, pos, sizeof(*array), js_array_cmp_generic, &asc);
     if (asc.exception)
         goto exception;
@@ -49779,10 +49949,15 @@ fail:
     return JS_EXCEPTION;
 }
 
-// Note: a.toSorted() is a.slice().sort() with the twist that a.slice()
-// leaves holes in sparse arrays intact whereas a.toSorted() replaces them
-// with undefined, thus in effect creating a dense array.
-// Does not use Array[@@species], always returns a base Array.
+/* Array.prototype.toSorted - 返回排序后的新数组 (ES2023)
+ * 不可变版本：不修改原数组
+ * 与 sort() 的区别:
+ * - toSorted 返回新数组，原数组不变
+ * - toSorted 将稀疏数组的空洞替换为 undefined (创建稠密数组)
+ * - 不使用 Array[@@species]，始终返回基础 Array
+ * @param compareFunction 可选的比较函数
+ * @return 排序后的新数组
+ */
 static JSValue js_array_toSorted(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
@@ -49792,6 +49967,7 @@ static JSValue js_array_toSorted(JSContext *ctx, JSValueConst this_val,
     uint32_t count32;
     int ok;
 
+    /* 验证比较函数 */
     ok = JS_IsUndefined(argv[0]) || JS_IsFunction(ctx, argv[0]);
     if (!ok)
         return JS_ThrowTypeError(ctx, "not a function");
@@ -49802,6 +49978,7 @@ static JSValue js_array_toSorted(JSContext *ctx, JSValueConst this_val,
     if (js_get_length64(ctx, &len, obj))
         goto exception;
 
+    /* 创建新数组并复制所有元素 */
     arr = js_allocate_fast_array(ctx, len);
     if (JS_IsException(arr))
         goto exception;
@@ -49821,6 +49998,7 @@ static JSValue js_array_toSorted(JSContext *ctx, JSValueConst this_val,
         }
     }
 
+    /* 对新数组进行排序 */
     ret = js_array_sort(ctx, arr, argc, argv);
     if (JS_IsException(ret))
         goto exception;
