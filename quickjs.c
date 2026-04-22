@@ -39997,132 +39997,225 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
         JSGlobalVar *hf = &s->global_vars[i];
 
         /* check if global variable (XXX: simplify) */
-        for(idx = 0; idx < s->closure_var_count; idx++) {
-            JSClosureVar *cv = &s->closure_var[idx];
-            if (cv->closure_type == JS_CLOSURE_GLOBAL_REF ||
-                cv->closure_type == JS_CLOSURE_GLOBAL_DECL ||
-                cv->closure_type == JS_CLOSURE_GLOBAL ||
-                cv->closure_type == JS_CLOSURE_MODULE_DECL ||
-                cv->closure_type == JS_CLOSURE_MODULE_IMPORT)
-                goto next; /* don't look at global variables (they are at the end) */
-            if (cv->var_name == hf->var_name) {
-                if (s->eval_type == JS_EVAL_TYPE_DIRECT &&
-                    cv->is_lexical) {
-                    /* Check if a lexical variable is
-                       redefined as 'var'. XXX: Could abort
-                       compilation here, but for consistency
-                       with the other checks, we delay the
-                       error generation. */
-                    dbuf_putc(&bc_out, OP_throw_error);
-                    dbuf_put_u32(&bc_out, JS_DupAtom(ctx, hf->var_name));
-                    dbuf_putc(&bc_out, JS_THROW_VAR_REDECL);
-                }
-                goto next;
+            /* ========================================================================
+     * 模块：字节码优化 - 闭包变量检查与字节码转换
+     * 行号：40000-40100
+     * 功能：遍历闭包变量，检查变量重定义，并将作用域相关的字节码转换为局部变量操作
+     * ======================================================================== */
+    
+    /* 遍历所有闭包变量，检查是否有变量名冲突 */
+    for(idx = 0; idx < s->closure_var_count; idx++) {
+        JSClosureVar *cv = &s->closure_var[idx];
+        
+        /* 跳过全局变量和模块级变量（它们在作用域链末尾）
+         * JS_CLOSURE_GLOBAL_REF: 全局引用
+         * JS_CLOSURE_GLOBAL_DECL: 全局声明
+         * JS_CLOSURE_GLOBAL: 全局变量
+         * JS_CLOSURE_MODULE_DECL: 模块声明
+         * JS_CLOSURE_MODULE_IMPORT: 模块导入
+         */
+        if (cv->closure_type == JS_CLOSURE_GLOBAL_REF ||
+            cv->closure_type == JS_CLOSURE_GLOBAL_DECL ||
+            cv->closure_type == JS_CLOSURE_GLOBAL ||
+            cv->closure_type == JS_CLOSURE_MODULE_DECL ||
+            cv->closure_type == JS_CLOSURE_MODULE_IMPORT)
+            goto next; /* 不检查全局变量 */
+            
+        /* 检查是否有同名变量 */
+        if (cv->var_name == hf->var_name) {
+            /* 特殊情况：在直接 eval 中，检查词法变量是否被 'var' 重新定义
+             * 例如：let x = 1; eval("var x = 2"); // 应该报错
+             * XXX: 理论上可以在此处中止编译，但为了与其他检查保持一致，
+             * 我们延迟错误生成，插入 OP_throw_error 字节码
+             */
+            if (s->eval_type == JS_EVAL_TYPE_DIRECT &&
+                cv->is_lexical) {
+                /* 插入运行时错误：变量重定义 */
+                dbuf_putc(&bc_out, OP_throw_error);
+                dbuf_put_u32(&bc_out, JS_DupAtom(ctx, hf->var_name)); /* 变量名原子 */
+                dbuf_putc(&bc_out, JS_THROW_VAR_REDECL); /* 错误类型：变量重定义 */
             }
-            if (cv->var_name == JS_ATOM__var_ ||
-                cv->var_name == JS_ATOM__arg_var_)
-                goto next;
+            goto next;
         }
-    next: ;
+        
+        /* 跳过内部生成的临时变量名
+         * JS_ATOM__var_: 内部临时变量
+         * JS_ATOM__arg_var_: 内部参数变量
+         */
+        if (cv->var_name == JS_ATOM__var_ ||
+            cv->var_name == JS_ATOM__arg_var_)
+            goto next;
+    }
+next: ;
     }
 
-    line_num = 0; /* avoid warning */
+    /* =========================================================================
+     * 主循环：遍历原始字节码，进行优化和转换
+     * bc_buf: 原始字节码缓冲区
+     * bc_out: 输出字节码缓冲区（优化后的结果）
+     * ========================================================================= */
+    line_num = 0; /* 初始化行号，避免编译器警告 */
     for (pos = 0; pos < bc_len; pos = pos_next) {
-        op = bc_buf[pos];
-        len = opcode_info[op].size;
-        pos_next = pos + len;
+        op = bc_buf[pos];              /* 当前操作码 */
+        len = opcode_info[op].size;    /* 操作码长度（字节数） */
+        pos_next = pos + len;          /* 下一个操作码位置 */
+        
         switch(op) {
+        /* ----------------------------------------------------------------------
+         * OP_line_num: 行号信息
+         * 用于调试，记录字节码位置对应的源代码行号
+         * ---------------------------------------------------------------------- */
         case OP_line_num:
-            line_num = get_u32(bc_buf + pos + 1);
-            s->line_number_size++;
-            goto no_change;
+            line_num = get_u32(bc_buf + pos + 1); /* 读取行号 */
+            s->line_number_size++;                 /* 增加行号表大小 */
+            goto no_change; /* 直接复制，不做修改 */
 
-        case OP_eval: /* convert scope index to adjusted variable index */
+        /* ----------------------------------------------------------------------
+         * OP_eval: eval() 函数调用
+         * 将作用域索引转换为调整后的变量索引
+         * eval() 会创建新的作用域，需要标记被捕获的变量
+         * ---------------------------------------------------------------------- */
+        case OP_eval:
             {
-                int call_argc = get_u16(bc_buf + pos + 1);
-                scope = get_u16(bc_buf + pos + 1 + 2);
+                int call_argc = get_u16(bc_buf + pos + 1); /* 参数个数 */
+                scope = get_u16(bc_buf + pos + 1 + 2);      /* 作用域索引 */
+                
+                /* 标记此作用域中被捕获的变量（用于闭包） */
                 mark_eval_captured_variables(ctx, s, scope);
+                
+                /* 重写操作码：使用调整后的作用域索引 */
                 dbuf_putc(&bc_out, op);
                 dbuf_put_u16(&bc_out, call_argc);
+                /* 调整作用域索引：减去 ARG_SCOPE_END 偏移量 */
                 dbuf_put_u16(&bc_out, s->scopes[scope].first - ARG_SCOPE_END);
             }
             break;
-        case OP_apply_eval: /* convert scope index to adjusted variable index */
-            scope = get_u16(bc_buf + pos + 1);
-            mark_eval_captured_variables(ctx, s, scope);
+            
+        /* ----------------------------------------------------------------------
+         * OP_apply_eval: apply/eval 调用
+         * 类似 OP_eval，但用于函数 .apply() 调用
+         * ---------------------------------------------------------------------- */
+        case OP_apply_eval:
+            scope = get_u16(bc_buf + pos + 1); /* 作用域索引 */
+            mark_eval_captured_variables(ctx, s, scope); /* 标记捕获的变量 */
+            
             dbuf_putc(&bc_out, op);
+            /* 使用调整后的作用域索引 */
             dbuf_put_u16(&bc_out, s->scopes[scope].first - ARG_SCOPE_END);
             break;
-        case OP_scope_get_var_checkthis:
-        case OP_scope_get_var_undef:
-        case OP_scope_get_var:
-        case OP_scope_put_var:
-        case OP_scope_delete_var:
-        case OP_scope_get_ref:
-        case OP_scope_put_var_init:
-            var_name = get_u32(bc_buf + pos + 1);
-            scope = get_u16(bc_buf + pos + 5);
+        /* ----------------------------------------------------------------------
+         * 作用域变量操作族：将作用域变量解析为具体的变量访问
+         * 这些操作码在运行时需要在作用域链中查找变量
+         * 优化阶段将它们转换为直接的局部变量访问或闭包访问
+         * ---------------------------------------------------------------------- */
+        case OP_scope_get_var_checkthis: /* 获取变量，检查 this */
+        case OP_scope_get_var_undef:     /* 获取变量（可能未定义） */
+        case OP_scope_get_var:           /* 获取变量 */
+        case OP_scope_put_var:           /* 设置变量 */
+        case OP_scope_delete_var:        /* 删除变量 */
+        case OP_scope_get_ref:           /* 获取变量引用 */
+        case OP_scope_put_var_init:      /* 设置变量（初始化） */
+            var_name = get_u32(bc_buf + pos + 1); /* 变量名原子 */
+            scope = get_u16(bc_buf + pos + 5);    /* 作用域索引 */
+            
+            /* 解析作用域变量：
+             * - 如果是局部变量，转换为 OP_get_loc/OP_put_loc
+             * - 如果是闭包变量，转换为 OP_get_var_ref/OP_put_var_ref
+             * - 如果在全局作用域，转换为 OP_get_var/OP_put_var
+             */
             pos_next = resolve_scope_var(ctx, s, var_name, scope, op, &bc_out,
                                          NULL, NULL, pos_next);
-            JS_FreeAtom(ctx, var_name);
+            JS_FreeAtom(ctx, var_name); /* 释放原子引用 */
             break;
+            
+        /* ----------------------------------------------------------------------
+         * OP_scope_make_ref: 创建变量引用（用于左值）
+         * 例如：x = 1 中的 x，需要先创建引用再赋值
+         * ---------------------------------------------------------------------- */
         case OP_scope_make_ref:
             {
                 int label;
                 LabelSlot *ls;
-                var_name = get_u32(bc_buf + pos + 1);
-                label = get_u32(bc_buf + pos + 5);
-                scope = get_u16(bc_buf + pos + 9);
+                
+                var_name = get_u32(bc_buf + pos + 1); /* 变量名 */
+                label = get_u32(bc_buf + pos + 5);     /* 标签索引 */
+                scope = get_u16(bc_buf + pos + 9);     /* 作用域索引 */
+                
                 ls = &s->label_slots[label];
-                ls->ref_count--;  /* always remove label reference */
+                ls->ref_count--;  /* 减少标签引用计数（总是移除） */
+                
+                /* 解析作用域变量，传入 label 信息用于后续跳转修复 */
                 pos_next = resolve_scope_var(ctx, s, var_name, scope, op, &bc_out,
                                              bc_buf, ls, pos_next);
                 JS_FreeAtom(ctx, var_name);
             }
             break;
-        case OP_scope_get_private_field:
-        case OP_scope_get_private_field2:
-        case OP_scope_put_private_field:
-        case OP_scope_in_private_field:
+            
+        /* ----------------------------------------------------------------------
+         * 私有字段操作族：处理 class 的私有字段 (#field)
+         * 私有字段需要在作用域中查找对应的私有名称
+         * ---------------------------------------------------------------------- */
+        case OP_scope_get_private_field:    /* 获取私有字段 */
+        case OP_scope_get_private_field2:   /* 获取私有字段（变体） */
+        case OP_scope_put_private_field:    /* 设置私有字段 */
+        case OP_scope_in_private_field:     /* in 操作符检查私有字段 */
             {
                 int ret;
-                var_name = get_u32(bc_buf + pos + 1);
-                scope = get_u16(bc_buf + pos + 5);
+                var_name = get_u32(bc_buf + pos + 1); /* 私有字段名原子 */
+                scope = get_u16(bc_buf + pos + 5);     /* 作用域索引 */
+                
+                /* 解析私有字段：转换为具体的字段访问操作码 */
                 ret = resolve_scope_private_field(ctx, s, var_name, scope, op, &bc_out);
                 if (ret < 0)
-                    goto fail;
+                    goto fail; /* 解析失败 */
                 JS_FreeAtom(ctx, var_name);
             }
             break;
+        /* ----------------------------------------------------------------------
+         * OP_gosub: 子程序调用（用于 try-finally 的 finally 块）
+         * ---------------------------------------------------------------------- */
         case OP_gosub:
-            s->jump_size++;
+            s->jump_size++; /* 增加跳转表大小 */
             if (OPTIMIZE) {
-                /* remove calls to empty finalizers  */
+                /* 优化：移除对空 finalizer 的调用
+                 * 如果目标位置直接是 OP_ret，说明 finally 块为空，可以省略调用
+                 */
                 int label;
                 LabelSlot *ls;
 
                 label = get_u32(bc_buf + pos + 1);
                 assert(label >= 0 && label < s->label_count);
                 ls = &s->label_slots[label];
+                
+                /* 检查目标位置是否只是 OP_ret（空 finalizer） */
                 if (code_match(&cc, ls->pos, OP_ret, -1)) {
-                    ls->ref_count--;
-                    break;
+                    ls->ref_count--; /* 减少引用计数 */
+                    break; /* 完全移除此 gosub 指令 */
                 }
             }
-            goto no_change;
+            goto no_change; /* 默认：复制原指令 */
+            
+        /* ----------------------------------------------------------------------
+         * OP_drop: 丢弃栈顶元素
+         * ---------------------------------------------------------------------- */
         case OP_drop:
             if (0) {
-                /* remove drops before return_undef */
-                /* do not perform this optimization in pass2 because
-                   it breaks patterns recognised in resolve_labels */
+                /* 已禁用的优化：移除 return_undef 前的 drop 指令
+                 * 注释掉的原因：在 pass2 中执行此优化会破坏 resolve_labels 识别的模式
+                 */
                 int pos1 = pos_next;
                 int line1 = line_num;
+                
+                /* 跳过连续的 drop 指令 */
                 while (code_match(&cc, pos1, OP_drop, -1)) {
                     if (cc.line_num >= 0) line1 = cc.line_num;
                     pos1 = cc.pos;
                 }
+                
+                /* 如果后面是 return_undef，可以跳过所有 drop */
                 if (code_match(&cc, pos1, OP_return_undef, -1)) {
                     pos_next = pos1;
+                    /* 更新行号信息 */
                     if (line1 != -1 && line1 != line_num) {
                         line_num = line1;
                         s->line_number_size++;
@@ -40133,12 +40226,22 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
                 }
             }
             goto no_change;
+            
+        /* ----------------------------------------------------------------------
+         * OP_insert3: 插入三个元素（用于数组/对象字面量）
+         * ---------------------------------------------------------------------- */
         case OP_insert3:
             if (OPTIMIZE) {
-                /* Transformation: insert3 put_array_el|put_ref_value drop -> put_array_el|put_ref_value */
+                /* 优化模式：insert3 + put_array_el/put_ref_value + drop 
+                 * -> put_array_el/put_ref_value
+                 * 场景：当 insert3 的结果立即被使用且栈被丢弃时，可以简化
+                 */
                 if (code_match(&cc, pos_next, M2(OP_put_array_el, OP_put_ref_value), OP_drop, -1)) {
+                    /* 直接输出 put_array_el 或 put_ref_value，跳过 insert3 */
                     dbuf_putc(&bc_out, cc.op);
                     pos_next = cc.pos;
+                    
+                    /* 更新行号信息 */
                     if (cc.line_num != -1 && cc.line_num != line_num) {
                         line_num = cc.line_num;
                         s->line_number_size++;
@@ -40150,22 +40253,36 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
             }
             goto no_change;
 
+        /* ----------------------------------------------------------------------
+         * 控制流指令族：goto、return、throw 等
+         * 这些指令会改变执行流，后面可能跟着死代码
+         * ---------------------------------------------------------------------- */
         case OP_goto:
-            s->jump_size++;
-            /* fall thru */
-        case OP_tail_call:
-        case OP_tail_call_method:
-        case OP_return:
-        case OP_return_undef:
-        case OP_throw:
-        case OP_throw_error:
-        case OP_ret:
+            s->jump_size++; /* 增加跳转表大小 */
+            /* fall thru: 继续处理下面的优化逻辑 */
+            
+        case OP_tail_call:          /* 尾调用 */
+        case OP_tail_call_method:   /* 尾方法调用 */
+        case OP_return:             /* 返回 */
+        case OP_return_undef:       /* 返回 undefined */
+        case OP_throw:              /* 抛出异常 */
+        case OP_throw_error:        /* 抛出错误 */
+        case OP_ret:                /* 子程序返回 */
             if (OPTIMIZE) {
-                /* remove dead code */
+                /* 优化：移除死代码
+                 * 控制流指令后面的代码（直到下一个标签）永远不会执行
+                 * skip_dead_code 会跳过这些死代码，定位到下一个有效指令
+                 */
                 int line = -1;
+                
+                /* 先复制当前控制流指令 */
                 dbuf_put(&bc_out, bc_buf + pos, len);
+                
+                /* 跳过死代码，找到下一个有效位置 */
                 pos = skip_dead_code(s, bc_buf, bc_len, pos + len, &line);
                 pos_next = pos;
+                
+                /* 如果跳过了行号信息，需要更新行号 */
                 if (pos < bc_len && line >= 0 && line_num != line) {
                     line_num = line;
                     s->line_number_size++;
@@ -40176,107 +40293,166 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
             }
             goto no_change;
 
+        /* ----------------------------------------------------------------------
+         * OP_label: 标签定义
+         * 用于标记跳转目标位置，在 resolve_labels 阶段会被解析
+         * ---------------------------------------------------------------------- */
         case OP_label:
             {
                 int label;
                 LabelSlot *ls;
 
-                label = get_u32(bc_buf + pos + 1);
+                label = get_u32(bc_buf + pos + 1); /* 标签索引 */
                 assert(label >= 0 && label < s->label_count);
                 ls = &s->label_slots[label];
+                
+                /* 记录标签在输出字节码中的实际位置（pos2）
+                 * 这个位置会在后续 resolve_labels 中用于计算跳转偏移
+                 */
                 ls->pos2 = bc_out.size + opcode_info[op].size;
             }
             goto no_change;
 
+        /* ----------------------------------------------------------------------
+         * OP_enter_scope: 进入新的作用域
+         * 初始化该作用域中的所有变量
+         * ---------------------------------------------------------------------- */
         case OP_enter_scope:
             {
                 int scope_idx, scope = get_u16(bc_buf + pos + 1);
 
+                /* 如果是函数体作用域，需要实例化提升的定义（函数声明等） */
                 if (scope == s->body_scope) {
                     instantiate_hoisted_definitions(ctx, s, &bc_out);
                 }
 
+                /* 遍历该作用域中的所有变量定义 */
                 for(scope_idx = s->scopes[scope].first; scope_idx >= 0;) {
                     JSVarDef *vd = &s->vars[scope_idx];
+                    
                     if (vd->scope_level == scope) {
+                        /* 跳过 arguments 参数（特殊处理） */
                         if (scope_idx != s->arguments_arg_idx) {
+                            /* 根据变量类型进行不同的初始化 */
                             if (vd->var_kind == JS_VAR_FUNCTION_DECL ||
                                 vd->var_kind == JS_VAR_NEW_FUNCTION_DECL) {
-                                /* Initialize lexical variable upon entering scope */
+                                /* 函数声明：创建闭包并初始化局部变量
+                                 * OP_fclosure: 从函数池创建函数闭包
+                                 * OP_put_loc: 存储到局部变量
+                                 */
                                 dbuf_putc(&bc_out, OP_fclosure);
-                                dbuf_put_u32(&bc_out, vd->func_pool_idx);
+                                dbuf_put_u32(&bc_out, vd->func_pool_idx); /* 函数池索引 */
                                 dbuf_putc(&bc_out, OP_put_loc);
-                                dbuf_put_u16(&bc_out, scope_idx);
+                                dbuf_put_u16(&bc_out, scope_idx); /* 局部变量索引 */
                             } else {
-                                /* XXX: should check if variable can be used
-                                   before initialization */
+                                /* 其他变量（let/const/class 等）：初始化为未初始化状态
+                                 * 访问未初始化的变量会抛出 ReferenceError
+                                 * XXX: 理论上应该检查变量是否在初始化前被使用
+                                 */
                                 dbuf_putc(&bc_out, OP_set_loc_uninitialized);
                                 dbuf_put_u16(&bc_out, scope_idx);
                             }
                         }
-                        scope_idx = vd->scope_next;
+                        scope_idx = vd->scope_next; /* 移动到同作用域的下一个变量 */
                     } else {
-                        break;
+                        break; /* 已遍历完当前作用域的所有变量 */
                     }
                 }
             }
             break;
 
+        /* ----------------------------------------------------------------------
+         * OP_leave_scope: 离开作用域
+         * 关闭该作用域中被捕获的变量（用于闭包）
+         * ---------------------------------------------------------------------- */
         case OP_leave_scope:
             {
                 int scope_idx, scope = get_u16(bc_buf + pos + 1);
 
+                /* 遍历该作用域中的所有变量 */
                 for(scope_idx = s->scopes[scope].first; scope_idx >= 0;) {
                     JSVarDef *vd = &s->vars[scope_idx];
+                    
                     if (vd->scope_level == scope) {
+                        /* 如果变量被闭包捕获，需要关闭它
+                         * OP_close_loc: 将局部变量移动到闭包存储中
+                         * 这样即使作用域结束，闭包仍能访问该变量
+                         */
                         if (vd->is_captured) {
                             dbuf_putc(&bc_out, OP_close_loc);
                             dbuf_put_u16(&bc_out, scope_idx);
                         }
                         scope_idx = vd->scope_next;
                     } else {
-                        break;
+                        break; /* 已遍历完当前作用域 */
                     }
                 }
             }
             break;
 
+        /* ----------------------------------------------------------------------
+         * OP_set_name: 设置函数/类名称
+         * 用于推断函数名（如 const f = function() {} 中的 f）
+         * ---------------------------------------------------------------------- */
         case OP_set_name:
             {
-                /* remove dummy set_name opcodes */
+                /* 优化：移除虚拟的 set_name 操作码（名称为 JS_ATOM_NULL） */
                 JSAtom name = get_u32(bc_buf + pos + 1);
                 if (name == JS_ATOM_NULL)
-                    break;
+                    break; /* 完全移除该指令 */
             }
             goto no_change;
 
-        case OP_if_false:
-        case OP_if_true:
-        case OP_catch:
-            s->jump_size++;
+        /* ----------------------------------------------------------------------
+         * 条件跳转指令族
+         * ---------------------------------------------------------------------- */
+        case OP_if_false: /* 如果为假则跳转 */
+        case OP_if_true:  /* 如果为真则跳转 */
+        case OP_catch:    /* 异常捕获 */
+            s->jump_size++; /* 增加跳转表大小 */
             goto no_change;
 
+        /* ----------------------------------------------------------------------
+         * OP_dup: 复制栈顶元素
+         * 包含一个复杂的优化：合并连续的 dup + if_xxx + drop 模式
+         * ---------------------------------------------------------------------- */
         case OP_dup:
             if (OPTIMIZE) {
-                /* Transformation: dup if_false(l1) drop, l1: if_false(l2) -> if_false(l2) */
-                /* Transformation: dup if_true(l1) drop, l1: if_true(l2) -> if_true(l2) */
+                /* 优化模式 1: dup + if_false(l1) + drop, l1: if_false(l2) 
+                 * -> if_false(l2)
+                 * 优化模式 2: dup + if_true(l1) + drop, l1: if_true(l2)
+                 * -> if_true(l2)
+                 * 
+                 * 场景：短路求值的优化，如 a && b && c
+                 */
                 if (code_match(&cc, pos_next, M2(OP_if_false, OP_if_true), OP_drop, -1)) {
                     int lab0, lab1, op1, pos1, line1, pos2;
-                    lab0 = lab1 = cc.label;
+                    
+                    lab0 = lab1 = cc.label; /* 初始标签 */
                     assert(lab1 >= 0 && lab1 < s->label_count);
-                    op1 = cc.op;
-                    pos1 = cc.pos;
-                    line1 = cc.line_num;
+                    op1 = cc.op;      /* if_false 或 if_true */
+                    pos1 = cc.pos;    /* 位置 */
+                    line1 = cc.line_num; /* 行号 */
+                    
+                    /* 跟随标签链，找到最终的跳转目标
+                     * 模式：dup + if_xxx(lab1) + drop, lab1: dup + if_xxx(lab2) + drop ...
+                     */
                     while (code_match(&cc, (pos2 = get_label_pos(s, lab1)), OP_dup, op1, OP_drop, -1)) {
-                        lab1 = cc.label;
+                        lab1 = cc.label; /* 更新为下一个标签 */
                     }
+                    
+                    /* 如果最终是一个 if_xxx 指令，可以进行优化 */
                     if (code_match(&cc, pos2, op1, -1)) {
                         s->jump_size++;
-                        update_label(s, lab0, -1);
-                        update_label(s, cc.label, +1);
+                        update_label(s, lab0, -1); /* 减少旧标签引用 */
+                        update_label(s, cc.label, +1); /* 增加新标签引用 */
+                        
+                        /* 输出优化后的指令：直接跳转到最终目标 */
                         dbuf_putc(&bc_out, op1);
                         dbuf_put_u32(&bc_out, cc.label);
                         pos_next = pos1;
+                        
+                        /* 更新行号信息 */
                         if (line1 != -1 && line1 != line_num) {
                             line_num = line1;
                             s->line_number_size++;
@@ -40289,120 +40465,209 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
             }
             goto no_change;
 
+        /* ----------------------------------------------------------------------
+         * OP_nop: 空操作
+         * 直接移除（已擦除的代码）
+         * ---------------------------------------------------------------------- */
         case OP_nop:
-            /* remove erased code */
+            /* 移除已擦除的代码 */
             break;
+            
+        /* ----------------------------------------------------------------------
+         * OP_set_class_name: 设置类名
+         * 仅在解析阶段使用，优化阶段可以忽略
+         * ---------------------------------------------------------------------- */
         case OP_set_class_name:
-            /* only used during parsing */
+            /* 仅用于解析阶段 */
             break;
 
-        case OP_get_field_opt_chain: /* equivalent to OP_get_field */
+        /* ----------------------------------------------------------------------
+         * 可选链操作优化：转换为普通操作
+         * OP_get_field_opt_chain: 可选链字段访问 (obj?.field)
+         * OP_get_array_el_opt_chain: 可选链数组访问 (arr?.[idx])
+         * ---------------------------------------------------------------------- */
+        case OP_get_field_opt_chain:
             {
                 JSAtom name = get_u32(bc_buf + pos + 1);
+                /* 转换为普通的字段访问 */
                 dbuf_putc(&bc_out, OP_get_field);
                 dbuf_put_u32(&bc_out, name);
             }
             break;
-        case OP_get_array_el_opt_chain: /* equivalent to OP_get_array_el */
+            
+        case OP_get_array_el_opt_chain:
+            /* 转换为普通的数组元素访问 */
             dbuf_putc(&bc_out, OP_get_array_el);
             break;
 
+        /* ----------------------------------------------------------------------
+         * default: 默认情况 - 直接复制操作码
+         * no_change: 标签 - 不做修改，直接复制
+         * ---------------------------------------------------------------------- */
         default:
         no_change:
+            /* 将原始操作码复制到输出缓冲区 */
             dbuf_put(&bc_out, bc_buf + pos, len);
             break;
         }
     }
 
-    /* set the new byte code */
+    /* =========================================================================
+     * 字节码优化完成：用优化后的字节码替换原始字节码
+     * ========================================================================= */
+    
+    /* 释放原始字节码缓冲区 */
     dbuf_free(&s->byte_code);
+    
+    /* 使用优化后的字节码 */
     s->byte_code = bc_out;
+    
+    /* 检查是否有内存错误 */
     if (dbuf_error(&s->byte_code)) {
         JS_ThrowOutOfMemory(ctx);
         return -1;
     }
-    return 0;
- fail:
-    /* continue the copy to keep the atom refcounts consistent */
-    /* XXX: find a better solution ? */
+    
+    return 0; /* 成功 */
+    
+fail:
+    /* 错误处理：继续复制剩余字节码以保持原子引用计数一致
+     * XXX: 需要找更好的解决方案
+     */
     for (; pos < bc_len; pos = pos_next) {
         op = bc_buf[pos];
         len = opcode_info[op].size;
         pos_next = pos + len;
         dbuf_put(&bc_out, bc_buf + pos, len);
     }
+    
     dbuf_free(&s->byte_code);
     s->byte_code = bc_out;
-    return -1;
+    return -1; /* 失败 */
 }
 
-/* the pc2line table gives a source position for each PC value */
+/* ===========================================================================
+ * 调试信息：PC 到源代码行号映射
+ * 这些函数用于生成调试信息，使得在调试器中可以显示源代码行号
+ * =========================================================================== */
+
+/**
+ * add_pc2line_info - 添加 PC 到行号的映射信息
+ * @s: 函数定义
+ * @pc: 程序计数器位置（字节码偏移）
+ * @source_pos: 源代码位置
+ * 
+ * 说明：构建一个映射表，将字节码位置映射回源代码位置
+ * 用于调试时的堆栈跟踪和断点功能
+ */
 static void add_pc2line_info(JSFunctionDef *s, uint32_t pc, uint32_t source_pos)
 {
+    /* 检查条件：
+     * 1. 行号槽已分配
+     * 2. 还有剩余空间
+     * 3. PC 值递增（保证有序）
+     * 4. 源代码位置发生变化
+     */
     if (s->line_number_slots != NULL
     &&  s->line_number_count < s->line_number_size
     &&  pc >= s->line_number_last_pc
     &&  source_pos != s->line_number_last) {
+        
+        /* 记录映射关系 */
         s->line_number_slots[s->line_number_count].pc = pc;
         s->line_number_slots[s->line_number_count].source_pos = source_pos;
         s->line_number_count++;
+        
+        /* 更新最后记录的位置 */
         s->line_number_last_pc = pc;
         s->line_number_last = source_pos;
     }
 }
 
-/* XXX: could use a more compact storage */
-/* XXX: get_line_col_cached() is slow. For more predictable
-   performance, line/cols could be stored every N source
-   bytes. Alternatively, get_line_col_cached() could be issued in
-   emit_source_pos() so that the deltas are more likely to be
-   small. */
+/**
+ * compute_pc2line_info - 计算并压缩 PC 到行号的映射表
+ * @s: 函数定义
+ * 
+ * 说明：将收集到的行号信息压缩编码到 pc2line 缓冲区
+ * 使用差分编码（delta encoding）来节省空间：
+ * - 存储相对于上一个条目的差值，而非绝对值
+ * - 对于小差值使用单字节编码，大差值使用 LEB128 变长编码
+ * 
+ * XXX: 可以使用更紧凑的存储方式
+ * XXX: get_line_col_cached() 较慢。为了更可预测的性能，
+ *      可以每 N 个源字节存储一次行/列信息。
+ */
 static void compute_pc2line_info(JSFunctionDef *s)
 {
+    /* 如果启用了调试信息（未剥离） */
     if (!s->strip_debug) {
-        int last_line_num, last_col_num;
-        uint32_t last_pc = 0;
+        int last_line_num, last_col_num;  /* 上一行的行号和列号 */
+        uint32_t last_pc = 0;              /* 上一个 PC 位置 */
         int i, line_num, col_num;
         const uint8_t *buf_start = s->get_line_col_cache->buf_start;
+        
+        /* 初始化 pc2line 动态缓冲区 */
         js_dbuf_init(s->ctx, &s->pc2line);
 
+        /* 获取起始位置的行列号 */
         last_line_num = get_line_col_cached(s->get_line_col_cache,
                                             &last_col_num,
                                             buf_start + s->source_pos);
-        dbuf_put_leb128(&s->pc2line, last_line_num); /* line number minus 1 */
-        dbuf_put_leb128(&s->pc2line, last_col_num); /* column number minus 1 */
+        
+        /* 写入初始行号和列号（使用 LEB128 变长编码） */
+        dbuf_put_leb128(&s->pc2line, last_line_num); /* 行号减 1 */
+        dbuf_put_leb128(&s->pc2line, last_col_num);  /* 列号减 1 */
 
+        /* 遍历所有收集到的行号映射 */
         for (i = 0; i < s->line_number_count; i++) {
             uint32_t pc = s->line_number_slots[i].pc;
             uint32_t source_pos = s->line_number_slots[i].source_pos;
             int diff_pc, diff_line, diff_col;
 
+            /* 跳过无效的源代码位置 */
             if (source_pos == -1)
                 continue;
+                
+            /* 计算 PC 差值 */
             diff_pc = pc - last_pc;
             if (diff_pc < 0)
                 continue;
 
+            /* 获取当前源代码位置的行列号 */
             line_num = get_line_col_cached(s->get_line_col_cache, &col_num,
                                            buf_start + source_pos);
+            
+            /* 计算行列号的差值 */
             diff_line = line_num - last_line_num;
             diff_col = col_num - last_col_num;
+            
+            /* 如果行列号都没变化，跳过（冗余信息） */
             if (diff_line == 0 && diff_col == 0)
                 continue;
 
+            /* 尝试使用紧凑编码：
+             * 条件：行号差值在 [PC2LINE_BASE, PC2LINE_BASE+PC2LINE_RANGE) 范围内
+             *       PC 差值不超过 PC2LINE_DIFF_PC_MAX
+             * 紧凑格式：单字节编码 (diff_line 偏移 + diff_pc * 范围 + 起始操作码)
+             */
             if (diff_line >= PC2LINE_BASE &&
                 diff_line < PC2LINE_BASE + PC2LINE_RANGE &&
                 diff_pc <= PC2LINE_DIFF_PC_MAX) {
+                /* 紧凑编码：单字节 */
                 dbuf_putc(&s->pc2line, (diff_line - PC2LINE_BASE) +
                           diff_pc * PC2LINE_RANGE + PC2LINE_OP_FIRST);
             } else {
-                /* longer encoding */
-                dbuf_putc(&s->pc2line, 0);
-                dbuf_put_leb128(&s->pc2line, diff_pc);
-                dbuf_put_sleb128(&s->pc2line, diff_line);
+                /* 长编码：使用 LEB128 变长编码
+                 * 格式：0 (标记) + diff_pc + diff_line + diff_col
+                 */
+                dbuf_putc(&s->pc2line, 0); /* 标记为长编码 */
+                dbuf_put_leb128(&s->pc2line, diff_pc);      /* PC 差值 */
+                dbuf_put_sleb128(&s->pc2line, diff_line);   /* 行号差值（有符号） */
             }
+            /* 列号差值总是用有符号 LEB128 编码 */
             dbuf_put_sleb128(&s->pc2line, diff_col);
                 
+            /* 更新最后记录的值 */
             last_pc = pc;
             last_line_num = line_num;
             last_col_num = col_num;
@@ -40410,27 +40675,53 @@ static void compute_pc2line_info(JSFunctionDef *s)
     }
 }
 
+/**
+ * add_reloc - 添加重定位条目
+ * @ctx: JS 上下文
+ * @ls: 标签槽
+ * @addr: 需要重定位的地址
+ * @size: 重定位字段大小（字节）
+ * 
+ * 说明：当标签的最终位置确定后，需要更新所有引用该标签的跳转指令
+ * 重定位条目记录了需要更新的位置和大小
+ */
 static RelocEntry *add_reloc(JSContext *ctx, LabelSlot *ls, uint32_t addr, int size)
 {
     RelocEntry *re;
+    
+    /* 分配重定位条目 */
     re = js_malloc(ctx, sizeof(*re));
     if (!re)
         return NULL;
-    re->addr = addr;
-    re->size = size;
-    re->next = ls->first_reloc;
+        
+    re->addr = addr;      /* 需要重定位的地址 */
+    re->size = size;      /* 字段大小 */
+    re->next = ls->first_reloc; /* 插入到链表头部 */
     ls->first_reloc = re;
+    
     return re;
 }
 
+/**
+ * code_has_label - 检查代码中是否包含指定标签
+ * @s: 代码上下文
+ * @pos: 起始位置
+ * @label: 标签索引
+ * 
+ * 返回：TRUE 如果找到标签，否则 FALSE
+ */
 static BOOL code_has_label(CodeContext *s, int pos, int label)
 {
     while (pos < s->bc_len) {
         int op = s->bc_buf[pos];
+        
+        /* 跳过行号指令 */
         if (op == OP_line_num) {
-            pos += 5;
+            pos += 5; /* OP_line_num 长度为 5 字节 */
             continue;
         }
+        
+        /* 检查标签定义 */
         if (op == OP_label) {
             int lab = get_u32(s->bc_buf + pos + 1);
             if (lab == label)
@@ -40438,98 +40729,151 @@ static BOOL code_has_label(CodeContext *s, int pos, int label)
             pos += 5;
             continue;
         }
+        
+        /* 检查跳转指令 */
         if (op == OP_goto) {
             int lab = get_u32(s->bc_buf + pos + 1);
             if (lab == label)
                 return TRUE;
         }
-        break;
+        
+        break; /* 遇到其他指令，停止搜索 */
     }
     return FALSE;
 }
 
-/* return the target label, following the OP_goto jumps
-   the first opcode at destination is stored in *pop
+/**
+ * find_jump_target - 查找跳转目标的最终标签
+ * @s: 函数定义
+ * @label0: 初始标签
+ * @pop: 输出参数，存储目标位置的第一条操作码
+ * @pline: 输出参数，存储行号（可选）
+ * 
+ * 返回：最终的目标标签索引
+ * 
+ * 说明：跟随 OP_goto 跳转链，找到最终的跳转目标
+ * 用于优化连续的 goto 指令（goto l1; l1: goto l2; -> goto l2）
  */
 static int find_jump_target(JSFunctionDef *s, int label0, int *pop, int *pline)
 {
     int i, pos, op, label;
 
     label = label0;
-    update_label(s, label, -1);
+    update_label(s, label, -1); /* 减少引用计数 */
+    
+    /* 最多跟随 10 层跳转，防止无限循环 */
     for (i = 0; i < 10; i++) {
         assert(label >= 0 && label < s->label_count);
-        pos = s->label_slots[label].pos2;
+        pos = s->label_slots[label].pos2; /* 标签的实际位置 */
+        
         for (;;) {
             switch(op = s->byte_code.buf[pos]) {
             case OP_line_num:
                 if (pline)
                     *pline = get_u32(s->byte_code.buf + pos + 1);
-                /* fall thru */
+                /* fall thru: 继续处理 */
+                
             case OP_label:
+                /* 跳过标签和行号指令 */
                 pos += opcode_info[op].size;
                 continue;
+                
             case OP_goto:
+                /* 跟随 goto 跳转到下一个标签 */
                 label = get_u32(s->byte_code.buf + pos + 1);
                 break;
+                
             case OP_drop:
-                /* ignore drop opcodes if followed by OP_return_undef */
+                /* 特殊情况：如果 drop 后面是 return_undef，可以忽略 drop */
                 while (s->byte_code.buf[++pos] == OP_drop)
                     continue;
                 if (s->byte_code.buf[pos] == OP_return_undef)
                     op = OP_return_undef;
                 /* fall thru */
+                
             default:
+                /* 找到目标指令 */
                 goto done;
             }
             break;
         }
     }
-    /* cycle detected, could issue a warning */
-    /* XXX: the combination of find_jump_target() and skip_dead_code()
-       seems incorrect with cyclic labels. See for exemple:
-
-       for (;;) {
-       l:break l;
-       l:break l;
-       l:break l;
-       l:break l;
-       }
-
-       Avoiding changing the target is just a workaround and might not
-       suffice to completely fix the problem. */
+    
+    /* 检测到循环跳转，发出警告
+     * XXX: find_jump_target() 和 skip_dead_code() 的组合在处理循环标签时可能有问题
+     * 例如：
+     *   for (;;) {
+     *   l:break l;
+     *   l:break l;
+     *   l:break l;
+     *   l:break l;
+     *   }
+     * 
+     * 不改变目标只是一个临时解决方案，可能不足以完全修复问题
+     */
     label = label0;
- done:
+    
+done:
     *pop = op;
-    update_label(s, label, +1);
+    update_label(s, label, +1); /* 恢复引用计数 */
     return label;
 }
 
+/**
+ * push_short_int - 推送整数到字节码（使用最短编码）
+ * @bc_out: 输出字节码缓冲区
+ * @val: 要推送的整数值
+ * 
+ * 说明：根据整数值的大小选择最紧凑的编码方式：
+ * - [-1, 7]: 单字节操作码 OP_push_0 ~ OP_push_7
+ * - int8 范围：OP_push_i8 + 1 字节
+ * - int16 范围：OP_push_i16 + 2 字节
+ * - 其他：OP_push_i32 + 4 字节
+ */
 static void push_short_int(DynBuf *bc_out, int val)
 {
 #if SHORT_OPCODES
+    /* 情况 1: 小整数 [-1, 7]，使用专用单字节操作码 */
     if (val >= -1 && val <= 7) {
-        dbuf_putc(bc_out, OP_push_0 + val);
+        dbuf_putc(bc_out, OP_push_0 + val); /* OP_push_0 + offset */
         return;
     }
+    
+    /* 情况 2: 8 位有符号整数 [-128, 127] */
     if (val == (int8_t)val) {
-        dbuf_putc(bc_out, OP_push_i8);
+        dbuf_putc(bc_out, OP_push_i8); /* 操作码 + 1 字节 */
         dbuf_putc(bc_out, val);
         return;
     }
+    
+    /* 情况 3: 16 位有符号整数 [-32768, 32767] */
     if (val == (int16_t)val) {
-        dbuf_putc(bc_out, OP_push_i16);
+        dbuf_putc(bc_out, OP_push_i16); /* 操作码 + 2 字节 */
         dbuf_put_u16(bc_out, val);
         return;
     }
 #endif
-    dbuf_putc(bc_out, OP_push_i32);
+    
+    /* 情况 4: 完整 32 位整数 */
+    dbuf_putc(bc_out, OP_push_i32); /* 操作码 + 4 字节 */
     dbuf_put_u32(bc_out, val);
 }
 
+/**
+ * put_short_code - 输出短编码操作码
+ * @bc_out: 输出字节码缓冲区
+ * @op: 操作码类型
+ * @idx: 索引值（如局部变量索引、参数索引等）
+ * 
+ * 说明：根据索引大小选择最紧凑的编码方式：
+ * - idx < 4: 使用专用单字节操作码（如 OP_get_loc0 ~ OP_get_loc3）
+ * - idx < 256: 使用 8 位编码（OP_xxx8 + 1 字节）
+ * - 其他：使用标准 16 位编码（OP_xxx + 2 字节）
+ */
 static void put_short_code(DynBuf *bc_out, int op, int idx)
 {
 #if SHORT_OPCODES
+    /* 情况 1: 小索引 [0-3]，使用专用操作码 */
     if (idx < 4) {
         switch (op) {
         case OP_get_loc:
@@ -40564,10 +40908,12 @@ static void put_short_code(DynBuf *bc_out, int op, int idx)
             return;
         }
     }
+    
+    /* 情况 2: 8 位索引 [0-255] */
     if (idx < 256) {
         switch (op) {
         case OP_get_loc:
-            dbuf_putc(bc_out, OP_get_loc8);
+            dbuf_putc(bc_out, OP_get_loc8); /* 操作码 + 1 字节 */
             dbuf_putc(bc_out, idx);
             return;
         case OP_put_loc:
@@ -40581,22 +40927,43 @@ static void put_short_code(DynBuf *bc_out, int op, int idx)
         }
     }
 #endif
-    dbuf_putc(bc_out, op);
-    dbuf_put_u16(bc_out, idx);
+    
+    /* 情况 3: 标准 16 位编码 */
+    dbuf_putc(bc_out, op);       /* 操作码 */
+    dbuf_put_u16(bc_out, idx);   /* 2 字节索引 */
 }
 
-/* peephole optimizations and resolve goto/labels */
+/* ===========================================================================
+ * 模块：标签解析与窥孔优化
+ * 函数：resolve_labels
+ * 
+ * 功能：
+ * 1. 解析所有 goto/标签，计算实际的跳转偏移量
+ * 2. 执行窥孔优化（peephole optimization）
+ * 3. 将短操作码优化应用到字节码
+ * 
+ * 这是字节码生成的最后一道优化工序
+ * =========================================================================== */
+
+/**
+ * resolve_labels - 解析标签并执行窥孔优化
+ * @ctx: JS 上下文
+ * @s: 函数定义
+ * 
+ * 返回：0 成功，-1 失败
+ */
 static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 {
+    /* 变量声明 */
     int pos, pos_next, bc_len, op, op1, len, i, line_num;
     const uint8_t *bc_buf;
-    DynBuf bc_out;
+    DynBuf bc_out;           /* 输出字节码缓冲区 */
     LabelSlot *label_slots, *ls;
-    RelocEntry *re, *re_next;
-    CodeContext cc;
+    RelocEntry *re, *re_next; /* 重定位条目 */
+    CodeContext cc;          /* 代码上下文匹配 */
     int label;
 #if SHORT_OPCODES
-    JumpSlot *jp;
+    JumpSlot *jp;            /* 跳转槽（用于短跳转优化） */
 #endif
 
     label_slots = s->label_slots;
