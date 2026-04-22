@@ -39216,6 +39216,7 @@ static int resolve_scope_private_field(JSContext *ctx, JSFunctionDef *s,
         }
         break;
     case OP_scope_in_private_field:
+        /* in 运算符检查私有字段是否存在 */
         get_loc_or_ref(bc, is_ref, idx);
         dbuf_putc(bc, OP_private_in);
         break;
@@ -39225,19 +39226,40 @@ static int resolve_scope_private_field(JSContext *ctx, JSFunctionDef *s,
     return 0;
 }
 
+/**
+ * @brief 标记 eval 需要捕获的变量
+ * 
+ * 当遇到 eval 调用时，需要将指定作用域层级的所有变量标记为"已捕获"，
+ * 这样这些变量就会被提升到闭包中，以便 eval 可以访问它们。
+ * 
+ * @param ctx JS 上下文
+ * @param s 函数定义结构
+ * @param scope_level 作用域层级
+ */
 static void mark_eval_captured_variables(JSContext *ctx, JSFunctionDef *s,
                                          int scope_level)
 {
     int idx;
     JSVarDef *vd;
 
+    /* 遍历该作用域层级中的所有变量，将它们标记为已捕获 */
     for (idx = s->scopes[scope_level].first; idx >= 0;) {
         vd = &s->vars[idx];
-        capture_var(s, vd);
+        capture_var(s, vd);  /* 标记变量需要被捕获到闭包中 */
         idx = vd->scope_next;
     }
 }
 
+/**
+ * @brief 检查变量是否属于参数作用域中的伪变量
+ * 
+ * 参数作用域中包含一些特殊的伪变量，如 this、new.target、home_object 等，
+ * 这些变量需要特殊处理。
+ * 
+ * @param var_name 变量名 atom
+ * @param var_kind 变量种类
+ * @return TRUE 如果是参数作用域中的变量，FALSE 否则
+ */
 /* XXX: should handle the argument scope generically */
 static BOOL is_var_in_arg_scope(JSAtom var_name, JSVarKindEnum var_kind)
 {
@@ -39249,6 +39271,17 @@ static BOOL is_var_in_arg_scope(JSAtom var_name, JSVarKindEnum var_kind)
             var_kind == JS_VAR_FUNCTION_NAME);
 }
 
+/**
+ * @brief 为 eval 添加必要的变量
+ * 
+ * eval 可以访问其所在函数的所有变量，因此需要：
+ * 1. 创建变量环境对象（非严格模式下）
+ * 2. 添加 this、arguments 等特殊绑定
+ * 3. 将所有外层函数的变量添加到闭包中
+ * 
+ * @param ctx JS 上下文
+ * @param s 函数定义结构（eval 函数）
+ */
 static void add_eval_variables(JSContext *ctx, JSFunctionDef *s)
 {
     JSFunctionDef *fd;
@@ -39256,48 +39289,53 @@ static void add_eval_variables(JSContext *ctx, JSFunctionDef *s)
     int i, scope_level, scope_idx;
     BOOL has_arguments_binding, has_this_binding, is_arg_scope;
 
-    /* in non strict mode, variables are created in the caller's
-       environment object */
+    /* 非严格模式下，变量创建在调用者的环境对象中 */
     if (!s->is_eval && !(s->js_mode & JS_MODE_STRICT)) {
         s->var_object_idx = add_var(ctx, s, JS_ATOM__var_);
         if (s->has_parameter_expressions) {
-            /* an additional variable object is needed for the
-               argument scope */
+            /* 参数作用域需要一个额外的变量对象 */
             s->arg_var_object_idx = add_var(ctx, s, JS_ATOM__arg_var_);
         }
     }
 
-    /* eval can potentially use 'arguments' so we must define it */
+    /* eval 可能会使用 'arguments'，所以必须定义它 */
     has_this_binding = s->has_this_binding;
     if (has_this_binding) {
+        /* 添加 this 绑定 */
         if (s->this_var_idx < 0)
             s->this_var_idx = add_var_this(ctx, s);
+        /* 添加 new.target 绑定 */
         if (s->new_target_var_idx < 0)
             s->new_target_var_idx = add_var(ctx, s, JS_ATOM_new_target);
+        /* 派生类构造函数需要 this_active_func */
         if (s->is_derived_class_constructor && s->this_active_func_var_idx < 0)
             s->this_active_func_var_idx = add_var(ctx, s, JS_ATOM_this_active_func);
+        /* 添加 home_object（用于 super 引用） */
         if (s->has_home_object && s->home_object_var_idx < 0)
             s->home_object_var_idx = add_var(ctx, s, JS_ATOM_home_object);
     }
     has_arguments_binding = s->has_arguments_binding;
     if (has_arguments_binding) {
+        /* 添加 arguments 绑定 */
         add_arguments_var(ctx, s);
-        /* also add an arguments binding in the argument scope to
-           raise an error if a direct eval in the argument scope tries
-           to redefine it */
+        /* 在参数作用域中也添加 arguments 绑定，
+           以便在参数作用域中的直接 eval 尝试重定义它时抛出错误 */
         if (s->has_parameter_expressions && !(s->js_mode & JS_MODE_STRICT))
             add_arguments_arg(ctx, s);
     }
+    /* 函数表达式需要添加函数名作为变量 */
     if (s->is_func_expr && s->func_name != JS_ATOM_NULL)
         add_func_var(ctx, s, s->func_name);
 
+    /* 捕获所有参数变量 */
     for(i = 0; i < s->arg_count; i++) {
         vd = &s->args[i];
         capture_var(s, vd);
     }
+    /* 捕获所有局部变量（除了顶层的__ret__结果变量） */
     for(i = 0; i < s->var_count; i++) {
         vd = &s->vars[i];
-        /* do not close top level last result */
+        /* 不捕获顶层的最后结果变量 */
         if (vd->scope_level == 0 &&
             vd->var_name != JS_ATOM__ret_ &&
             vd->var_name != JS_ATOM_NULL) {
@@ -39305,20 +39343,20 @@ static void add_eval_variables(JSContext *ctx, JSFunctionDef *s)
         }
     }
     
-    /* eval can use all the variables of the enclosing functions, so
-       they must be all put in the closure. The closure variables are
-       ordered by scope. It works only because no closure are created
-       before. */
+    /* eval 可以使用所有外层函数的变量，
+       所以必须将它们全部放入闭包中。闭包变量按作用域排序。
+       这之所以可行，是因为在此之前没有创建过闭包。 */
     assert(s->is_eval || s->closure_var_count == 0);
 
-    /* XXX: inefficient, but eval performance is less critical */
+    /* XXX: 效率不高，但 eval 的性能不那么关键 */
     fd = s;
+    /* 遍历所有外层函数，收集需要捕获的变量 */
     for(;;) {
         scope_level = fd->parent_scope_level;
         fd = fd->parent;
         if (!fd)
             break;
-        /* add 'this' if it was not previously added */
+        /* 如果之前没有添加 'this'，现在添加 */
         if (!has_this_binding && fd->has_this_binding) {
             if (fd->this_var_idx < 0)
                 fd->this_var_idx = add_var_this(ctx, fd);
@@ -39330,28 +39368,30 @@ static void add_eval_variables(JSContext *ctx, JSFunctionDef *s)
                 fd->home_object_var_idx = add_var(ctx, fd, JS_ATOM_home_object);
             has_this_binding = TRUE;
         }
-        /* add 'arguments' if it was not previously added */
+        /* 如果之前没有添加 'arguments'，现在添加 */
         if (!has_arguments_binding && fd->has_arguments_binding) {
             add_arguments_var(ctx, fd);
             has_arguments_binding = TRUE;
         }
-        /* add function name */
+        /* 添加函数名（函数表达式的情况） */
         if (fd->is_func_expr && fd->func_name != JS_ATOM_NULL)
             add_func_var(ctx, fd, fd->func_name);
 
-        /* add lexical variables */
+        /* 添加词法变量 */
         scope_idx = fd->scopes[scope_level].first;
         while (scope_idx >= 0) {
             vd = &fd->vars[scope_idx];
-            capture_var(fd, vd);
+            capture_var(fd, vd);  /* 标记为需要捕获 */
+            /* 将变量添加到闭包变量列表中 */
             get_closure_var(ctx, s, fd, JS_CLOSURE_LOCAL, scope_idx,
                             vd->var_name, vd->is_const, vd->is_lexical, vd->var_kind);
             scope_idx = vd->scope_next;
         }
         is_arg_scope = (scope_idx == ARG_SCOPE_END);
         if (!is_arg_scope) {
-            /* add unscoped variables */
-            /* XXX: propagate is_const and var_kind too ? */
+            /* 添加非作用域变量（参数和普通变量） */
+            /* XXX: 是否也应该传播 is_const 和 var_kind？ */
+            /* 添加参数变量 */
             for(i = 0; i < fd->arg_count; i++) {
                 vd = &fd->args[i];
                 if (vd->var_name != JS_ATOM_NULL) {
@@ -39361,9 +39401,10 @@ static void add_eval_variables(JSContext *ctx, JSFunctionDef *s)
                                     vd->is_lexical, JS_VAR_NORMAL);
                 }
             }
+            /* 添加局部变量（除了顶层的__ret__） */
             for(i = 0; i < fd->var_count; i++) {
                 vd = &fd->vars[i];
-                /* do not close top level last result */
+                /* 不捕获顶层的最后结果变量 */
                 if (vd->scope_level == 0 &&
                     vd->var_name != JS_ATOM__ret_ &&
                     vd->var_name != JS_ATOM_NULL) {
@@ -39374,9 +39415,10 @@ static void add_eval_variables(JSContext *ctx, JSFunctionDef *s)
                 }
             }
         } else {
+            /* 在参数作用域中，只添加伪变量 */
             for(i = 0; i < fd->var_count; i++) {
                 vd = &fd->vars[i];
-                /* do not close top level last result */
+                /* 不捕获顶层的最后结果变量 */
                 if (vd->scope_level == 0 && is_var_in_arg_scope(vd->var_name, vd->var_kind)) {
                     capture_var(fd, vd);
                     get_closure_var(ctx, s, fd,
@@ -39385,14 +39427,13 @@ static void add_eval_variables(JSContext *ctx, JSFunctionDef *s)
                 }
             }
         }
+        /* 如果外层函数是直接 eval，需要添加其闭包变量 */
         if (fd->is_eval) {
             int idx;
-            /* add direct eval variables (we are necessarily at the
-               top level). */
+            /* 添加直接 eval 的变量（我们必然在顶层） */
             for (idx = 0; idx < fd->closure_var_count; idx++) {
                 JSClosureVar *cv = &fd->closure_var[idx];
-                /* Global variables are removed but module
-                   definitions are kept. */
+                /* 移除全局变量，但保留模块定义 */
                 if (cv->closure_type != JS_CLOSURE_GLOBAL_REF &&
                     cv->closure_type != JS_CLOSURE_GLOBAL_DECL &&
                     cv->closure_type != JS_CLOSURE_GLOBAL) {
@@ -39406,6 +39447,16 @@ static void add_eval_variables(JSContext *ctx, JSFunctionDef *s)
     }
 }
 
+/**
+ * @brief 从字节码变量定义设置闭包变量
+ * 
+ * 将字节码中的变量定义复制到闭包变量结构中。
+ * 
+ * @param ctx JS 上下文
+ * @param cv 目标闭包变量结构
+ * @param vd 源字节码变量定义
+ * @param var_idx 变量索引
+ */
 static void set_closure_from_var(JSContext *ctx, JSClosureVar *cv,
                                  JSBytecodeVarDef *vd, int var_idx)
 {
@@ -39414,9 +39465,21 @@ static void set_closure_from_var(JSContext *ctx, JSClosureVar *cv,
     cv->is_lexical = vd->is_lexical;
     cv->var_kind = vd->var_kind;
     cv->var_idx = var_idx;
-    cv->var_name = JS_DupAtom(ctx, vd->var_name);
+    cv->var_name = JS_DupAtom(ctx, vd->var_name);  /* 引用计数增加 */
 }
 
+/**
+ * @brief 为直接 eval 编译添加闭包变量
+ * 
+ * 直接 eval 需要访问调用函数的所有变量，此函数将调用函数的
+ * 变量复制到 eval 函数的闭包变量列表中。
+ * 
+ * @param ctx JS 上下文
+ * @param s eval 函数定义
+ * @param b 调用函数的字节码
+ * @param scope_idx eval 调用点的作用域索引
+ * @return 0 成功，-1 失败
+ */
 /* for direct eval compilation: add references to the variables of the
    calling function */
 static __exception int add_closure_variables(JSContext *ctx, JSFunctionDef *s,
@@ -39426,6 +39489,7 @@ static __exception int add_closure_variables(JSContext *ctx, JSFunctionDef *s,
     JSBytecodeVarDef *vd;
     BOOL is_arg_scope;
 
+    /* 计算需要的闭包变量总数 */
     count = b->arg_count + b->var_count + b->closure_var_count;
     s->closure_var = NULL;
     s->closure_var_count = 0;
@@ -39435,7 +39499,8 @@ static __exception int add_closure_variables(JSContext *ctx, JSFunctionDef *s,
     s->closure_var = js_malloc(ctx, sizeof(s->closure_var[0]) * count);
     if (!s->closure_var)
         return -1;
-    /* Add lexical variables in scope at the point of evaluation */
+    
+    /* 添加 eval 调用点作用域中的词法变量 */
     for (i = scope_idx; i >= 0;) {
         vd = &b->vardefs[b->arg_count + i];
         if (vd->has_scope) {
@@ -39445,8 +39510,9 @@ static __exception int add_closure_variables(JSContext *ctx, JSFunctionDef *s,
         i = vd->scope_next;
     }
     is_arg_scope = (i == ARG_SCOPE_END);
+    
     if (!is_arg_scope) {
-        /* Add argument variables */
+        /* 添加参数变量 */
         for(i = 0; i < b->arg_count; i++) {
             JSClosureVar *cv = &s->closure_var[s->closure_var_count++];
             vd = &b->vardefs[i];
@@ -39457,7 +39523,7 @@ static __exception int add_closure_variables(JSContext *ctx, JSFunctionDef *s,
             cv->var_idx = i;
             cv->var_name = JS_DupAtom(ctx, vd->var_name);
         }
-        /* Add local non lexical variables */
+        /* 添加局部非词法变量 */
         for(i = 0; i < b->var_count; i++) {
             vd = &b->vardefs[b->arg_count + i];
             if (!vd->has_scope && vd->var_name != JS_ATOM__ret_) {
@@ -39466,7 +39532,7 @@ static __exception int add_closure_variables(JSContext *ctx, JSFunctionDef *s,
             }
         }
     } else {
-        /* only add pseudo variables */
+        /* 在参数作用域中，只添加伪变量 */
         for(i = 0; i < b->var_count; i++) {
             vd = &b->vardefs[b->arg_count + i];
             if (!vd->has_scope && is_var_in_arg_scope(vd->var_name, vd->var_kind)) {
@@ -39475,6 +39541,8 @@ static __exception int add_closure_variables(JSContext *ctx, JSFunctionDef *s,
             }
         }
     }
+    
+    /* 添加外层闭包变量的引用 */
     for(i = 0; i < b->closure_var_count; i++) {
         JSClosureVar *cv0 = &b->closure_var[i];
         JSClosureVar *cv;
@@ -39489,12 +39557,12 @@ static __exception int add_closure_variables(JSContext *ctx, JSFunctionDef *s,
         case JS_CLOSURE_GLOBAL_REF:
         case JS_CLOSURE_GLOBAL_DECL:
         case JS_CLOSURE_GLOBAL:
-            continue; /* not necessary to add global variables */
+            continue; /* 不需要添加全局变量 */
         default:
             abort();
         }
         cv = &s->closure_var[s->closure_var_count++];
-        cv->closure_type = JS_CLOSURE_REF;
+        cv->closure_type = JS_CLOSURE_REF;  /* 作为引用添加 */
         cv->is_const = cv0->is_const;
         cv->is_lexical = cv0->is_lexical;
         cv->var_kind = cv0->var_kind;
@@ -39504,22 +39572,50 @@ static __exception int add_closure_variables(JSContext *ctx, JSFunctionDef *s,
     return 0;
 }
 
+/**
+ * @brief 代码匹配上下文结构
+ * 
+ * 用于字节码模式匹配，支持通配符和多操作符匹配。
+ */
 typedef struct CodeContext {
-    const uint8_t *bc_buf; /* code buffer */
-    int bc_len;   /* length of the code buffer */
-    int pos;      /* position past the matched code pattern */
-    int line_num; /* last visited OP_line_num parameter or -1 */
-    int op;
-    int idx;
-    int label;
-    int val;
-    JSAtom atom;
+    const uint8_t *bc_buf;  /* 字节码缓冲区 */
+    int bc_len;             /* 字节码长度 */
+    int pos;                /* 匹配模式后的位置 */
+    int line_num;           /* 最后访问的 OP_line_num 参数或 -1 */
+    int op;                 /* 匹配到的操作码 */
+    int idx;                /* 匹配到的索引值 */
+    int label;              /* 匹配到的标签 */
+    int val;                /* 匹配到的附加值 */
+    JSAtom atom;            /* 匹配到的 atom */
 } CodeContext;
 
+/* 多操作符匹配宏：允许匹配多个可能的操作码 */
 #define M2(op1, op2)            ((op1) | ((op2) << 8))
 #define M3(op1, op2, op3)       ((op1) | ((op2) << 8) | ((op3) << 16))
 #define M4(op1, op2, op3, op4)  ((op1) | ((op2) << 8) | ((op3) << 16) | ((op4) << 24))
 
+/**
+ * @brief 字节码模式匹配函数
+ * 
+ * 从指定位置开始匹配字节码模式。支持：
+ * - 精确操作码匹配
+ * - 多操作符匹配（使用 M2/M3/M4 宏）
+ * - 通配符匹配（参数为 -1 时表示任意值）
+ * - 自动跳过 OP_line_num 指令
+ * 
+ * @param s 代码上下文
+ * @param pos 起始位置
+ * @param ... 可变参数：操作码序列，以 -1 结尾
+ *              参数为 -1 表示通配符（匹配任意值）
+ * @return TRUE 匹配成功，FALSE 失败
+ * 
+ * @example
+ * // 匹配 "OP_drop, OP_return_undef" 序列
+ * code_match(&cc, pos, OP_drop, OP_return_undef, -1);
+ * 
+ * // 匹配 "OP_if_false 或 OP_if_true, 后跟 OP_drop"
+ * code_match(&cc, pos, M2(OP_if_false, OP_if_true), OP_drop, -1);
+ */
 static BOOL code_match(CodeContext *s, int pos, ...)
 {
     const uint8_t *tab = s->bc_buf;
@@ -39533,11 +39629,13 @@ static BOOL code_match(CodeContext *s, int pos, ...)
     for(;;) {
         op1 = va_arg(ap, int);
         if (op1 == -1) {
+            /* 所有模式匹配成功 */
             s->pos = pos;
             s->line_num = line_num;
             ret = TRUE;
             break;
         }
+        /* 跳过 OP_line_num 指令（调试信息） */
         for (;;) {
             if (pos >= s->bc_len)
                 goto done;
@@ -39553,9 +39651,12 @@ static BOOL code_match(CodeContext *s, int pos, ...)
                 break;
             }
         }
+        /* 检查操作码是否匹配 */
         if (op != op1) {
+            /* 如果不是多操作符匹配，直接失败 */
             if (op1 == (uint8_t)op1 || !op)
                 break;
+            /* 检查是否匹配多操作符中的任意一个 */
             if (op != (uint8_t)op1
             &&  op != (uint8_t)(op1 >> 8)
             &&  op != (uint8_t)(op1 >> 16)
@@ -39566,6 +39667,7 @@ static BOOL code_match(CodeContext *s, int pos, ...)
         }
 
         pos++;
+        /* 根据操作码格式解析参数 */
         switch(opcode_info[op].fmt) {
         case OP_FMT_loc8:
         case OP_FMT_u8:
@@ -39573,10 +39675,10 @@ static BOOL code_match(CodeContext *s, int pos, ...)
                 int idx = tab[pos];
                 int arg = va_arg(ap, int);
                 if (arg == -1) {
-                    s->idx = idx;
+                    s->idx = idx;  /* 通配符：保存匹配值 */
                 } else {
                     if (arg != idx)
-                        goto done;
+                        goto done;  /* 不匹配 */
                 }
                 break;
             }
@@ -39644,20 +39746,32 @@ static BOOL code_match(CodeContext *s, int pos, ...)
     return ret;
 }
 
+/**
+ * @brief 实例化提升的定义（hoisted definitions）
+ * 
+ * 在函数开始时初始化被提升的函数声明和模块全局变量。
+ * JS 中函数声明会被"提升"到作用域顶部，此函数负责生成相应的初始化代码。
+ * 
+ * @param ctx JS 上下文
+ * @param s 函数定义
+ * @param bc 输出字节码缓冲区
+ */
 static void instantiate_hoisted_definitions(JSContext *ctx, JSFunctionDef *s, DynBuf *bc)
 {
     int i, idx, label_next = -1;
 
-    /* add the hoisted functions in arguments and local variables */
+    /* 初始化参数中的提升函数 */
     for(i = 0; i < s->arg_count; i++) {
         JSVarDef *vd = &s->args[i];
         if (vd->func_pool_idx >= 0) {
+            /* 从函数池创建函数闭包并赋值给参数 */
             dbuf_putc(bc, OP_fclosure);
             dbuf_put_u32(bc, vd->func_pool_idx);
             dbuf_putc(bc, OP_put_arg);
             dbuf_put_u16(bc, i);
         }
     }
+    /* 初始化局部变量中的提升函数（仅限顶层作用域） */
     for(i = 0; i < s->var_count; i++) {
         JSVarDef *vd = &s->vars[i];
         if (vd->scope_level == 0 && vd->func_pool_idx >= 0) {
@@ -39668,16 +39782,15 @@ static void instantiate_hoisted_definitions(JSContext *ctx, JSFunctionDef *s, Dy
         }
     }
 
-    /* the module global variables must be initialized before
-       evaluating the module so that the exported functions are
-       visible if there are cyclic module references */
+    /* 模块全局变量必须在模块求值之前初始化，
+       这样如果存在循环模块引用，导出的函数就是可见的 */
     if (s->module) {
         label_next = new_label_fd(s);
         if (label_next < 0) {
             dbuf_set_error(bc);
             return;
         }
-        /* if 'this' is true, initialize the global variables and return */
+        /* 如果'this'为 true，初始化全局变量并返回 */
         dbuf_putc(bc, OP_push_this);
         dbuf_putc(bc, OP_if_false);
         dbuf_put_u32(bc, label_next);
@@ -39685,23 +39798,22 @@ static void instantiate_hoisted_definitions(JSContext *ctx, JSFunctionDef *s, Dy
         s->jump_size++;
     }
 
-    /* add the global variables (only happens if s->is_global_var is
-       true) */
-    /* XXX: inefficient, add a closure index in JSGlobalVar */
+    /* 初始化全局变量（仅在 s->is_global_var 为 true 时发生） */
+    /* XXX: 效率不高，应该在 JSGlobalVar 中添加闭包索引 */
     for(i = 0; i < s->global_var_count; i++) {
         JSGlobalVar *hf = &s->global_vars[i];
         BOOL has_var_obj = FALSE;
         BOOL force_init = hf->force_init;
-        /* we are in an eval, so the closure contains all the
-           enclosing variables */
-        /* If the outer function has a variable environment,
-           create a property for the variable there */
+        /* 我们在 eval 中，所以闭包包含所有外层变量 */
+        /* 如果外层函数有变量环境，在那里为变量创建属性 */
         for(idx = 0; idx < s->closure_var_count; idx++) {
             JSClosureVar *cv = &s->closure_var[idx];
             if (cv->var_name == hf->var_name) {
+                /* 变量已在闭包中，不需要强制初始化 */
                 force_init = FALSE;
                 goto closure_found;
             }
+            /* 检查是否有变量环境对象 */
             if (cv->var_name == JS_ATOM__var_ ||
                 cv->var_name == JS_ATOM__arg_var_) {
                 dbuf_putc(bc, OP_get_var_ref);
@@ -39711,46 +39823,67 @@ static void instantiate_hoisted_definitions(JSContext *ctx, JSFunctionDef *s, Dy
                 goto closure_found;
             }
         }
-        abort();
+        abort();  /* 应该总能找到变量环境 */
     closure_found:
         if (hf->cpool_idx >= 0 || force_init) {
             if (hf->cpool_idx >= 0) {
+                /* 从常量池创建函数闭包 */
                 dbuf_putc(bc, OP_fclosure);
                 dbuf_put_u32(bc, hf->cpool_idx);
                 if (hf->var_name == JS_ATOM__default_) {
-                    /* set default export function name */
+                    /* 设置默认导出函数名 */
                     dbuf_putc(bc, OP_set_name);
                     dbuf_put_u32(bc, JS_DupAtom(ctx, JS_ATOM_default));
                 }
             } else {
+                /* 没有初始值，使用 undefined */
                 dbuf_putc(bc, OP_undefined);
             }
             if (!has_var_obj) {
+                /* 直接赋值给变量引用 */
                 dbuf_putc(bc, OP_put_var_ref);
                 dbuf_put_u16(bc, idx);
             } else {
+                /* 在变量环境对象上定义属性 */
                 dbuf_putc(bc, OP_define_field);
                 dbuf_put_u32(bc, JS_DupAtom(ctx, hf->var_name));
-                dbuf_putc(bc, OP_drop);
+                dbuf_putc(bc, OP_drop);  /* 丢弃 define_field 的返回值 */
             }
         }
-        JS_FreeAtom(ctx, hf->var_name);
+        JS_FreeAtom(ctx, hf->var_name);  /* 释放 atom 引用 */
     }
 
     if (s->module) {
+        /* 模块初始化代码结束，返回 undefined */
         dbuf_putc(bc, OP_return_undef);
 
+        /* 跳转标签，跳过全局变量初始化（当 this 为 false 时） */
         dbuf_putc(bc, OP_label);
         dbuf_put_u32(bc, label_next);
         s->label_slots[label_next].pos2 = bc->size;
     }
 
+    /* 清理全局变量数组 */
     js_free(ctx, s->global_vars);
     s->global_vars = NULL;
     s->global_var_count = 0;
     s->global_var_size = 0;
 }
 
+/**
+ * @brief 跳过死代码（无法到达的代码）
+ * 
+ * 从指定位置开始扫描字节码，跳过所有无法到达的指令，
+ * 直到遇到一个标签或其他需要保留的指令。
+ * 用于优化：删除 goto/return/throw 之后的代码。
+ * 
+ * @param s 函数定义
+ * @param bc_buf 字节码缓冲区
+ * @param bc_len 字节码长度
+ * @param pos 起始位置
+ * @param linep 输出参数：返回最后遇到的行号
+ * @return 死代码之后的位置
+ */
 static int skip_dead_code(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
                           int pos, int *linep)
 {
@@ -39760,13 +39893,16 @@ static int skip_dead_code(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
         op = bc_buf[pos];
         len = opcode_info[op].size;
         if (op == OP_line_num) {
+            /* 记录行号信息 */
             *linep = get_u32(bc_buf + pos + 1);
         } else
         if (op == OP_label) {
+            /* 遇到标签，停止跳过 */
             label = get_u32(bc_buf + pos + 1);
             if (update_label(s, label, 0) > 0)
                 break;
 #if 0
+            /* 调试代码：检查未引用标签是否有重定位 */
             if (s->label_slots[label].first_reloc) {
                 printf("line %d: unreferenced label %d:%d has relocations\n",
                        *linep, label, s->label_slots[label].pos2);
@@ -39774,13 +39910,14 @@ static int skip_dead_code(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
 #endif
             assert(s->label_slots[label].first_reloc == NULL);
         } else {
-            /* XXX: output a warning for unreachable code? */
+            /* 其他指令：释放资源并减少标签引用计数 */
+            /* XXX: 是否应该为不可达代码输出警告？ */
             JSAtom atom;
             switch(opcode_info[op].fmt) {
             case OP_FMT_label:
             case OP_FMT_label_u16:
                 label = get_u32(bc_buf + pos + 1);
-                update_label(s, label, -1);
+                update_label(s, label, -1);  /* 减少标签引用计数 */
                 break;
             case OP_FMT_atom_label_u8:
             case OP_FMT_atom_label_u16:
@@ -39790,6 +39927,7 @@ static int skip_dead_code(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
             case OP_FMT_atom:
             case OP_FMT_atom_u8:
             case OP_FMT_atom_u16:
+                /* 释放 atom 引用 */
                 atom = get_u32(bc_buf + pos + 1);
                 JS_FreeAtom(s->ctx, atom);
                 break;
@@ -39801,18 +39939,31 @@ static int skip_dead_code(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
     return pos;
 }
 
+/**
+ * @brief 获取标签的实际位置（跟随 goto 链）
+ * 
+ * 如果一个标签后面紧跟 goto，会返回 goto 目标的标签位置。
+ * 用于优化跳转指令。
+ * 
+ * @param s 函数定义
+ * @param label 标签 ID
+ * @return 标签的实际位置
+ */
 static int get_label_pos(JSFunctionDef *s, int label)
 {
     int i, pos;
+    /* 最多跟踪 20 层 goto 链，防止无限循环 */
     for (i = 0; i < 20; i++) {
         pos = s->label_slots[label].pos;
         for (;;) {
             switch (s->byte_code.buf[pos]) {
             case OP_line_num:
             case OP_label:
+                /* 跳过行号和标签指令 */
                 pos += 5;
                 continue;
             case OP_goto:
+                /* 跟随 goto 跳转到下一个标签 */
                 label = get_u32(s->byte_code.buf + pos + 1);
                 break;
             default:
