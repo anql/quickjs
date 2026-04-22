@@ -35509,6 +35509,23 @@ static JSResolveResultEnum js_resolve_export(JSContext *ctx,
     return ret;
 }
 
+/**
+ * @brief 模块导出解析错误处理函数
+ * 
+ * 当模块导出解析失败时，根据不同的错误类型抛出相应的语法错误。
+ * 这是 ES6 模块系统错误处理的核心函数之一。
+ * 
+ * @param ctx JS 上下文
+ * @param res 解析结果枚举值
+ * @param m 模块定义
+ * @param export_name 导出名称（atom 形式）
+ * 
+ * @note 错误类型包括：
+ * - JS_RESOLVE_RES_NOT_FOUND: 导出未找到
+ * - JS_RESOLVE_RES_CIRCULAR: 循环引用
+ * - JS_RESOLVE_RES_AMBIGUOUS: 导出名称歧义
+ * - JS_RESOLVE_RES_EXCEPTION: 异常（不抛出错误）
+ */
 static void js_resolve_export_throw_error(JSContext *ctx,
                                           JSResolveResultEnum res,
                                           JSModuleDef *m, JSAtom export_name)
@@ -35517,19 +35534,23 @@ static void js_resolve_export_throw_error(JSContext *ctx,
     char buf2[ATOM_GET_STR_BUF_SIZE];
     switch(res) {
     case JS_RESOLVE_RES_EXCEPTION:
+        /* 异常情况：不抛出额外错误，避免掩盖原始异常 */
         break;
     default:
     case JS_RESOLVE_RES_NOT_FOUND:
+        /* 未找到导出：指定的导出名称在模块中不存在 */
         JS_ThrowSyntaxError(ctx, "Could not find export '%s' in module '%s'",
                             JS_AtomGetStr(ctx, buf1, sizeof(buf1), export_name),
                             JS_AtomGetStr(ctx, buf2, sizeof(buf2), m->module_name));
         break;
     case JS_RESOLVE_RES_CIRCULAR:
+        /* 循环引用：模块之间存在循环依赖，无法解析导出 */
         JS_ThrowSyntaxError(ctx, "circular reference when looking for export '%s' in module '%s'",
                             JS_AtomGetStr(ctx, buf1, sizeof(buf1), export_name),
                             JS_AtomGetStr(ctx, buf2, sizeof(buf2), m->module_name));
         break;
     case JS_RESOLVE_RES_AMBIGUOUS:
+        /* 歧义导出：同一个导出名称在多个地方定义，无法确定使用哪个 */
         JS_ThrowSyntaxError(ctx, "export '%s' in module '%s' is ambiguous",
                             JS_AtomGetStr(ctx, buf1, sizeof(buf1), export_name),
                             JS_AtomGetStr(ctx, buf2, sizeof(buf2), m->module_name));
@@ -35538,31 +35559,61 @@ static void js_resolve_export_throw_error(JSContext *ctx,
 }
 
 
+/**
+ * @brief 导出名称条目类型枚举
+ * 
+ * 用于标识模块导出名称的解析状态：
+ * - AMBIGUOUS: 歧义导出（多个来源）
+ * - NORMAL: 正常导出（可直接解析）
+ * - DELAYED: 延迟解析导出（依赖循环引用，需懒加载）
+ */
 typedef enum {
-    EXPORTED_NAME_AMBIGUOUS,
-    EXPORTED_NAME_NORMAL,
-    EXPORTED_NAME_DELAYED,
+    EXPORTED_NAME_AMBIGUOUS,    /* 歧义导出 */
+    EXPORTED_NAME_NORMAL,       /* 正常导出 */
+    EXPORTED_NAME_DELAYED,      /* 延迟解析导出 */
 } ExportedNameEntryEnum;
 
+/**
+ * @brief 导出名称条目结构
+ * 
+ * 存储模块导出的元信息，用于构建模块命名空间。
+ * 使用联合体节省内存，根据导出类型存储不同的引用。
+ */
 typedef struct ExportedNameEntry {
-    JSAtom export_name;
-    ExportedNameEntryEnum export_type;
+    JSAtom export_name;             /* 导出名称（atom 形式） */
+    ExportedNameEntryEnum export_type; /* 导出类型 */
     union {
-        JSExportEntry *me; /* using when the list is built */
-        JSVarRef *var_ref; /* EXPORTED_NAME_NORMAL */
+        JSExportEntry *me;          /* 导出条目指针（构建列表时使用） */
+        JSVarRef *var_ref;          /* 变量引用（NORMAL 类型使用） */
     } u;
 } ExportedNameEntry;
 
+/**
+ * @brief 获取导出名称的状态结构
+ * 
+ * 用于收集和管理模块及其依赖的所有导出名称。
+ * 包含两个动态数组：模块列表和导出名称列表。
+ */
 typedef struct GetExportNamesState {
-    JSModuleDef **modules;
-    int modules_size;
-    int modules_count;
+    JSModuleDef **modules;          /* 模块指针数组 */
+    int modules_size;               /* 模块数组容量 */
+    int modules_count;              /* 模块实际数量 */
 
-    ExportedNameEntry *exported_names;
-    int exported_names_size;
-    int exported_names_count;
+    ExportedNameEntry *exported_names;  /* 导出名称条目数组 */
+    int exported_names_size;            /* 导出名称数组容量 */
+    int exported_names_count;           /* 导出名称实际数量 */
 } GetExportNamesState;
 
+/**
+ * @brief 查找导出名称在列表中的索引
+ * 
+ * 线性搜索导出名称列表，返回匹配项的索引。
+ * 使用 atom 指针比较（而非字符串比较），效率较高。
+ * 
+ * @param s 导出名称状态结构
+ * @param name 要查找的名称（atom 形式）
+ * @return 找到返回索引，未找到返回 -1
+ */
 static int find_exported_name(GetExportNamesState *s, JSAtom name)
 {
     int i;
@@ -35573,6 +35624,23 @@ static int find_exported_name(GetExportNamesState *s, JSAtom name)
     return -1;
 }
 
+/**
+ * @brief 递归收集模块的所有导出名称
+ * 
+ * 这是 ES6 模块系统的核心函数之一，用于构建模块命名空间。
+ * 它会：
+ * 1. 检查循环引用（避免无限递归）
+ * 2. 收集当前模块的所有导出
+ * 3. 递归处理 star export（export * from）导入的模块
+ * 
+ * @param ctx JS 上下文
+ * @param s 导出名称状态结构（累积结果）
+ * @param m 当前处理的模块
+ * @param from_star 是否来自 star export（影响 default 导出的处理）
+ * @return 成功返回 0，失败返回 -1
+ * 
+ * @note from_star 为 TRUE 时，跳过 default 导出（star export 不导出 default）
+ */
 static __exception int get_exported_names(JSContext *ctx,
                                           GetExportNamesState *s,
                                           JSModuleDef *m, BOOL from_star)
@@ -35580,38 +35648,44 @@ static __exception int get_exported_names(JSContext *ctx,
     ExportedNameEntry *en;
     int i, j;
 
-    /* check circular reference */
+    /* 检查循环引用：如果模块已在处理列表中，直接返回（避免无限递归） */
     for(i = 0; i < s->modules_count; i++) {
         if (s->modules[i] == m)
             return 0;
     }
+    /* 将当前模块添加到处理列表 */
     if (js_resize_array(ctx, (void **)&s->modules, sizeof(s->modules[0]),
                         &s->modules_size, s->modules_count + 1))
         return -1;
     s->modules[s->modules_count++] = m;
 
+    /* 收集当前模块的直接导出 */
     for(i = 0; i < m->export_entries_count; i++) {
         JSExportEntry *me = &m->export_entries[i];
+        /* star export 不导出 default */
         if (from_star && me->export_name == JS_ATOM_default)
             continue;
         j = find_exported_name(s, me->export_name);
         if (j < 0) {
+            /* 新导出名称：添加到列表 */
             if (js_resize_array(ctx, (void **)&s->exported_names, sizeof(s->exported_names[0]),
                                 &s->exported_names_size,
                                 s->exported_names_count + 1))
                 return -1;
             en = &s->exported_names[s->exported_names_count++];
             en->export_name = me->export_name;
-            /* avoid a second lookup for simple module exports */
+            /* 优化：简单模块导出避免二次查找 */
             if (from_star || me->export_type != JS_EXPORT_TYPE_LOCAL)
                 en->u.me = NULL;
             else
                 en->u.me = me;
         } else {
+            /* 重复名称：标记为需要进一步处理 */
             en = &s->exported_names[j];
             en->u.me = NULL;
         }
     }
+    /* 递归处理 star export 导入的模块 */
     for(i = 0; i < m->star_export_entries_count; i++) {
         JSStarExportEntry *se = &m->star_export_entries[i];
         JSModuleDef *m1;
@@ -35622,16 +35696,41 @@ static __exception int get_exported_names(JSContext *ctx,
     return 0;
 }
 
-/* Unfortunately, the spec gives a different behavior from GetOwnProperty ! */
+/**
+ * @brief 模块命名空间的 has 属性检查
+ * 
+ * ES6 模块命名空间对象使用特殊的 has 属性检查逻辑。
+ * 与标准的 GetOwnProperty 不同，这里只检查属性是否存在，
+ * 不考虑属性的可枚举性等特征。
+ * 
+ * @param ctx JS 上下文
+ * @param obj 模块命名空间对象
+ * @param atom 属性名（atom 形式）
+ * @return 存在返回 TRUE，不存在返回 FALSE
+ */
 static int js_module_ns_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
 {
     return (find_own_property1(JS_VALUE_GET_OBJ(obj), atom) != NULL);
 }
 
+/* 模块命名空间的特殊方法表 */
 static const JSClassExoticMethods js_module_ns_exotic_methods = {
     .has_property = js_module_ns_has,
 };
 
+/**
+ * @brief 导出名称比较函数（用于排序）
+ * 
+ * 按照导出名称的字符串表示进行字典序排序。
+ * 用于对模块命名空间的属性进行规范化排序。
+ * 
+ * @param p1 第一个导出名称条目
+ * @param p2 第二个导出名称条目
+ * @param opaque JS 上下文（通过 opaque 传递）
+ * @return 比较结果：<0 表示 p1<p2, 0 表示相等，>0 表示 p1>p2
+ * 
+ * @note 使用 atom 转字符串比较，可能存在内存分配开销
+ */
 static int exported_names_cmp(const void *p1, const void *p2, void *opaque)
 {
     JSContext *ctx = opaque;
@@ -35640,11 +35739,11 @@ static int exported_names_cmp(const void *p1, const void *p2, void *opaque)
     JSValue str1, str2;
     int ret;
 
-    /* XXX: should avoid allocation memory in atom comparison */
+    /* 将 atom 转换为字符串进行比较 */
     str1 = JS_AtomToString(ctx, me1->export_name);
     str2 = JS_AtomToString(ctx, me2->export_name);
     if (JS_IsException(str1) || JS_IsException(str2)) {
-        /* XXX: raise an error ? */
+        /* 异常处理：返回 0 避免崩溃 */
         ret = 0;
     } else {
         ret = js_string_compare(ctx, JS_VALUE_GET_STRING(str1),
@@ -35655,6 +35754,20 @@ static int exported_names_cmp(const void *p1, const void *p2, void *opaque)
     return ret;
 }
 
+/**
+ * @brief 模块命名空间自动初始化回调
+ * 
+ * 当访问模块命名空间的延迟解析属性时，此函数被调用。
+ * 用于处理循环依赖情况下的懒加载导出。
+ * 
+ * @param ctx JS 上下文
+ * @param p 模块命名空间对象
+ * @param atom 被访问的属性名
+ * @param opaque 模块定义（作为 opaque 传递）
+ * @return 属性值，异常返回 JS_EXCEPTION
+ * 
+ * @note 这是 ES6 模块循环依赖处理的关键机制
+ */
 static JSValue js_module_ns_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                      void *opaque)
 {
@@ -35664,26 +35777,52 @@ static JSValue js_module_ns_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
     JSModuleDef *res_m;
     JSVarRef *var_ref;
 
+    /* 解析导出：找到导出的实际来源 */
     res = js_resolve_export(ctx, &res_m, &res_me, m, atom);
     if (res != JS_RESOLVE_RES_FOUND) {
-        /* fail safe: normally no error should happen here except for memory */
+        /* 失败保护：正常情况下不应出错（内存不足除外） */
         js_resolve_export_throw_error(ctx, res, m, atom);
         return JS_EXCEPTION;
     }
     if (res_me->local_name == JS_ATOM__star_) {
+        /* star export：返回整个模块命名空间 */
         return JS_GetModuleNamespace(ctx, res_m->req_module_entries[res_me->u.req_module_idx].module);
     } else {
+        /* 普通导出：获取变量引用 */
         if (res_me->u.local.var_ref) {
             var_ref = res_me->u.local.var_ref;
         } else {
             JSObject *p1 = JS_VALUE_GET_OBJ(res_m->func_obj);
             var_ref = p1->u.func.var_refs[res_me->u.local.var_idx];
         }
-        /* WARNING: a varref is returned as a string ! */
+        /* 注意：varref 以字符串标签形式返回 */
         return JS_MKPTR(JS_TAG_STRING, var_ref);
     }
 }
 
+/**
+ * @brief 构建模块命名空间对象
+ * 
+ * 这是 ES6 模块系统的核心函数，用于创建模块的命名空间对象。
+ * 模块命名空间是一个特殊的对象，具有以下特点：
+ * 1. 包含模块的所有导出作为属性
+ * 2. 属性不可删除、不可修改（extensible = FALSE）
+ * 3. 支持循环依赖的懒加载解析
+ * 4. 按导出名称字典序排序
+ * 
+ * @param ctx JS 上下文
+ * @param m 模块定义
+ * @return 模块命名空间对象，异常返回 JS_EXCEPTION
+ * 
+ * @note 函数流程：
+ * 1. 创建模块命名空间对象
+ * 2. 收集所有导出名称（包括 star export）
+ * 3. 解析每个导出的实际来源
+ * 4. 排序导出名称
+ * 5. 添加属性（正常导出直接添加，延迟导出使用 autoinit）
+ * 6. 设置 Symbol.toStringTag
+ * 7. 冻结对象（extensible = FALSE）
+ */
 static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
 {
     JSValue obj;
@@ -35692,18 +35831,21 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
     int i, ret;
     JSProperty *pr;
 
+    /* 创建模块命名空间对象（特殊类） */
     obj = JS_NewObjectClass(ctx, JS_CLASS_MODULE_NS);
     if (JS_IsException(obj))
         return obj;
     p = JS_VALUE_GET_OBJ(obj);
 
+    /* 初始化状态结构 */
     memset(s, 0, sizeof(*s));
+    /* 收集所有导出名称（递归处理 star export） */
     ret = get_exported_names(ctx, s, m, FALSE);
     js_free(ctx, s->modules);
     if (ret)
         goto fail;
 
-    /* Resolve the exported names. The ambiguous exports are removed */
+    /* 解析导出名称：确定每个导出的类型和来源 */
     for(i = 0; i < s->exported_names_count; i++) {
         ExportedNameEntry *en = &s->exported_names[i];
         JSResolveResultEnum res;
@@ -35711,23 +35853,30 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
         JSModuleDef *res_m;
 
         if (en->u.me) {
-            res_me = en->u.me; /* fast case: no resolution needed */
+            /* 快速路径：简单模块导出，无需二次解析 */
+            res_me = en->u.me;
             res_m = m;
             res = JS_RESOLVE_RES_FOUND;
         } else {
+            /* 需要解析：可能是 star export 或复杂情况 */
             res = js_resolve_export(ctx, &res_m, &res_me, m,
                                     en->export_name);
         }
         if (res != JS_RESOLVE_RES_FOUND) {
             if (res != JS_RESOLVE_RES_AMBIGUOUS) {
+                /* 非歧义错误：抛出异常 */
                 js_resolve_export_throw_error(ctx, res, m, en->export_name);
                 goto fail;
             }
+            /* 歧义导出：标记为 AMBIGUOUS（不添加到命名空间） */
             en->export_type = EXPORTED_NAME_AMBIGUOUS;
         } else {
+            /* 成功解析：确定导出类型 */
             if (res_me->local_name == JS_ATOM__star_) {
+                /* star export：需要延迟解析 */
                 en->export_type = EXPORTED_NAME_DELAYED;
             } else {
+                /* 普通导出：获取变量引用 */
                 if (res_me->u.local.var_ref) {
                     en->u.var_ref = res_me->u.local.var_ref;
                 } else {
@@ -35735,21 +35884,23 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
                     en->u.var_ref = p1->u.func.var_refs[res_me->u.local.var_idx];
                 }
                 if (en->u.var_ref == NULL)
-                    en->export_type = EXPORTED_NAME_DELAYED;
+                    en->export_type = EXPORTED_NAME_DELAYED;  /* 变量引用未就绪，延迟解析 */
                 else
-                    en->export_type = EXPORTED_NAME_NORMAL;
+                    en->export_type = EXPORTED_NAME_NORMAL;   /* 可直接添加 */
             }
         }
     }
 
-    /* sort the exported names */
+    /* 按导出名称字典序排序（规范化顺序） */
     rqsort(s->exported_names, s->exported_names_count,
            sizeof(s->exported_names[0]), exported_names_cmp, ctx);
 
+    /* 添加属性到命名空间对象 */
     for(i = 0; i < s->exported_names_count; i++) {
         ExportedNameEntry *en = &s->exported_names[i];
         switch(en->export_type) {
         case EXPORTED_NAME_NORMAL:
+            /* 正常导出：直接添加属性 */
             {
                 JSVarRef *var_ref = en->u.var_ref;
                 pr = add_property(ctx, p, en->export_name,
@@ -35762,8 +35913,8 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
             }
             break;
         case EXPORTED_NAME_DELAYED:
-            /* the exported namespace or reference may depend on
-               circular references, so we resolve it lazily */
+            /* 延迟导出：使用 autoinit 机制懒加载 */
+            /* 适用于循环依赖或变量引用未就绪的情况 */
             if (JS_DefineAutoInitProperty(ctx, obj,
                                           en->export_name,
                                           JS_AUTOINIT_ID_MODULE_NS,
@@ -35771,12 +35922,14 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
                 goto fail;
             break;
         default:
+            /* AMBIGUOUS：跳过不添加 */
             break;
         }
     }
 
     js_free(ctx, s->exported_names);
 
+    /* 设置 Symbol.toStringTag 为 "Module" */
     JS_DefinePropertyValue(ctx, obj, JS_ATOM_Symbol_toStringTag,
                            JS_AtomToString(ctx, JS_ATOM_Module),
                            0);
