@@ -20927,16 +20927,44 @@ static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
     return enum_obj;
 }
 
-/* obj -> enum_obj */
+/* ==========================================================================
+   for-in 循环迭代器实现
+   ========================================================================== */
+
+/**
+ * @brief for-in 循环启动：创建枚举迭代器
+ * 
+ * 栈操作：obj -> enum_obj
+ * 
+ * 将输入对象转换为 for-in 迭代器对象，用于遍历对象的可枚举属性。
+ * 这是 for-in 语句的第一步，创建一个迭代器来跟踪遍历状态。
+ * 
+ * @param ctx 上下文
+ * @param sp 栈指针，sp[-1] 为待枚举的对象
+ * @return 0 成功，-1 异常
+ */
 static __exception int js_for_in_start(JSContext *ctx, JSValue *sp)
 {
+    // 构建 for-in 迭代器对象，替换栈上的原对象
     sp[-1] = build_for_in_iterator(ctx, sp[-1]);
     if (JS_IsException(sp[-1]))
         return -1;
     return 0;
 }
 
-/* return -1 if exception, 0 if slow case, 1 if the enumeration is finished */
+/**
+ * @brief 准备原型链枚举：检查是否需要进入慢速路径
+ * 
+ * for-in 循环需要遍历整个原型链上的可枚举属性。此函数检查原型链中
+ * 是否存在可枚举属性，以决定使用快速路径还是慢速路径。
+ * 
+ * @param ctx 上下文
+ * @param enum_obj 枚举器对象
+ * @return -1 异常，0 需要慢速路径，1 枚举完成（原型链无更多属性）
+ * 
+ * 快速路径：如果原型链上没有可枚举属性，直接返回 1 表示完成
+ * 慢速路径：如果原型链上有属性，需要详细跟踪已访问的属性以避免重复
+ */
 static __exception int js_for_in_prepare_prototype_chain_enum(JSContext *ctx,
                                                               JSValueConst enum_obj)
 {
@@ -20949,14 +20977,16 @@ static __exception int js_for_in_prepare_prototype_chain_enum(JSContext *ctx,
     p = JS_VALUE_GET_OBJ(enum_obj);
     it = p->u.for_in_iterator;
 
-    /* check if there are enumerable properties in the prototype chain (fast path) */
+    /* 快速路径：检查原型链中是否存在可枚举属性 */
     obj1 = JS_DupValue(ctx, it->obj);
     for(;;) {
+        // 沿原型链向上查找
         obj1 = JS_GetPrototypeFree(ctx, obj1);
         if (JS_IsNull(obj1))
-            break;
+            break;  // 到达原型链顶端
         if (JS_IsException(obj1))
             goto fail;
+        // 获取当前原型对象的所有可枚举属性名
         if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count,
                                            JS_VALUE_GET_OBJ(obj1),
                                            JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
@@ -20965,20 +20995,22 @@ static __exception int js_for_in_prepare_prototype_chain_enum(JSContext *ctx,
         }
         JS_FreePropertyEnum(ctx, tab_atom, tab_atom_count);
         if (tab_atom_count != 0) {
+            // 发现可枚举属性，需要进入慢速路径详细处理
             JS_FreeValue(ctx, obj1);
             goto slow_path;
         }
-        /* must check for timeout to avoid infinite loop */
+        /* 必须检查超时以避免无限循环（恶意原型链攻击） */
         if (js_poll_interrupts(ctx)) {
             JS_FreeValue(ctx, obj1);
             goto fail;
         }
     }
     JS_FreeValue(ctx, obj1);
-    return 1;
+    return 1;  // 原型链上无更多可枚举属性
 
  slow_path:
-    /* add the visited properties, even if they are not enumerable */
+    /* 慢速路径：添加已访问的属性，即使它们不可枚举
+       这是为了防止在原型链上重复访问同一属性 */
     if (it->is_array) {
         if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count,
                                            JS_VALUE_GET_OBJ(it->obj),
@@ -20990,6 +21022,7 @@ static __exception int js_for_in_prepare_prototype_chain_enum(JSContext *ctx,
         it->atom_count = tab_atom_count;
     }
 
+    // 将所有属性添加到枚举器中，标记为已访问
     for(i = 0; i < it->atom_count; i++) {
         if (JS_DefinePropertyValue(ctx, enum_obj, it->tab_atom[i].atom, JS_NULL, JS_PROP_ENUMERABLE) < 0)
             goto fail;
@@ -20999,6 +21032,22 @@ static __exception int js_for_in_prepare_prototype_chain_enum(JSContext *ctx,
     return -1;
 }
 
+/**
+ * @brief for-in 循环迭代器：获取下一个属性
+ * 
+ * 栈操作：enum_obj -> enum_obj value done
+ * 
+ * 从迭代器中获取下一个可枚举属性名。这是 for-in 循环的核心逻辑，
+ * 需要处理：
+ * 1. 当前对象的属性遍历
+ * 2. 原型链的遍历
+ * 3. 属性可能被删除的情况
+ * 4. 避免重复访问同一属性
+ * 
+ * @param ctx 上下文
+ * @param sp 栈指针
+ * @return 0 成功，-1 异常
+ */
 /* enum_obj -> enum_obj value done */
 static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
 {
@@ -21011,7 +21060,7 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
     int ret;
 
     enum_obj = sp[-1];
-    /* fail safe */
+    /* 安全检查：确保是有效的对象 */
     if (JS_VALUE_GET_TAG(enum_obj) != JS_TAG_OBJECT)
         goto done;
     p = JS_VALUE_GET_OBJ(enum_obj);
@@ -21020,28 +21069,32 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
     it = p->u.for_in_iterator;
 
     for(;;) {
+        // 检查是否已遍历完当前对象的所有属性
         if (it->idx >= it->atom_count) {
             if (JS_IsNull(it->obj) || JS_IsUndefined(it->obj))
-                goto done; /* not an object */
-            /* no more property in the current object: look in the prototype */
+                goto done; /* 不是对象，结束 */
+            
+            /* 当前对象无更多属性：查找原型链 */
             if (!it->in_prototype_chain) {
                 ret = js_for_in_prepare_prototype_chain_enum(ctx, enum_obj);
                 if (ret < 0)
                     return -1;
                 if (ret)
-                    goto done;
+                    goto done;  // 原型链上无更多属性
                 it->in_prototype_chain = TRUE;
             }
+            // 移动到原型链的下一个对象
             it->obj = JS_GetPrototypeFree(ctx, it->obj);
             if (JS_IsException(it->obj))
                 return -1;
             if (JS_IsNull(it->obj))
-                goto done; /* no more prototype */
+                goto done; /* 原型链结束 */
 
-            /* must check for timeout to avoid infinite loop */
+            /* 必须检查超时以避免无限循环 */
             if (js_poll_interrupts(ctx))
                 return -1;
 
+            // 获取原型对象的属性名列表
             if (JS_GetOwnPropertyNamesInternal(ctx, &tab_atom, &tab_atom_count,
                                                JS_VALUE_GET_OBJ(it->obj),
                                                JS_GPN_STRING_MASK | JS_GPN_SET_ENUM)) {
@@ -21052,7 +21105,9 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
             it->atom_count = tab_atom_count;
             it->idx = 0;
         } else {
+            // 遍历当前对象的属性
             if (it->is_array) {
+                // 快速数组：直接使用数字索引
                 prop = __JS_AtomFromUInt32(it->idx);
                 it->idx++;
             } else {
@@ -21061,47 +21116,63 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
                 is_enumerable = it->tab_atom[it->idx].is_enumerable;
                 it->idx++;
                 if (it->in_prototype_chain) {
-                    /* slow case: we are in the prototype chain */
+                    /* 慢速路径：在原型链中，需要检查属性是否已访问 */
                     ret = JS_GetOwnPropertyInternal(ctx, NULL, JS_VALUE_GET_OBJ(enum_obj), prop);
                     if (ret < 0)
                         return ret;
                     if (ret)
-                        continue; /* already visited */
-                    /* add to the visited property list */
+                        continue; /* 已访问过，跳过 */
+                    /* 添加到已访问属性列表 */
                     if (JS_DefinePropertyValue(ctx, enum_obj, prop, JS_NULL,
                                                JS_PROP_ENUMERABLE) < 0)
                         return -1;
                 }
                 if (!is_enumerable)
-                    continue;
+                    continue;  // 不可枚举，跳过
             }
-            /* check if the property was deleted */
+            /* 检查属性是否在遍历过程中被删除 */
             ret = JS_GetOwnPropertyInternal(ctx, NULL, JS_VALUE_GET_OBJ(it->obj), prop);
             if (ret < 0)
                 return ret;
             if (ret)
-                break;
+                break;  // 属性存在，返回
         }
     }
-    /* return the property */
+    /* 返回属性名 */
     sp[0] = JS_AtomToValue(ctx, prop);
-    sp[1] = JS_FALSE;
+    sp[1] = JS_FALSE;  // done = false
     return 0;
  done:
-    /* return the end */
+    /* 返回结束标记 */
     sp[0] = JS_UNDEFINED;
-    sp[1] = JS_TRUE;
+    sp[1] = JS_TRUE;  // done = true
     return 0;
 }
 
+/* ==========================================================================
+   迭代器协议实现 (Iterator Protocol)
+   ========================================================================== */
+
+/**
+ * @brief 获取迭代器对象（内部版本）
+ * 
+ * 调用对象的 Symbol.iterator 或 Symbol.asyncIterator 方法获取迭代器。
+ * 
+ * @param ctx 上下文
+ * @param obj 待迭代的对象
+ * @param method 迭代器方法（Symbol.iterator 或 Symbol.asyncIterator）
+ * @return 迭代器对象，异常时返回 JS_EXCEPTION
+ */
 static JSValue JS_GetIterator2(JSContext *ctx, JSValueConst obj,
                                JSValueConst method)
 {
     JSValue enum_obj;
 
+    // 调用迭代器方法
     enum_obj = JS_Call(ctx, method, obj, 0, NULL);
     if (JS_IsException(enum_obj))
         return enum_obj;
+    // 确保返回值是对象
     if (!JS_IsObject(enum_obj)) {
         JS_FreeValue(ctx, enum_obj);
         return JS_ThrowTypeErrorNotAnObject(ctx);
@@ -21109,14 +21180,28 @@ static JSValue JS_GetIterator2(JSContext *ctx, JSValueConst obj,
     return enum_obj;
 }
 
+/**
+ * @brief 获取迭代器：支持同步和异步迭代
+ * 
+ * 根据 is_async 参数决定使用 Symbol.iterator 还是 Symbol.asyncIterator。
+ * 对于异步迭代，如果对象没有 Symbol.asyncIterator，会回退到 Symbol.iterator
+ * 并创建异步包装器。
+ * 
+ * @param ctx 上下文
+ * @param obj 待迭代的对象
+ * @param is_async TRUE=异步迭代，FALSE=同步迭代
+ * @return 迭代器对象，异常时返回 JS_EXCEPTION
+ */
 static JSValue JS_GetIterator(JSContext *ctx, JSValueConst obj, BOOL is_async)
 {
     JSValue method, ret, sync_iter;
 
     if (is_async) {
+        // 异步迭代：优先使用 Symbol.asyncIterator
         method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_asyncIterator);
         if (JS_IsException(method))
             return method;
+        // 如果没有异步迭代器，尝试同步迭代器并包装
         if (JS_IsUndefined(method) || JS_IsNull(method)) {
             method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_iterator);
             if (JS_IsException(method))
@@ -21125,15 +21210,18 @@ static JSValue JS_GetIterator(JSContext *ctx, JSValueConst obj, BOOL is_async)
             JS_FreeValue(ctx, method);
             if (JS_IsException(sync_iter))
                 return sync_iter;
+            // 创建异步包装器
             ret = JS_CreateAsyncFromSyncIterator(ctx, sync_iter);
             JS_FreeValue(ctx, sync_iter);
             return ret;
         }
     } else {
+        // 同步迭代：使用 Symbol.iterator
         method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_iterator);
         if (JS_IsException(method))
             return method;
     }
+    // 确保方法是函数
     if (!JS_IsFunction(ctx, method)) {
         JS_FreeValue(ctx, method);
         return JS_ThrowTypeError(ctx, "value is not iterable");
@@ -21143,6 +21231,20 @@ static JSValue JS_GetIterator(JSContext *ctx, JSValueConst obj, BOOL is_async)
     return ret;
 }
 
+/**
+ * @brief 迭代器 next() 调用（内部版本，返回完整结果对象）
+ * 
+ * 调用迭代器的 next() 方法，返回 { value, done } 对象。
+ * 对于内置迭代器有快速路径优化。
+ * 
+ * @param ctx 上下文
+ * @param enum_obj 迭代器对象
+ * @param method next 方法
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @param pdone 输出：done 标志（2=需要解析结果对象）
+ * @return 迭代结果，异常时返回 JS_EXCEPTION
+ */
 /* return *pdone = 2 if the iterator object is not parsed */
 static JSValue JS_IteratorNext2(JSContext *ctx, JSValueConst enum_obj,
                                 JSValueConst method,
@@ -21150,8 +21252,7 @@ static JSValue JS_IteratorNext2(JSContext *ctx, JSValueConst enum_obj,
 {
     JSValue obj;
 
-    /* fast path for the built-in iterators (avoid creating the
-       intermediate result object) */
+    /* 快速路径：内置迭代器直接返回，避免创建中间结果对象 */
     if (JS_IsObject(method)) {
         JSObject *p = JS_VALUE_GET_OBJ(method);
         if (p->class_id == JS_CLASS_C_FUNCTION &&
@@ -21159,31 +21260,48 @@ static JSValue JS_IteratorNext2(JSContext *ctx, JSValueConst enum_obj,
             JSCFunctionType func;
             JSValueConst args[1];
 
-            /* in case the function expects one argument */
+            /* 如果函数需要一个参数，提供 undefined */
             if (argc == 0) {
                 args[0] = JS_UNDEFINED;
                 argv = args;
             }
             func = p->u.cfunc.c_function;
+            // 调用内置的 iterator_next 函数
             return func.iterator_next(ctx, enum_obj, argc, argv,
                                       pdone, p->u.cfunc.magic);
         }
     }
+    // 普通路径：调用 next() 方法
     obj = JS_Call(ctx, method, enum_obj, argc, argv);
     if (JS_IsException(obj))
         goto fail;
+    // 确保返回值是对象
     if (!JS_IsObject(obj)) {
         JS_FreeValue(ctx, obj);
         JS_ThrowTypeError(ctx, "iterator must return an object");
         goto fail;
     }
-    *pdone = 2;
+    *pdone = 2;  // 需要解析结果对象
     return obj;
  fail:
     *pdone = FALSE;
     return JS_EXCEPTION;
 }
 
+/**
+ * @brief 迭代器 next() 调用：解析 { value, done } 结果
+ * 
+ * 调用迭代器的 next() 方法并解析返回值。
+ * 注意：当 *pdone = TRUE 时，总是返回 JS_UNDEFINED。
+ * 
+ * @param ctx 上下文
+ * @param enum_obj 迭代器对象
+ * @param method next 方法
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @param pdone 输出：done 标志
+ * @return value 值，完成或异常时返回 JS_UNDEFINED/JS_EXCEPTION
+ */
 /* Note: always return JS_UNDEFINED when *pdone = TRUE. */
 static JSValue JS_IteratorNext(JSContext *ctx, JSValueConst enum_obj,
                                JSValueConst method,
@@ -21196,19 +21314,23 @@ static JSValue JS_IteratorNext(JSContext *ctx, JSValueConst enum_obj,
     if (JS_IsException(obj))
         goto fail;
     if (likely(done == 0)) {
+        // 快速路径：内置迭代器直接返回结果
         *pdone = FALSE;
         return obj;
     } else if (done != 2) {
+        // 已完成
         JS_FreeValue(ctx, obj);
         *pdone = TRUE;
         return JS_UNDEFINED;
     } else {
+        // 需要解析 { value, done } 对象
         done_val = JS_GetProperty(ctx, obj, JS_ATOM_done);
         if (JS_IsException(done_val))
             goto fail;
         *pdone = JS_ToBoolFree(ctx, done_val);
         value = JS_UNDEFINED;
         if (!*pdone) {
+            // 未完成时获取 value
             value = JS_GetProperty(ctx, obj, JS_ATOM_value);
         }
         JS_FreeValue(ctx, obj);
@@ -21220,6 +21342,17 @@ static JSValue JS_IteratorNext(JSContext *ctx, JSValueConst enum_obj,
     return JS_EXCEPTION;
 }
 
+/**
+ * @brief 关闭迭代器：处理 return() 方法和异常清理
+ * 
+ * 当 for-of 循环提前退出（break/return/异常）时，需要调用迭代器的
+ * return() 方法进行清理。这是迭代器协议的一部分。
+ * 
+ * @param ctx 上下文
+ * @param enum_obj 迭代器对象
+ * @param is_exception_pending 是否有待处理的异常
+ * @return 0 成功，-1 异常
+ */
 /* return < 0 in case of exception */
 static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
                             BOOL is_exception_pending)
@@ -21228,6 +21361,7 @@ static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
     int res;
 
     if (is_exception_pending) {
+        // 保存当前异常，处理 return() 后再重新抛出
         ex_obj = ctx->rt->current_exception;
         ctx->rt->current_exception = JS_UNINITIALIZED;
         res = -1;
@@ -21235,19 +21369,23 @@ static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
         ex_obj = JS_UNDEFINED;
         res = 0;
     }
+    // 获取迭代器的 return 方法
     method = JS_GetProperty(ctx, enum_obj, JS_ATOM_return);
     if (JS_IsException(method)) {
         res = -1;
         goto done;
     }
+    // 如果没有 return 方法，无需清理
     if (JS_IsUndefined(method) || JS_IsNull(method)) {
         goto done;
     }
+    // 调用 return() 方法
     ret = JS_CallFree(ctx, method, enum_obj, 0, NULL);
     if (!is_exception_pending) {
         if (JS_IsException(ret)) {
             res = -1;
         } else if (!JS_IsObject(ret)) {
+            // return() 必须返回对象
             JS_ThrowTypeErrorNotAnObject(ctx);
             res = -1;
         }
@@ -21255,22 +21393,44 @@ static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
     JS_FreeValue(ctx, ret);
  done:
     if (is_exception_pending) {
+        // 重新抛出原始异常
         JS_Throw(ctx, ex_obj);
     }
     return res;
 }
 
+/* ==========================================================================
+   for-of 循环实现
+   ========================================================================== */
+
+/**
+ * @brief for-of 循环启动：创建迭代器记录
+ * 
+ * 栈操作：obj -> enum_rec (3 个槽位)
+ * 
+ * 为 for-of 循环准备迭代器，包括：
+ * 1. 获取对象的迭代器
+ * 2. 获取 next 方法
+ * 3. 设置循环状态
+ * 
+ * @param ctx 上下文
+ * @param sp 栈指针
+ * @param is_async 是否为 for-await-of 循环
+ * @return 0 成功，-1 异常
+ */
 /* obj -> enum_rec (3 slots) */
 static __exception int js_for_of_start(JSContext *ctx, JSValue *sp,
                                        BOOL is_async)
 {
     JSValue op1, obj, method;
     op1 = sp[-1];
+    // 获取迭代器
     obj = JS_GetIterator(ctx, op1, is_async);
     if (JS_IsException(obj))
         return -1;
     JS_FreeValue(ctx, op1);
     sp[-1] = obj;
+    // 获取 next 方法
     method = JS_GetProperty(ctx, obj, JS_ATOM_next);
     if (JS_IsException(method))
         return -1;
@@ -21278,6 +21438,19 @@ static __exception int js_for_of_start(JSContext *ctx, JSValue *sp,
     return 0;
 }
 
+/**
+ * @brief for-of 循环迭代：获取下一个值
+ * 
+ * 栈操作：enum_rec [objs] -> enum_rec [objs] value done
+ * 
+ * 调用迭代器的 next() 方法获取下一个值。
+ * 如果 done=true 或异常，将 enum_rec 设为 undefined。
+ * 
+ * @param ctx 上下文
+ * @param sp 栈指针
+ * @param offset 栈上对象的数量
+ * @return 0 成功，-1 异常
+ */
 /* enum_rec [objs] -> enum_rec [objs] value done. There are 'offset'
    objs. If 'done' is true or in case of exception, 'enum_rec' is set
    to undefined. If 'done' is true, 'value' is always set to
@@ -21288,12 +21461,12 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
     int done = 1;
 
     if (likely(!JS_IsUndefined(sp[offset]))) {
+        // 调用迭代器的 next() 方法
         value = JS_IteratorNext(ctx, sp[offset], sp[offset + 1], 0, NULL, &done);
         if (JS_IsException(value))
             done = -1;
         if (done) {
-            /* value is JS_UNDEFINED or JS_EXCEPTION */
-            /* replace the iteration object with undefined */
+            /* 迭代完成或异常：清理迭代器对象 */
             JS_FreeValue(ctx, sp[offset]);
             sp[offset] = JS_UNDEFINED;
             if (done < 0) {
@@ -21309,14 +21482,23 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
     return 0;
 }
 
+/**
+ * @brief for-await-of 循环迭代：处理异步迭代
+ * 
+ * 处理异步迭代器的 next() 调用，返回 Promise 对象。
+ * 
+ * @param ctx 上下文
+ * @param sp 栈指针
+ * @return 0 成功，-1 异常
+ */
 static __exception int js_for_await_of_next(JSContext *ctx, JSValue *sp)
 {
     JSValue obj, iter, next;
 
-    sp[-1] = JS_UNDEFINED; /* disable the catch offset so that
-                              exceptions do not close the iterator */
+    sp[-1] = JS_UNDEFINED; /* 禁用 catch 偏移，使异常不会关闭迭代器 */
     iter = sp[-3];
     next = sp[-2];
+    // 调用 next() 方法，返回 Promise
     obj = JS_Call(ctx, next, iter, 0, NULL);
     if (JS_IsException(obj))
         return -1;
@@ -21324,6 +21506,16 @@ static __exception int js_for_await_of_next(JSContext *ctx, JSValue *sp)
     return 0;
 }
 
+/**
+ * @brief 从迭代器结果对象中提取 value 和 done
+ * 
+ * 解析 { value, done } 对象，返回 value 并通过 pdone 输出 done 标志。
+ * 
+ * @param ctx 上下文
+ * @param obj 迭代器结果对象
+ * @param pdone 输出：done 标志
+ * @return value 值，异常时返回 JS_EXCEPTION
+ */
 static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValueConst obj,
                                            BOOL *pdone)
 {
@@ -21343,6 +21535,18 @@ static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValueConst obj,
     return JS_EXCEPTION;
 }
 
+/**
+ * @brief 获取迭代器的 value/done：用于字节码操作
+ * 
+ * 栈操作：obj -> value done
+ * 
+ * 从迭代器结果对象中提取 value 和 done，并重新设置 catch 偏移
+ * 以便异常时能正确关闭迭代器。
+ * 
+ * @param ctx 上下文
+ * @param sp 栈指针
+ * @return 0 成功，-1 异常
+ */
 static __exception int js_iterator_get_value_done(JSContext *ctx, JSValue *sp)
 {
     JSValue obj, value;
@@ -21356,14 +21560,23 @@ static __exception int js_iterator_get_value_done(JSContext *ctx, JSValue *sp)
     if (JS_IsException(value))
         return -1;
     JS_FreeValue(ctx, obj);
-    /* put again the catch offset so that exceptions close the
-       iterator */
+    /* 重新设置 catch 偏移，使异常时能关闭迭代器 */
     sp[-2] = JS_NewCatchOffset(ctx, 0); 
     sp[-1] = value;
     sp[0] = JS_NewBool(ctx, done);
     return 0;
 }
 
+/**
+ * @brief 创建迭代器结果对象：{ value, done }
+ * 
+ * 创建标准的迭代器结果对象，用于手动实现迭代器协议。
+ * 
+ * @param ctx 上下文
+ * @param val value 值
+ * @param done done 标志
+ * @return 结果对象，异常时返回 JS_EXCEPTION
+ */
 static JSValue js_create_iterator_result(JSContext *ctx,
                                          JSValue val,
                                          BOOL done)
