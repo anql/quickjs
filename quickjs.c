@@ -23600,6 +23600,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_get_arg):
+            /* 获取函数参数：从参数缓冲区读取第 idx 个参数并压栈
+             * 栈操作：→ arg[idx]
+             * 参数索引由操作码后 2 字节指定
+             * JS_DupValue 增加引用计数 */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23609,6 +23613,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_put_arg):
+            /* 设置函数参数：将栈顶值写入参数缓冲区第 idx 个位置
+             * 栈操作：value → (empty)
+             * 用于函数调用时传递实参
+             * set_value 会减少旧值引用计数，增加新值引用计数 */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23618,6 +23626,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_set_arg):
+            /* 复制设置函数参数：将栈顶值复制后写入参数缓冲区
+             * 栈操作：value → value (保留栈顶值)
+             * 与 put_arg 区别：不弹出栈顶值，而是复制一份
+             * 用于需要保留原值的场景 */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23627,42 +23639,64 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
 #if SHORT_OPCODES
-        CASE(OP_get_loc8): *sp++ = JS_DupValue(ctx, var_buf[*pc++]); BREAK;
-        CASE(OP_put_loc8): set_value(ctx, &var_buf[*pc++], *--sp); BREAK;
-        CASE(OP_set_loc8): set_value(ctx, &var_buf[*pc++], JS_DupValue(ctx, sp[-1])); BREAK;
+        /* 短操作码优化：针对常用索引 (0-3) 和 8 位索引的单字节操作码
+         * 减少字节码大小，提高解释器 fetch-decode-execute 效率
+         * 以下操作码均为 1 字节，无需额外的索引参数 */
+        
+        /* 8 位索引的局部变量操作 (索引紧跟操作码后 1 字节) */
+        CASE(OP_get_loc8): *sp++ = JS_DupValue(ctx, var_buf[*pc++]); BREAK;  /* 读取局部变量 [idx8] */
+        CASE(OP_put_loc8): set_value(ctx, &var_buf[*pc++], *--sp); BREAK;    /* 写入局部变量 [idx8]，弹出栈顶 */
+        CASE(OP_set_loc8): set_value(ctx, &var_buf[*pc++], JS_DupValue(ctx, sp[-1])); BREAK;  /* 复制写入局部变量 [idx8] */
 
+        /* 固定索引 0-3 的局部变量读取 (最常用变量，无需索引字节) */
         CASE(OP_get_loc0): *sp++ = JS_DupValue(ctx, var_buf[0]); BREAK;
         CASE(OP_get_loc1): *sp++ = JS_DupValue(ctx, var_buf[1]); BREAK;
         CASE(OP_get_loc2): *sp++ = JS_DupValue(ctx, var_buf[2]); BREAK;
         CASE(OP_get_loc3): *sp++ = JS_DupValue(ctx, var_buf[3]); BREAK;
+        
+        /* 固定索引 0-3 的局部变量写入 */
         CASE(OP_put_loc0): set_value(ctx, &var_buf[0], *--sp); BREAK;
         CASE(OP_put_loc1): set_value(ctx, &var_buf[1], *--sp); BREAK;
         CASE(OP_put_loc2): set_value(ctx, &var_buf[2], *--sp); BREAK;
         CASE(OP_put_loc3): set_value(ctx, &var_buf[3], *--sp); BREAK;
+        
+        /* 固定索引 0-3 的局部变量复制写入 */
         CASE(OP_set_loc0): set_value(ctx, &var_buf[0], JS_DupValue(ctx, sp[-1])); BREAK;
         CASE(OP_set_loc1): set_value(ctx, &var_buf[1], JS_DupValue(ctx, sp[-1])); BREAK;
         CASE(OP_set_loc2): set_value(ctx, &var_buf[2], JS_DupValue(ctx, sp[-1])); BREAK;
         CASE(OP_set_loc3): set_value(ctx, &var_buf[3], JS_DupValue(ctx, sp[-1])); BREAK;
+        
+        /* 固定索引 0-3 的参数读取 */
         CASE(OP_get_arg0): *sp++ = JS_DupValue(ctx, arg_buf[0]); BREAK;
         CASE(OP_get_arg1): *sp++ = JS_DupValue(ctx, arg_buf[1]); BREAK;
         CASE(OP_get_arg2): *sp++ = JS_DupValue(ctx, arg_buf[2]); BREAK;
         CASE(OP_get_arg3): *sp++ = JS_DupValue(ctx, arg_buf[3]); BREAK;
+        
+        /* 固定索引 0-3 的参数写入 */
         CASE(OP_put_arg0): set_value(ctx, &arg_buf[0], *--sp); BREAK;
         CASE(OP_put_arg1): set_value(ctx, &arg_buf[1], *--sp); BREAK;
         CASE(OP_put_arg2): set_value(ctx, &arg_buf[2], *--sp); BREAK;
         CASE(OP_put_arg3): set_value(ctx, &arg_buf[3], *--sp); BREAK;
+        
+        /* 固定索引 0-3 的参数复制写入 */
         CASE(OP_set_arg0): set_value(ctx, &arg_buf[0], JS_DupValue(ctx, sp[-1])); BREAK;
-        CASE(OP_set_arg1): set_value(ctx, &arg_buf[1], JS_DupValue(ctx, sp[-1])); BREAK;
+        CASE(OP_set_arg1): set_value(ctx, &var_buf[1], JS_DupValue(ctx, sp[-1])); BREAK;
         CASE(OP_set_arg2): set_value(ctx, &arg_buf[2], JS_DupValue(ctx, sp[-1])); BREAK;
         CASE(OP_set_arg3): set_value(ctx, &arg_buf[3], JS_DupValue(ctx, sp[-1])); BREAK;
+        
+        /* 固定索引 0-3 的变量引用读取 (var_refs 数组) */
         CASE(OP_get_var_ref0): *sp++ = JS_DupValue(ctx, *var_refs[0]->pvalue); BREAK;
         CASE(OP_get_var_ref1): *sp++ = JS_DupValue(ctx, *var_refs[1]->pvalue); BREAK;
         CASE(OP_get_var_ref2): *sp++ = JS_DupValue(ctx, *var_refs[2]->pvalue); BREAK;
         CASE(OP_get_var_ref3): *sp++ = JS_DupValue(ctx, *var_refs[3]->pvalue); BREAK;
+        
+        /* 固定索引 0-3 的变量引用写入 */
         CASE(OP_put_var_ref0): set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
         CASE(OP_put_var_ref1): set_value(ctx, var_refs[1]->pvalue, *--sp); BREAK;
         CASE(OP_put_var_ref2): set_value(ctx, var_refs[2]->pvalue, *--sp); BREAK;
         CASE(OP_put_var_ref3): set_value(ctx, var_refs[3]->pvalue, *--sp); BREAK;
+        
+        /* 固定索引 0-3 的变量引用复制写入 */
         CASE(OP_set_var_ref0): set_value(ctx, var_refs[0]->pvalue, JS_DupValue(ctx, sp[-1])); BREAK;
         CASE(OP_set_var_ref1): set_value(ctx, var_refs[1]->pvalue, JS_DupValue(ctx, sp[-1])); BREAK;
         CASE(OP_set_var_ref2): set_value(ctx, var_refs[2]->pvalue, JS_DupValue(ctx, sp[-1])); BREAK;
@@ -23670,6 +23704,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #endif
 
         CASE(OP_get_var_ref):
+            /* 获取变量引用值：从 var_refs 数组读取第 idx 个变量的值并压栈
+             * 栈操作：→ value
+             * var_refs 存储闭包变量的引用，支持跨作用域访问
+             * 索引由操作码后 2 字节指定 */
             {
                 int idx;
                 JSValue val;
@@ -23681,6 +23719,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_put_var_ref):
+            /* 设置变量引用值：将栈顶值写入 var_refs 第 idx 个变量
+             * 栈操作：value → (empty)
+             * 用于闭包环境下的变量赋值
+             * 弹出栈顶值，减少旧值引用计数 */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23690,6 +23732,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_set_var_ref):
+            /* 复制设置变量引用值：将栈顶值复制后写入 var_refs 第 idx 个变量
+             * 栈操作：value → value (保留栈顶)
+             * 与 put_var_ref 区别：不弹出栈顶，用于需要保留值的场景 */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23698,6 +23743,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_get_var_ref_check):
+            /* 获取变量引用值 (带初始化检查)：读取前检查变量是否已初始化
+             * 栈操作：→ value
+             * 如果变量未初始化 (TDZ .temporal dead zone)，抛出 ReferenceError
+             * 用于 let/const 声明的变量访问检查
+             * 参数：idx (2 字节), is_var_ref=TRUE */
             {
                 int idx;
                 JSValue val;
@@ -23713,6 +23763,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_put_var_ref_check):
+            /* 设置变量引用值 (带初始化检查)：写入前检查变量是否已初始化
+             * 栈操作：value → (empty)
+             * 如果变量未初始化，抛出 ReferenceError
+             * 用于已声明变量的赋值操作 (不允许重复初始化) */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23726,6 +23780,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_put_var_ref_check_init):
+            /* 设置变量引用值 (仅允许初始化)：仅当变量未初始化时才允许写入
+             * 栈操作：value → (empty)
+             * 如果变量已初始化，抛出 ReferenceError (防止重复初始化)
+             * 用于 let/const 声明时的初始赋值，确保只赋值一次 */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23739,6 +23797,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_set_loc_uninitialized):
+            /* 设置局部变量为未初始化状态：用于 let/const 声明时的 TDZ 标记
+             * 栈操作：(无)
+             * 将变量设置为 JS_UNINITIALIZED，访问时会抛出 ReferenceError
+             * 实现 Temporal Dead Zone (TDZ) 语义 */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23747,6 +23809,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_get_loc_check):
+            /* 获取局部变量 (带初始化检查)：读取前检查是否已初始化
+             * 栈操作：→ value
+             * 如果变量在 TDZ 中 (未初始化)，抛出 ReferenceError
+             * 参数：is_var_ref=FALSE 表示局部变量而非闭包变量 */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23760,6 +23826,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_get_loc_checkthis):
+            /* 获取 this 绑定 (带初始化检查)：专门用于 this 变量的读取
+             * 栈操作：→ this_value
+             * 如果 this 未初始化，抛出 ReferenceError
+             * 使用 caller_ctx 报错，因为 this 通常在调用者上下文中初始化 */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23773,6 +23843,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_put_loc_check):
+            /* 设置局部变量 (带初始化检查)：写入前检查是否已初始化
+             * 栈操作：value → (empty)
+             * 如果变量在 TDZ 中，抛出 ReferenceError
+             * 用于已声明变量的后续赋值 */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23786,6 +23860,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_set_loc_check):
+            /* 复制设置局部变量 (带初始化检查)：与 put_loc_check 类似但不弹出栈顶
+             * 栈操作：value → value
+             * 用于需要保留栈顶值的场景 */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23798,6 +23875,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_put_loc_check_init):
+            /* 设置局部变量 (仅允许初始化)：专门用于 this 的初始化
+             * 栈操作：value → (empty)
+             * 仅当变量未初始化时才允许写入，防止重复初始化
+             * 错误消息明确指出 "'this' can be initialized only once" */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23811,6 +23892,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_close_loc):
+            /* 关闭局部变量：将局部变量提升为闭包变量
+             * 栈操作：(无)
+             * 当函数返回但内部闭包仍引用该变量时调用
+             * close_lexical_var 将变量从栈帧移动到堆上闭包环境 */
             {
                 int idx;
                 idx = get_u16(pc);
@@ -23822,6 +23907,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_make_loc_ref):
         CASE(OP_make_arg_ref):
         CASE(OP_make_var_ref_ref):
+            /* 创建变量引用对象：用于解构赋值等需要引用语义的场景
+             * 栈操作：→ ref_object atom
+             * 创建一个空对象，添加一个特殊属性，该属性指向变量引用 (JSVarRef)
+             * 解构赋值时通过这个引用对象间接修改变量
+             * 
+             * 三种操作码区别：
+             * - OP_make_loc_ref: 引用局部变量
+             * - OP_make_arg_ref: 引用函数参数
+             * - OP_make_var_ref_ref: 引用闭包变量 (var_refs 数组)
+             * 
+             * 参数：atom (4 字节属性名), idx (2 字节变量索引)
+             * 返回：ref_object (带 var_ref 属性的对象), atom (属性名) */
             {
                 JSVarRef *var_ref;
                 JSProperty *pr;
@@ -23852,6 +23949,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_make_var_ref):
+            /* 创建全局变量引用：获取全局对象的属性引用
+             * 栈操作：→ global_obj property_name
+             * 用于全局变量的解构赋值
+             * JS_GetGlobalVarRef 返回全局对象和属性名 */
             {
                 JSAtom atom;
                 atom = get_u32(pc);
@@ -23865,11 +23966,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_goto):
+            /* 无条件跳转：pc += offset (32 位有符号偏移)
+             * 用于实现 break/continue/无条件分支
+             * 每 4096 字节检查中断信号 (信号、异步回调等) */
             pc += (int32_t)get_u32(pc);
             if (unlikely(js_poll_interrupts(ctx)))
                 goto exception;
             BREAK;
 #if SHORT_OPCODES
+        /* 短跳转指令：16 位和 8 位偏移，减少字节码大小 */
         CASE(OP_goto16):
             pc += (int16_t)get_u16(pc);
             if (unlikely(js_poll_interrupts(ctx)))
@@ -23882,6 +23987,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 #endif
         CASE(OP_if_true):
+            /* 条件跳转 (真则跳)：如果栈顶值为真，则跳转
+             * 栈操作：value → (empty)
+             * 快速路径：int/bool/null/undefined 直接转 int 判断
+             * 慢速路径：调用 JS_ToBoolFree 处理对象/字符串等
+             * 参数：4 字节偏移量 (条件成立时跳转) */
             {
                 int res;
                 JSValue op1;
@@ -23902,6 +24012,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_if_false):
+            /* 条件跳转 (假则跳)：如果栈顶值为假，则跳转
+             * 栈操作：value → (empty)
+             * 用于 if 语句的条件分支
+             * 快速路径优化：tag <= JS_TAG_UNDEFINED 时直接取 int 值判断
+             * 慢速路径：调用 JS_ToBoolFree 处理其他类型 */
             {
                 int res;
                 JSValue op1;
@@ -23923,6 +24038,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 #if SHORT_OPCODES
+        /* 8 位条件跳转：单字节偏移，用于短距离分支 */
         CASE(OP_if_true8):
             {
                 int res;
@@ -23965,6 +24081,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 #endif
         CASE(OP_catch):
+            /* catch 块入口：创建 catch offset 并压栈
+             * 栈操作：→ catch_offset
+             * 用于异常处理：当异常发生时，栈 unwinding 会查找 catch offset
+             * 参数：diff (4 字节) - 到 catch 块结束位置的偏移
+             * catch offset 是一个特殊标记值，用于标识异常处理边界 */
             {
                 int32_t diff;
                 diff = get_u32(pc);
@@ -23974,6 +24095,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_gosub):
+            /* 子程序调用：跳转到子程序并保存返回地址
+             * 栈操作：→ return_address
+             * 返回地址 = 当前 pc + 4 (下一条指令位置)
+             * 用于实现代码复用，配合 ret 指令返回
+             * 注意：这里用 int tag 保存返回地址，注释提示可能存在安全隐患 */
             {
                 int32_t diff;
                 diff = get_u32(pc);
@@ -23985,7 +24111,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_ret):
             /* 子程序返回指令：从子程序调用返回到调用点
-             * 栈操作：pop return_address → pc = return_address
+             * 栈操作：return_address → (empty)
+             * 弹出栈顶的返回地址，设置 pc 为该地址
              * 用于实现 gosub/ret 子程序机制 */
             {
                 JSValue op1;
@@ -24007,7 +24134,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_for_in_start):
             /* for-in 循环初始化：枚举对象的可枚举属性
              * 栈操作：obj → obj enumerator
-             * 调用 js_for_in_start 创建枚举器对象 */
+             * 调用 js_for_in_start 创建枚举器对象
+             * for-in 遍历对象自身和原型链上的可枚举属性 (不含 Symbol) */
             sf->cur_pc = pc;
             if (js_for_in_start(ctx, sp))
                 goto exception;
@@ -24015,7 +24143,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_for_in_next):
             /* for-in 循环迭代：获取下一个属性名
              * 栈操作：obj enumerator → obj enumerator key done
-             * 返回属性名和完成标志，sp += 2 表示压入两个值 */
+             * 返回：key (属性名), done (是否完成)
+             * sp += 2 表示压入两个值
+             * 当 done=true 时循环结束 */
             sf->cur_pc = pc;
             if (js_for_in_next(ctx, sp))
                 goto exception;
@@ -24024,8 +24154,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_for_of_start):
             /* for-of 循环初始化：获取迭代器
              * 栈操作：iterable → iterable iterator
-             * 调用 js_for_of_start 获取迭代器的 next 方法
-             * 压入 catch offset 用于异常处理（迭代器关闭）*/
+             * 调用 js_for_of_start 获取可迭代对象的迭代器
+             * 参数 FALSE 表示同步迭代器
+             * 压入 catch offset (0) 用于异常处理时关闭迭代器 */
             sf->cur_pc = pc;
             if (js_for_of_start(ctx, sp, FALSE))
                 goto exception;
@@ -24035,7 +24166,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_for_of_next):
             /* for-of 循环迭代：调用 iterator.next()
              * 栈操作：iterable iterator catch_offset → iterable iterator catch_offset value done
-             * offset 参数用于异常时跳转到 catch 块 */
+             * 参数 offset：异常时跳转到 catch 块的偏移量 (-3 - pc[0])
+             * 返回：value (迭代值), done (是否完成)
+             * 符合迭代器协议：{value, done} */
             {
                 int offset = -3 - pc[0];
                 pc += 1;
@@ -24046,9 +24179,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_for_await_of_next):
-            /* for-await-of 循环迭代：异步迭代器的 next 调用
+            /* for-await-of 循环迭代：异步迭代器的 next() 调用
              * 用于 async/await 场景，返回 Promise
-             * 栈操作：类似 for_of_next，但处理异步结果 */
+             * 栈操作：iterable iterator catch_offset → iterable iterator catch_offset promise
+             * 异步迭代器的 next() 返回 Promise<{value, done}> */
             sf->cur_pc = pc;
             if (js_for_await_of_next(ctx, sp))
                 goto exception;
@@ -24056,8 +24190,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_for_await_of_start):
             /* for-await-of 循环初始化：异步迭代器设置
-             * 与 for_of_start 类似，但标记为异步模式 (TRUE)
-             * 用于处理 async iterable 对象 */
+             * 与 for_of_start 类似，但参数 TRUE 表示异步迭代器
+             * 用于处理 async iterable 对象 (async generator 等)
+             * 异步迭代器必须实现 [Symbol.asyncIterator]() */
             sf->cur_pc = pc;
             if (js_for_of_start(ctx, sp, TRUE))
                 goto exception;
@@ -24067,7 +24202,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_iterator_get_value_done):
             /* 从迭代器结果对象提取 {value, done} 属性
              * 栈操作：result_obj → value done
-             * 调用 js_iterator_get_value_done 解构迭代器返回值 */
+             * 调用 js_iterator_get_value_done 解构迭代器返回值
+             * 符合迭代器协议：next() 返回 {value, done} 对象 */
             sf->cur_pc = pc;
             if (js_iterator_get_value_done(ctx, sp))
                 goto exception;
@@ -24076,7 +24212,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_iterator_check_object):
             /* 验证迭代器返回值必须是对象类型
              * 符合 ECMAScript 规范：IteratorResult 必须是对象
-             * 如果非对象则抛出 TypeError */
+             * 如果非对象则抛出 TypeError
+             * 用于确保迭代器实现符合规范 */
             if (unlikely(!JS_IsObject(sp[-1]))) {
                 JS_ThrowTypeError(ctx, "iterator must return an object");
                 goto exception;
@@ -24089,7 +24226,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              * 1. 丢弃 catch offset（避免被异常捕获）
              * 2. 释放 next 方法引用
              * 3. 如果 iter_obj 非 undefined，调用 JS_IteratorClose 关闭迭代器
-             * 用于 for-of 循环的 break/continue/异常退出场景 */
+             * 用于 for-of 循环的 break/continue/异常退出场景
+             * 确保迭代器资源正确释放 (如文件句柄、网络连接等) */
             sp--; /* drop the catch offset to avoid getting caught by exception */
             JS_FreeValue(ctx, sp[-1]); /* drop the next method */
             sp--;
@@ -24105,7 +24243,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* 清理 catch 块栈帧：移除 catch_offset 及其下方的所有值，保留返回值
              * 栈操作：catch_offset ... values ret_val → ret_val
              * 用于异常处理后清理栈帧，只保留最终返回值
-             * 循环释放 catch_offset 上方的所有值，直到找到 catch 标记 */
+             * 循环释放 catch_offset 上方的所有值，直到找到 catch 标记
+             * "nip" 意为"剪掉"，即剪掉 catch offset 上方的所有栈值 */
             {
                 JSValue ret_val;
                 /* catch_offset ... ret_val -> ret_eval */
@@ -24127,7 +24266,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             /* 调用迭代器的 next 方法：iterator.next(value)
              * 栈操作：iter_obj next catch_offset val → iter_obj next catch_offset result
              * sp[-3] = next 方法，sp[-4] = iter_obj，sp[-1] = 传递给 next 的值
-             * 用于 for-of 循环中获取下一个迭代值 */
+             * 用于 for-of 循环中获取下一个迭代值
+             * JS_Call 调用 next 方法，传入 val 作为参数 */
             {
                 JSValue ret;
                 sf->cur_pc = pc;
@@ -24143,10 +24283,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_iterator_call):
             /* 调用迭代器的 return/throw 方法：用于迭代器关闭或异常传播
              * 栈操作：iter_obj next catch_offset val → iter_obj next catch_offset result method_not_found_flag
-             * flags 参数：
+             * flags 参数 (1 字节)：
              *   bit 0: 0=调用 return 方法，1=调用 throw 方法
              *   bit 1: 0=带参数调用，1=无参数调用
-             * 如果方法不存在 (undefined/null)，返回 TRUE 标志表示使用默认行为 */
+             * 如果方法不存在 (undefined/null)，返回 TRUE 标志表示使用默认行为
+             * 用于 for-of 循环异常退出时清理迭代器 */
             {
                 JSValue method, ret;
                 BOOL ret_flag;
@@ -24180,6 +24321,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_lnot):
+            /* 逻辑非运算：!value
+             * 栈操作：value → boolean
+             * 快速路径：int/bool/null/undefined 直接取 int 值判断非零
+             * 慢速路径：调用 JS_ToBoolFree 处理对象/字符串等
+             * 返回：!ToBoolean(value) */
             {
                 int res;
                 JSValue op1;
@@ -24194,6 +24340,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+/* GET_FIELD_INLINE 宏：内联字段访问优化
+ * 参数：
+ *   name: 操作名前缀 (用于慢速路径标签)
+ *   keep: 是否保留原对象 (1=保留，0=替换)
+ *   is_length: 是否为 .length 访问 (1=使用预定义 atom，0=从字节码读取)
+ * 
+ * 功能：访问对象的属性值 obj.prop
+ * 快速路径：
+ *   1. 检查对象是否为 JS_TAG_OBJECT
+ *   2. 在对象自身属性中查找 (find_own_property)
+ *   3. 如果属性是普通值属性 (非 getter/setter/virtual)，直接返回
+ *   4. 沿原型链查找 (p->shape->proto)
+ * 慢速路径：
+ *   - 代理对象 (is_exotic)
+ *   - getter/setter 属性 (JS_PROP_TMASK)
+ *   - 非对象类型
+ *   调用 JS_GetPropertyInternal 处理
+ * 
+ * 栈操作：
+ *   keep=0: obj → value (替换)
+ *   keep=1: obj → obj value (保留对象，额外压入值)
+ */
 #define GET_FIELD_INLINE(name, keep, is_length)                         \
             {                                                           \
                 JSValue val, obj;                                       \
@@ -24251,20 +24419,49 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
             
         CASE(OP_get_field):
+            /* 获取对象字段：obj.prop → value
+             * 栈操作：obj → value (替换)
+             * 参数：4 字节 atom (属性名)
+             * keep=0, is_length=0 */
             GET_FIELD_INLINE(get_field, 0, 0);
             BREAK;
 
         CASE(OP_get_field2):
+            /* 获取对象字段 (保留对象)：obj → obj value
+             * 栈操作：obj → obj value (保留对象，额外压入值)
+             * 用于链式调用或需要保留对象的场景
+             * keep=1, is_length=0 */
             GET_FIELD_INLINE(get_field2, 1, 0);
             BREAK;
 
 #if SHORT_OPCODES
         CASE(OP_get_length):
+            /* 获取 .length 属性：obj.length
+             * 栈操作：obj → value
+             * 优化：使用预定义 JS_ATOM_length，无需从字节码读取 atom
+             * is_length=1 */
             GET_FIELD_INLINE(get_length, 0, 1);
             BREAK;
 #endif
             
         CASE(OP_put_field):
+            /* 设置对象字段：obj.prop = value
+             * 栈操作：obj value → (empty)
+             * 参数：4 字节 atom (属性名)
+             * 
+             * 快速路径：
+             *   1. 对象是 JS_TAG_OBJECT
+             *   2. 属性存在于对象自身 (非原型链)
+             *   3. 属性是普通可写属性 (非 getter/setter/virtual/length)
+             *   直接设置 pr->u.value
+             * 
+             * 慢速路径：
+             *   - 属性不存在 (需要创建)
+             *   - 属性是 getter/setter
+             *   - 非对象类型
+             *   调用 JS_SetPropertyInternal 处理
+             * 
+             * JS_PROP_THROW_STRICT: 严格模式下抛出错误 */
             {
                 int ret;
                 JSValue obj;
@@ -24306,6 +24503,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_private_symbol):
+            /* 创建私有符号：#name
+             * 栈操作：→ PrivateSymbol(name)
+             * 参数：4 字节 atom (属性名)
+             * 用于 ES2022 私有类字段语法
+             * JS_ATOM_TYPE_PRIVATE 标记为私有符号类型 */
             {
                 JSAtom atom;
                 JSValue val;
@@ -24320,6 +24522,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_get_private_field):
+            /* 获取私有字段值：obj.#private
+             * 栈操作：obj private_symbol → value
+             * 私有字段存储在对象的内部槽中，外部不可访问
+             * JS_GetPrivateField 执行访问检查并返回值 */
             {
                 JSValue val;
 
@@ -24334,6 +24540,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_put_private_field):
+            /* 设置私有字段值：obj.#private = value
+             * 栈操作：obj value private_symbol → (empty)
+             * JS_SetPrivateField 将值存储到对象的私有字段槽
+             * 参数顺序：obj=sp[-3], value=sp[-2], symbol=sp[-1] */
             {
                 int ret;
                 ret = JS_SetPrivateField(ctx, sp[-3], sp[-1], sp[-2]);
@@ -24346,6 +24556,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_define_private_field):
+            /* 定义私有字段：在类构造函数中初始化 #private
+             * 栈操作：obj value → obj
+             * 用于类字段初始化语法：class A { #x = 1 }
+             * JS_DefinePrivateField 创建新的私有字段槽 */
             {
                 int ret;
                 ret = JS_DefinePrivateField(ctx, sp[-3], sp[-2], sp[-1]);
@@ -24357,6 +24571,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_define_field):
+            /* 定义对象字段：Object.defineProperty(obj, atom, {value, writable:true, enumerable:true, configurable:true})
+             * 栈操作：obj value → obj
+             * 参数：4 字节 atom (属性名)
+             * JS_PROP_C_W_E = configurable + writable + enumerable
+             * 用于类字段定义和方法定义 */
             {
                 int ret;
                 JSAtom atom;
@@ -24372,6 +24591,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_set_name):
+            /* 设置对象名称：为函数/类对象设置 name 属性
+             * 栈操作：func → func
+             * 参数：4 字节 atom (名称)
+             * 用于函数表达式/类表达式的 name 属性绑定
+             * 例如：const f = function myName() {} 中 f.name = "myName" */
             {
                 int ret;
                 JSAtom atom;
@@ -24384,6 +24608,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_set_name_computed):
+            /* 设置对象名称 (计算属性名)：与 set_name 类似但属性名在栈上
+             * 栈操作：func name → func
+             * 用于计算属性名的场景：const f = function [expr]() {} */
             {
                 int ret;
                 ret = JS_DefineObjectNameComputed(ctx, sp[-1], sp[-2], JS_PROP_CONFIGURABLE);
@@ -24392,6 +24619,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_set_proto):
+            /* 设置对象原型：obj.__proto__ = proto
+             * 栈操作：obj proto → obj
+             * 参数：proto 必须是对象或 null
+             * JS_SetPrototypeInternal 设置对象的 [[Prototype]] 内部槽
+             * 用于类继承链的建立 */
             {
                 JSValue proto;
                 sf->cur_pc = pc;
@@ -24405,10 +24637,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_set_home_object):
+            /* 设置方法的 home object：用于 super 关键字解析
+             * 栈操作：method obj → (empty)
+             * home object 是方法定义时所在的对象字面量/类
+             * super 调用时需要通过 home object 查找原型链
+             * js_method_set_home_object 将 home object 存储在方法的内部槽 */
             js_method_set_home_object(ctx, sp[-1], sp[-2]);
             BREAK;
         CASE(OP_define_method):
         CASE(OP_define_method_computed):
+            /* 定义对象方法：obj.method = function() {} 或 obj[expr] = function() {}
+             * 栈操作：obj method_func → obj (或 obj name method_func → obj)
+             * 
+             * op_flags (1 字节) 编码：
+             *   bits 0-1: 方法类型
+             *     0 = 普通方法 (METHOD)
+             *     1 = getter (GETTER)
+             *     2 = setter (SETTER)
+             *   bit 2: 是否可枚举 (ENUMERABLE)
+             * 
+             * 两种操作码：
+             *   OP_define_method: 属性名来自字节码 (atom)
+             *   OP_define_method_computed: 属性名来自栈顶值 (计算属性名)
+             * 
+             * 用于对象字面量方法定义、类方法定义、getter/setter 定义 */
             {
                 JSValue getter, setter, value;
                 JSValueConst obj;
@@ -24469,6 +24721,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_define_class):
         CASE(OP_define_class_computed):
+            /* 定义类：class Name extends Parent { ... }
+             * 栈操作：parent_ctor methods → class_ctor (或 parent_ctor name methods → class_ctor)
+             * 
+             * 参数 (5 字节)：
+             *   atom (4 字节): 类名
+             *   class_flags (1 字节): 类标志位
+             * 
+             * 两种操作码：
+             *   OP_define_class: 类名来自字节码
+             *   OP_define_class_computed: 类名来自栈顶值 (计算类名)
+             * 
+             * js_op_define_class 执行：
+             *   1. 创建构造函数
+             *   2. 设置原型链 (extends 父类)
+             *   3. 安装方法到原型
+             *   4. 处理静态方法 */
             {
                 int class_flags;
                 JSAtom atom;
@@ -24483,6 +24751,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+/* GET_ARRAY_EL_INLINE 宏：内联数组元素访问优化
+ * 参数：
+ *   name: 操作名前缀 (用于慢速路径标签)
+ *   keep: 是否保留原对象 (1=保留，0=替换)
+ * 
+ * 功能：访问数组元素 arr[index]
+ * 快速路径：
+ *   1. 对象是 JS_TAG_OBJECT 且 class_id == JS_CLASS_ARRAY
+ *   2. 索引是整数 (JS_TAG_INT)
+ *   3. 索引在数组范围内 (idx < count)
+ *   直接返回 p->u.array.u.values[idx]
+ * 慢速路径：
+ *   - 非数组对象
+ *   - 非整数索引
+ *   - 索引越界
+ *   调用 JS_GetPropertyValue 处理 (支持原型链、getter 等)
+ * 
+ * 栈操作：
+ *   keep=0: arr index → value (替换)
+ *   keep=1: arr index → arr value (保留索引，压入值)
+ */
 #define GET_ARRAY_EL_INLINE(name, keep)                                 \
             {                                                           \
                 JSValue val, obj, prop;                                 \
@@ -24522,10 +24811,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             
         CASE(OP_get_array_el):
+            /* 获取数组元素：arr[index] → value
+             * 栈操作：arr index → value (替换)
+             * keep=0 */
             GET_ARRAY_EL_INLINE(get_array_el, 0);
             BREAK;
 
         CASE(OP_get_array_el2):
+            /* 获取数组元素 (保留索引)：arr index → arr value
+             * 栈操作：arr index → arr value (保留索引，额外压入值)
+             * 用于链式访问或需要保留索引的场景
+             * keep=1 */
             GET_ARRAY_EL_INLINE(get_array_el2, 1);
             BREAK;
 
