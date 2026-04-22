@@ -65902,6 +65902,29 @@ static int js_TA_cmp_generic(const void *a, const void *b, void *opaque) {
     return cmp;
 }
 
+/**
+ * js_typed_array_sort - TypedArray 排序实现
+ * @ctx: JS 上下文
+ * @this_val: this 值（TypedArray 实例）
+ * @argc: 参数个数
+ * @argv: 参数数组（argv[0] 为可选的比较函数）
+ * 
+ * 功能：
+ * - 实现 ECMAScript TypedArray.prototype.sort() 方法
+ * - 支持自定义比较函数或默认类型排序
+ * - 保证排序稳定性（使用索引数组）
+ * 
+ * 排序策略：
+ * 1. 无比较函数：使用类型专用的快速比较函数（js_TA_cmp_*）
+ * 2. 有比较函数：使用通用比较器（js_TA_cmp_generic），通过 JS 调用用户函数
+ * 
+ * 注意：
+ * - 使用比较函数时会先复制数组（防止用户函数修改原数组）
+ * - 使用 rqsort（QuickJS 的快速排序实现）
+ * - 处理 TypedArray 分离（detached）的异常情况
+ * 
+ * 返回：排序后的 TypedArray（原地修改）
+ */
 static JSValue js_typed_array_sort(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
@@ -66047,6 +66070,24 @@ static JSValue js_typed_array_sort(JSContext *ctx, JSValueConst this_val,
     return JS_DupValue(ctx, this_val);
 }
 
+/**
+ * js_typed_array_toSorted - TypedArray 非原地排序（返回新数组）
+ * @ctx: JS 上下文
+ * @this_val: this 值（TypedArray 实例）
+ * @argc: 参数个数
+ * @argv: 参数数组（argv[0] 为可选的比较函数）
+ * 
+ * 功能：
+ * - 实现 ECMAScript TypedArray.prototype.toSorted() 方法（ES2023 新特性）
+ * - 与 sort() 功能相同，但不修改原数组，返回排序后的新数组
+ * 
+ * 实现策略：
+ * 1. 创建相同类型和长度的新 TypedArray
+ * 2. 调用 js_typed_array_sort 对新数组排序
+ * 3. 释放临时数组，返回结果
+ * 
+ * 返回：排序后的新 TypedArray 实例
+ */
 static JSValue js_typed_array_toSorted(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
@@ -66125,6 +66166,29 @@ static JSValue js_typed_array_base_constructor(JSContext *ctx,
     return JS_ThrowTypeError(ctx, "cannot be called");
 }
 
+/**
+ * typed_array_init - 初始化 TypedArray 对象
+ * @ctx: JS 上下文
+ * @obj: 已分配的 TypedArray 对象
+ * @buffer: ArrayBuffer 对象
+ * @offset: 字节偏移量（必须是对齐的）
+ * @len: 元素个数（不是字节数）
+ * @track_rab: 是否跟踪可调整大小的 ArrayBuffer
+ * 
+ * 功能：
+ * - 建立 TypedArray 与 ArrayBuffer 的关联
+ * - 初始化 JSTypedArray 结构体
+ * - 将 TypedArray 链接到 ArrayBuffer 的链表中（用于自动释放和分离检测）
+ * 
+ * 数据结构：
+ * - JSTypedArray: 包含 buffer 引用、offset、length 等信息
+ * - 链表管理：一个 ArrayBuffer 可以被多个 TypedArray 视图共享
+ * 
+ * 注意：
+ * - offset 必须按元素大小对齐（由调用者保证）
+ * - track_rab 用于支持可调整大小的 ArrayBuffer（RAB）
+ * - 失败时返回 -1，成功返回 0
+ */
 /* 'obj' must be an allocated typed array object */
 static int typed_array_init(JSContext *ctx, JSValueConst obj,
                             JSValue buffer, uint64_t offset, uint64_t len,
@@ -66157,6 +66221,28 @@ static int typed_array_init(JSContext *ctx, JSValueConst obj,
 }
 
 
+/**
+ * js_array_from_iterator - 从迭代器创建数组
+ * @ctx: JS 上下文
+ * @plen: 输出参数，返回数组长度
+ * @obj: 可迭代对象
+ * @method: 迭代器方法（通常是 Symbol.iterator）
+ * 
+ * 功能：
+ * - 实现 ECMAScript 的"从迭代器创建数组"语义
+ * - 用于 TypedArray 构造函数处理可迭代对象参数
+ * 
+ * 执行流程：
+ * 1. 获取迭代器（调用 obj[Symbol.iterator]()）
+ * 2. 获取 next 方法
+ * 3. 循环调用 next() 直到 done === true
+ * 4. 将每个值存入新数组
+ * 
+ * 注意：
+ * - 失败时返回 JS_EXCEPTION
+ * - 成功时返回数组对象，并通过 plen 输出长度
+ * - 需要手动释放 iter 和 next_method
+ */
 static JSValue js_array_from_iterator(JSContext *ctx, uint32_t *plen,
                                       JSValueConst obj, JSValueConst method)
 {
