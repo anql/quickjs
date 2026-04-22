@@ -37001,6 +37001,10 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
         }
     }
 
+    /* 处理模块的异步依赖关系
+     * 如果模块有待处理的异步依赖，标记为异步评估状态
+     * 如果模块有顶层 await (TLA)，也需要异步执行
+     * 否则同步执行模块 */
     if (m->pending_async_dependencies > 0) {
         assert(!m->async_evaluation);
         m->async_evaluation = TRUE;
@@ -37017,10 +37021,13 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
             return -1;
     }
 
+    /* 从 DFS 栈中弹出模块，更新状态
+     * dfs_index == dfs_ancestor_index 表示找到了一个强连通分量的根
+     * 将该分量中的所有模块都标记为已评估或异步评估中 */
     assert(m->dfs_ancestor_index <= m->dfs_index);
     if (m->dfs_index == m->dfs_ancestor_index) {
         for(;;) {
-            /* pop m1 from stack */
+            /* pop m1 from stack - 从栈中弹出模块 */
             m1 = *pstack_top;
             *pstack_top = m1->stack_prev;
             if (!m1->async_evaluation) {
@@ -37028,7 +37035,8 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
             } else {
                 m1->status = JS_MODULE_STATUS_EVALUATING_ASYNC;
             }
-            /* spec bug: cycle_root must be assigned before the test */
+            /* spec bug: cycle_root must be assigned before the test 
+             * 规范 bug：必须先赋值 cycle_root 再进行测试 */
             m1->cycle_root = m;
             if (m1 == m)
                 break;
@@ -37038,8 +37046,15 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
     return index;
 }
 
-/* Run the <eval> function of the module and of all its requested
-   modules. Return a promise or an exception. */
+/* 执行模块及其所有依赖模块的<eval>函数
+ * 返回一个 Promise 或异常
+ * 
+ * 模块评估流程：
+ * 1. 检查模块状态，如果是循环依赖则使用 cycle_root
+ * 2. 创建 Promise Capability 用于异步模块
+ * 3. 递归执行内部模块评估
+ * 4. 处理异常情况，调用 reject 函数
+ * 5. 正常完成则调用 resolve 函数 */
 static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
 {
     JSModuleDef *m1, *stack_top;
@@ -37048,34 +37063,41 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
 #ifdef DUMP_MODULE_EXEC
     js_dump_module(ctx, __func__, m);
 #endif
+    /* 断言模块必须处于已链接、异步评估中或已评估状态 */
     assert(m->status == JS_MODULE_STATUS_LINKED ||
            m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
            m->status == JS_MODULE_STATUS_EVALUATED);
+    /* 如果是循环依赖的一部分，使用 cycle_root 模块 */
     if (m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
         m->status == JS_MODULE_STATUS_EVALUATED) {
         m = m->cycle_root;
     }
-    /* a promise may be created only on the cycle_root of a cycle */
+    /* a promise may be created only on the cycle_root of a cycle 
+     * Promise 只能在循环的 cycle_root 上创建，避免重复创建 */
     if (!JS_IsUndefined(m->promise))
         return JS_DupValue(ctx, m->promise);
+    /* 创建新的 Promise Capability，包含 resolve/reject 函数 */
     m->promise = JS_NewPromiseCapability(ctx, m->resolving_funcs);
     if (JS_IsException(m->promise))
         return JS_EXCEPTION;
 
     stack_top = NULL;
+    /* 递归执行内部模块评估 */
     if (js_inner_module_evaluation(ctx, m, 0, &stack_top, &result) < 0) {
+        /* 评估失败：处理异常情况 */
         while (stack_top != NULL) {
             m1 = stack_top;
             assert(m1->status == JS_MODULE_STATUS_EVALUATING);
             m1->status = JS_MODULE_STATUS_EVALUATED;
             m1->eval_has_exception = TRUE;
             m1->eval_exception = JS_DupValue(ctx, result);
-            m1->cycle_root = m; /* spec bug: should be present */
+            m1->cycle_root = m; /* spec bug: should be present - 规范 bug：应该存在 */
             stack_top = m1->stack_prev;
         }
         JS_FreeValue(ctx, result);
         assert(m->status == JS_MODULE_STATUS_EVALUATED);
         assert(m->eval_has_exception);
+        /* 调用 reject 函数，传递异常 */
         ret_val = JS_Call(ctx, m->resolving_funcs[1], JS_UNDEFINED,
                           1, (JSValueConst *)&m->eval_exception);
         JS_FreeValue(ctx, ret_val);
@@ -37083,6 +37105,7 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
 #ifdef DUMP_MODULE_EXEC
         js_dump_module(ctx, "  done", m);
 #endif
+        /* 评估成功：处理正常完成 */
         assert(m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
                m->status == JS_MODULE_STATUS_EVALUATED);
         assert(!m->eval_has_exception);
@@ -37090,6 +37113,7 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
             JSValue value;
             assert(m->status == JS_MODULE_STATUS_EVALUATED);
             value = JS_UNDEFINED;
+            /* 调用 resolve 函数，传递 undefined 值 */
             ret_val = JS_Call(ctx, m->resolving_funcs[0], JS_UNDEFINED,
                               1, (JSValueConst *)&value);
             JS_FreeValue(ctx, ret_val);
@@ -37169,22 +37193,34 @@ static __exception int js_parse_with_clause(JSParseState *s, JSReqModuleEntry *r
     return js_parse_expect(s, '}');
 }
 
-/* return the module index in m->req_module_entries[] or < 0 if error */
+/* 解析 import/export语句中的from子句
+ * 语法：from "module-name" [with { ... }]
+ * 
+ * 返回模块在 m->req_module_entries[] 中的索引，失败返回<0
+ * 
+ * 处理流程：
+ * 1. 检查'from'关键字
+ * 2. 解析模块名字符串
+ * 3. 添加请求模块条目
+ * 4. 可选解析 with 子句（模块属性）*/
 static __exception int js_parse_from_clause(JSParseState *s, JSModuleDef *m)
 {
     JSAtom module_name;
     int idx;
 
+    /* 检查'from'关键字 */
     if (!token_is_pseudo_keyword(s, JS_ATOM_from)) {
         js_parse_error(s, "from clause expected");
         return -1;
     }
     if (next_token(s))
         return -1;
+    /* 模块名必须是字符串 */
     if (s->token.val != TOK_STRING) {
         js_parse_error(s, "string expected");
         return -1;
     }
+    /* 将字符串转换为 Atom */
     module_name = JS_ValueToAtom(s->ctx, s->token.u.str.str);
     if (module_name == JS_ATOM_NULL)
         return -1;
@@ -37193,10 +37229,12 @@ static __exception int js_parse_from_clause(JSParseState *s, JSModuleDef *m)
         return -1;
     }
 
+    /* 添加请求模块条目到模块的请求列表中 */
     idx = add_req_module_entry(s->ctx, m, module_name);
     JS_FreeAtom(s->ctx, module_name);
     if (idx < 0)
         return -1;
+    /* 可选的 with 子句：import x from "mod" with { type: "json" } */
     if (s->token.val == TOK_WITH) {
         if (js_parse_with_clause(s, &m->req_module_entries[idx]))
             return -1;
@@ -37204,6 +37242,17 @@ static __exception int js_parse_from_clause(JSParseState *s, JSModuleDef *m)
     return idx;
 }
 
+/* 解析 export 语句
+ * 支持以下语法形式：
+ * - export class Foo {}         // 导出类
+ * - export function foo() {}    // 导出函数
+ * - export async function foo() {}  // 导出异步函数
+ * - export { x, y as z }        // 命名导出
+ * - export { x } from "mod"     // 从其他模块导出
+ * - export * from "mod"         // 导出所有内容
+ * - export * as ns from "mod"   // 作为命名空间导出
+ * - export default ...          // 默认导出
+ * - export var/let/const x = 1  // 导出变量声明 */
 static __exception int js_parse_export(JSParseState *s)
 {
     JSContext *ctx = s->ctx;
@@ -37216,6 +37265,7 @@ static __exception int js_parse_export(JSParseState *s)
         return -1;
 
     tok = s->token.val;
+    /* 处理 export class/function/async function 声明 */
     if (tok == TOK_CLASS) {
         return js_parse_class(s, FALSE, JS_PARSE_EXPORT_NAMED);
     } else if (tok == TOK_FUNCTION ||
@@ -37230,6 +37280,7 @@ static __exception int js_parse_export(JSParseState *s)
     if (next_token(s))
         return -1;
 
+    /* 根据 token 类型分发到不同的导出处理逻辑 */
     switch(tok) {
     case '{':
         first_export = m->export_entries_count;
@@ -37324,6 +37375,8 @@ static __exception int js_parse_export(JSParseState *s)
         }
         break;
     case TOK_DEFAULT:
+        /* 处理 export default 语法
+         * 支持：export default class/function/expr */
         if (s->token.val == TOK_CLASS) {
             return js_parse_class(s, FALSE, JS_PARSE_EXPORT_DEFAULT);
         } else if (s->token.val == TOK_FUNCTION ||
@@ -37334,14 +37387,15 @@ static __exception int js_parse_export(JSParseState *s)
                                            s->token.ptr,
                                            JS_PARSE_EXPORT_DEFAULT, NULL);
         } else {
+            /* export default 后跟表达式 */
             if (js_parse_assign_expr(s))
                 return -1;
         }
-        /* set the name of anonymous functions */
+        /* 为匿名函数设置名称 */
         set_object_name(s, JS_ATOM_default);
 
-        /* store the value in the _default_ global variable and export
-           it */
+        /* 将值存储到_default_全局变量并导出
+         * 默认导出实际上是导出一个名为'_default_'的内部变量 */
         local_name = JS_ATOM__default_;
         if (define_var(s, s->cur_func, local_name, JS_VAR_DEF_LET) < 0)
             return -1;
@@ -37356,6 +37410,7 @@ static __exception int js_parse_export(JSParseState *s)
     case TOK_VAR:
     case TOK_LET:
     case TOK_CONST:
+        /* 处理 export var/let/const 声明 */
         return js_parse_var(s, TRUE, tok, TRUE);
     default:
         return js_parse_error(s, "invalid export syntax");
@@ -37369,6 +37424,13 @@ static int add_closure_var(JSContext *ctx, JSFunctionDef *s,
                            BOOL is_const, BOOL is_lexical,
                            JSVarKindEnum var_kind);
 
+/* 添加导入条目
+ * local_name: 本地绑定名称（import 后的变量名）
+ * import_name: 从模块导入的名称（被导入的实际名称）
+ * is_star: 是否为命名空间导入（import * as ns）
+ * 
+ * 导入条目存储在模块的 import_entries 数组中
+ * 同时创建闭包变量用于运行时访问 */
 static int add_import(JSParseState *s, JSModuleDef *m,
                       JSAtom local_name, JSAtom import_name, BOOL is_star)
 {
@@ -37376,9 +37438,11 @@ static int add_import(JSParseState *s, JSModuleDef *m,
     int i, var_idx;
     JSImportEntry *mi;
 
+    /* 禁止使用'arguments'和'eval'作为导入绑定名（严格模式要求）*/
     if (local_name == JS_ATOM_arguments || local_name == JS_ATOM_eval)
         return js_parse_error(s, "invalid import binding");
 
+    /* 检查是否重复导入（default 除外）*/
     if (local_name != JS_ATOM_default) {
         for (i = 0; i < s->cur_func->closure_var_count; i++) {
             if (s->cur_func->closure_var[i].var_name == local_name)
@@ -37386,12 +37450,14 @@ static int add_import(JSParseState *s, JSModuleDef *m,
         }
     }
 
+    /* 添加闭包变量：模块导入是只读的常量 lexical 变量 */
     var_idx = add_closure_var(ctx, s->cur_func,
                               is_star ? JS_CLOSURE_MODULE_DECL : JS_CLOSURE_MODULE_IMPORT,
                               m->import_entries_count,
                               local_name, TRUE, TRUE, JS_VAR_NORMAL);
     if (var_idx < 0)
         return -1;
+    /* 扩展导入条目数组 */
     if (js_resize_array(ctx, (void **)&m->import_entries,
                         sizeof(JSImportEntry),
                         &m->import_entries_size,
@@ -37404,6 +37470,17 @@ static int add_import(JSParseState *s, JSModuleDef *m,
     return 0;
 }
 
+/* 解析 import 语句
+ * 支持以下语法形式：
+ * - import "mod"                          // 副作用导入
+ * - import foo from "mod"                 // 默认导入
+ * - import { x, y as z } from "mod"       // 命名导入
+ * - import * as ns from "mod"             // 命名空间导入
+ * - import foo, { x } from "mod"          // 混合导入
+ * - import "mod" with { type: "json" }    // 带属性的导入
+ * 
+ * 导入条目存储在模块的 import_entries 数组中
+ * 同时创建闭包变量用于运行时访问导入的绑定 */
 static __exception int js_parse_import(JSParseState *s)
 {
     JSContext *ctx = s->ctx;
@@ -37415,6 +37492,7 @@ static __exception int js_parse_import(JSParseState *s)
         return -1;
 
     first_import = m->import_entries_count;
+    /* 处理纯副作用导入：import "mod" with { ... } */
     if (s->token.val == TOK_STRING) {
         module_name = JS_ValueToAtom(ctx, s->token.u.str.str);
         if (module_name == JS_ATOM_NULL)
@@ -37432,11 +37510,12 @@ static __exception int js_parse_import(JSParseState *s)
                 return -1;
         }
     } else {
+        /* 处理默认导入：import foo from "mod" */
         if (s->token.val == TOK_IDENT) {
             if (s->token.u.ident.is_reserved) {
                 return js_parse_error_reserved_identifier(s);
             }
-            /* "default" import */
+            /* "default" import - 导入默认导出 */
             local_name = JS_DupAtom(ctx, s->token.u.ident.atom);
             import_name = JS_ATOM_default;
             if (next_token(s))
@@ -37451,8 +37530,9 @@ static __exception int js_parse_import(JSParseState *s)
                 return -1;
         }
 
+        /* 处理命名空间导入：import * as ns from "mod" */
         if (s->token.val == '*') {
-            /* name space import */
+            /* name space import - 命名空间导入 */
             if (next_token(s))
                 return -1;
             if (!token_is_pseudo_keyword(s, JS_ATOM_as))
@@ -37567,6 +37647,23 @@ static __exception int js_parse_source_element(JSParseState *s)
     return 0;
 }
 
+/* 创建新的函数定义结构
+ * 
+ * JSFunctionDef 是编译期的函数表示，包含：
+ * - 字节码
+ * - 变量信息（参数、局部变量、闭包变量）
+ * - 作用域信息
+ * - 调试信息（行号表等）
+ * 
+ * 参数：
+ * - parent: 父函数定义（用于嵌套函数/闭包）
+ * - is_eval: 是否为 eval 代码
+ * - is_func_expr: 是否为函数表达式
+ * - filename: 源文件名
+ * - source_ptr: 源代码指针
+ * - get_line_col_cache: 行号列号缓存
+ * 
+ * 返回：新创建的函数定义，失败返回 NULL */
 static JSFunctionDef *js_new_function_def(JSContext *ctx,
                                           JSFunctionDef *parent,
                                           BOOL is_eval,
@@ -37584,22 +37681,26 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     fd->ctx = ctx;
     init_list_head(&fd->child_list);
 
-    /* insert in parent list */
+    /* 插入到父函数的子函数列表中 - 建立父子关系 */
     fd->parent = parent;
     fd->parent_cpool_idx = -1;
     if (parent) {
         list_add_tail(&fd->link, &parent->child_list);
-        fd->js_mode = parent->js_mode;
+        fd->js_mode = parent->js_mode;  /* 继承父函数的 JS 模式（严格/非严格）*/
         fd->parent_scope_level = parent->scope_level;
     }
+    /* 设置调试信息剥离标志 */
     fd->strip_debug = ((ctx->rt->strip_flags & JS_STRIP_DEBUG) != 0);
     fd->strip_source = ((ctx->rt->strip_flags & (JS_STRIP_DEBUG | JS_STRIP_SOURCE)) != 0);
 
     fd->is_eval = is_eval;
     fd->is_func_expr = is_func_expr;
+    /* 初始化字节码缓冲区 */
     js_dbuf_bytecode_init(ctx, &fd->byte_code);
     fd->last_opcode_pos = -1;
     fd->func_name = JS_ATOM_NULL;
+    
+    /* 初始化特殊变量索引为 -1（表示未使用）*/
     fd->var_object_idx = -1;
     fd->arg_var_object_idx = -1;
     fd->arguments_var_idx = -1;
@@ -37611,13 +37712,14 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     fd->this_active_func_var_idx = -1;
     fd->home_object_var_idx = -1;
 
-    /* XXX: should distinguish arg, var and var object and body scopes */
+    /* XXX: should distinguish arg, var and var object and body scopes 
+     * TODO: 应该区分参数、变量、变量对象和作用域 */
     fd->scopes = fd->def_scope_array;
     fd->scope_size = countof(fd->def_scope_array);
     fd->scope_count = 1;
     fd->scopes[0].first = -1;
     fd->scopes[0].parent = -1;
-    fd->scope_level = 0;  /* 0: var/arg scope */
+    fd->scope_level = 0;  /* 0: var/arg scope - 变量/参数作用域 */
     fd->scope_first = -1;
     fd->body_scope = -1;
 
@@ -37625,6 +37727,7 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     fd->source_pos = source_ptr - get_line_col_cache->buf_start;
     fd->get_line_col_cache = get_line_col_cache;
     
+    /* 初始化 PC 到行号的映射表（用于调试和错误报告）*/
     js_dbuf_init(ctx, &fd->pc2line);
     //fd->pc2line_last_line_num = line_num;
     //fd->pc2line_last_pc = 0;
