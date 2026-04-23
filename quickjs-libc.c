@@ -3756,6 +3756,27 @@ static int my_execvpe(const char *filename, char **argv, char **envp)
     return -1;
 }
 
+/**
+ * @brief 执行外部进程 (os.exec)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=参数数组，[1]=选项对象（可选）
+ * @return 阻塞模式下返回退出码，非阻塞模式返回 PID
+ * 
+ * 创建子进程执行指定的可执行文件。
+ * 选项对象可包含：
+ * - block: 是否阻塞等待（默认 true）
+ * - usePath: 是否在 PATH 中搜索（默认 true）
+ * - file: 可执行文件路径（默认使用 args[0]）
+ * - cwd: 工作目录
+ * - env: 环境变量对象
+ * - uid/gid: 用户/组 ID
+ * - stdin/stdout/stderr: 文件描述符重定向
+ * 
+ * 子进程会关闭所有继承的文件描述符（3 及以上）。
+ * 支持 closefrom() 的系统会使用它，否则手动关闭到 1024。
+ */
 /* exec(args[, options]) -> exitcode */
 static JSValue js_os_exec(JSContext *ctx, JSValueConst this_val,
                           int argc, JSValueConst *argv)
@@ -3972,6 +3993,17 @@ static JSValue js_os_exec(JSContext *ctx, JSValueConst this_val,
     goto done;
 }
 
+/**
+ * @brief 获取当前进程 ID (os.getpid)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 当前进程 ID
+ * 
+ * 返回调用进程的 PID（进程标识符）。
+ * 仅在 POSIX 系统上可用。
+ */
 /* getpid() -> pid */
 static JSValue js_os_getpid(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv)
@@ -3979,6 +4011,22 @@ static JSValue js_os_getpid(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, getpid());
 }
 
+/**
+ * @brief 等待子进程状态变化 (os.waitpid)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=进程 ID，[1]=选项标志
+ * @return 返回 [PID, 状态码] 数组，失败时 PID 为负数错误码
+ * 
+ * 等待指定的子进程状态发生变化（终止或停止）。
+ * 选项标志：
+ * - WNOHANG: 非阻塞模式，无状态变化时立即返回
+ * 
+ * 返回值说明：
+ * - 正常退出：状态码为退出码（0-255）
+ * - 信号终止：状态码为负的信号编号
+ */
 /* waitpid(pid, block) -> [pid, status] */
 static JSValue js_os_waitpid(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
@@ -4007,6 +4055,21 @@ static JSValue js_os_waitpid(JSContext *ctx, JSValueConst this_val,
     return obj;
 }
 
+/**
+ * @brief 创建匿名管道 (os.pipe)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 返回 [读端 FD, 写端 FD] 数组，失败返回 null
+ * 
+ * 创建一对相连的文件描述符，用于进程间通信。
+ * - pipe_fds[0]: 读端，用于从管道读取数据
+ * - pipe_fds[1]: 写端，用于向管道写入数据
+ * 
+ * 数据流动是单向的：写端 → 管道 → 读端。
+ * 通常在 fork() 前创建，用于父子进程通信。
+ */
 /* pipe() -> [read_fd, write_fd] or null if error */
 static JSValue js_os_pipe(JSContext *ctx, JSValueConst this_val,
                           int argc, JSValueConst *argv)
@@ -4027,6 +4090,24 @@ static JSValue js_os_pipe(JSContext *ctx, JSValueConst this_val,
     return obj;
 }
 
+/**
+ * @brief 发送信号到进程 (os.kill)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=目标 PID，[1]=信号编号
+ * @return 成功返回 0，失败返回负数错误码
+ * 
+ * 向指定进程发送信号。
+ * 常用信号：
+ * - SIGINT (2): 中断信号（Ctrl+C）
+ * - SIGTERM (15): 终止信号
+ * - SIGKILL (9): 强制杀死（不可捕获）
+ * - SIGUSR1/SIGUSR2: 用户自定义信号
+ * 
+ * 如果 pid 为负数，信号发送到进程组。
+ * 仅在 POSIX 系统上可用。
+ */
 /* kill(pid, sig) */
 static JSValue js_os_kill(JSContext *ctx, JSValueConst this_val,
                           int argc, JSValueConst *argv)
@@ -4041,6 +4122,19 @@ static JSValue js_os_kill(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, ret);
 }
 
+/**
+ * @brief 复制文件描述符 (os.dup)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=原文件描述符
+ * @return 新的文件描述符，失败返回负数错误码
+ * 
+ * 创建指定文件描述符的副本。
+ * 返回的新 FD 是系统可用的最小非负整数。
+ * 两个 FD 共享相同的文件偏移量和状态标志。
+ * 常用于重定向前保存原 FD。
+ */
 /* dup(fd) */
 static JSValue js_os_dup(JSContext *ctx, JSValueConst this_val,
                          int argc, JSValueConst *argv)
@@ -4053,7 +4147,20 @@ static JSValue js_os_dup(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, ret);
 }
 
-/* dup2(fd) */
+/**
+ * @brief 复制文件描述符到指定编号 (os.dup2)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=原 FD，[1]=目标 FD
+ * @return 目标 FD，失败返回负数错误码
+ * 
+ * 将原 FD 复制到指定的目标编号。
+ * 如果目标 FD 已打开，会先关闭它。
+ * 如果原 FD 和目标 FD 相同，直接返回不做任何操作。
+ * 常用于将 FD 重定向到标准输入/输出/错误（0/1/2）。
+ */
+/* dup2(fd, fd2) */
 static JSValue js_os_dup2(JSContext *ctx, JSValueConst this_val,
                          int argc, JSValueConst *argv)
 {
@@ -4392,6 +4499,18 @@ static JSValue js_worker_ctor(JSContext *ctx, JSValueConst new_target,
     return JS_EXCEPTION;
 }
 
+/**
+ * @brief Worker 发送消息到父线程 (worker.postMessage)
+ * @param ctx JS 上下文
+ * @param this_val Worker 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=要发送的消息对象
+ * @return 成功返回 JS_UNDEFINED，失败返回异常
+ * 
+ * 将 JS 对象序列化为字节流，通过管道发送到父线程。
+ * 支持 SharedArrayBuffer 和引用对象的传输。
+ * 消息被添加到队列并唤醒接收方。
+ */
 static JSValue js_worker_postMessage(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
@@ -4460,6 +4579,17 @@ static JSValue js_worker_postMessage(JSContext *ctx, JSValueConst this_val,
 
 }
 
+/**
+ * @brief 设置 Worker 消息接收处理函数 (worker.onmessage = func)
+ * @param ctx JS 上下文
+ * @param this_val Worker 对象
+ * @param func 消息处理函数或 null
+ * @return 成功返回 JS_UNDEFINED，失败返回异常
+ * 
+ * 设置或清除 Worker 的消息接收回调函数。
+ * 当父线程发送消息时，该函数会被调用。
+ * 设置为 null 时移除监听器并释放资源。
+ */
 static JSValue js_worker_set_onmessage(JSContext *ctx, JSValueConst this_val,
                                    JSValueConst func)
 {
@@ -4495,6 +4625,15 @@ static JSValue js_worker_set_onmessage(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * @brief 获取 Worker 消息接收处理函数 (worker.onmessage)
+ * @param ctx JS 上下文
+ * @param this_val Worker 对象
+ * @return 消息处理函数或 null
+ * 
+ * 返回当前设置的 onmessage 回调函数。
+ * 如果未设置则返回 null。
+ */
 static JSValue js_worker_get_onmessage(JSContext *ctx, JSValueConst this_val)
 {
     JSWorkerData *worker = JS_GetOpaque2(ctx, this_val, js_worker_class_id);
@@ -4516,6 +4655,13 @@ static const JSCFunctionListEntry js_worker_proto_funcs[] = {
 
 #endif /* USE_WORKER */
 
+/**
+ * @brief 设置 Worker 上下文创建函数（全局 API）
+ * @param func 上下文创建函数指针
+ * 
+ * 用于设置 Worker 线程创建新 JS 上下文的回调函数。
+ * 仅在启用 USE_WORKER 时有效。
+ */
 void js_std_set_worker_new_context_func(JSContext *(*func)(JSRuntime *rt))
 {
 #ifdef USE_WORKER
@@ -4620,6 +4766,15 @@ static const JSCFunctionListEntry js_os_funcs[] = {
 #endif
 };
 
+/**
+ * @brief OS 模块初始化函数
+ * @param ctx JS 上下文
+ * @param m 模块对象
+ * @return 成功返回 0，失败返回负数
+ * 
+ * 初始化 os 模块，注册 Worker 类（如果启用）并导出所有 OS API 函数。
+ * 设置 os_poll_func 为 js_os_poll 以支持事件轮询。
+ */
 static int js_os_init(JSContext *ctx, JSModuleDef *m)
 {
     os_poll_func = js_os_poll;
@@ -4656,6 +4811,15 @@ static int js_os_init(JSContext *ctx, JSModuleDef *m)
                                   countof(js_os_funcs));
 }
 
+/**
+ * @brief 创建并初始化 OS 模块
+ * @param ctx JS 上下文
+ * @param module_name 模块名称
+ * @return 模块对象，失败返回 NULL
+ * 
+ * 创建 C 模块并注册所有 OS 导出项。
+ * 如果启用 Worker，还添加 Worker 导出项。
+ */
 JSModuleDef *js_init_module_os(JSContext *ctx, const char *module_name)
 {
     JSModuleDef *m;
@@ -4671,6 +4835,17 @@ JSModuleDef *js_init_module_os(JSContext *ctx, const char *module_name)
 
 /**********************************************************/
 
+/**
+ * @brief print 函数实现（全局 print）
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组（要打印的值列表）
+ * @return 返回 JS_UNDEFINED
+ * 
+ * 将参数打印到 stdout，字符串直接输出，其他类型使用 JS_PrintValue。
+ * 参数之间用空格分隔，末尾添加换行符。
+ */
 static JSValue js_print(JSContext *ctx, JSValueConst this_val,
                         int argc, JSValueConst *argv)
 {
@@ -4697,6 +4872,16 @@ static JSValue js_print(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * @brief console.log 实现
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 调用 js_print 的结果
+ * 
+ * 调用 print 函数并刷新 stdout 缓冲区。
+ */
 static JSValue js_console_log(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
@@ -4706,6 +4891,21 @@ static JSValue js_console_log(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
+/**
+ * @brief 添加标准辅助函数到全局对象
+ * @param ctx JS 上下文
+ * @param argc 命令行参数个数
+ * @param argv 命令行参数数组
+ * 
+ * 向全局对象添加以下属性和函数：
+ * - console: 包含 log 方法的控制台对象
+ * - performance: 包含 now 方法的性能对象
+ * - scriptArgs: 命令行参数数组
+ * - print: 打印函数
+ * - __loadScript: 加载脚本的内部函数
+ * 
+ * 用于初始化 JS shell 环境。
+ */
 void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
 {
     JSValue global_obj, console, args, performance;
@@ -4741,6 +4941,19 @@ void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
     JS_FreeValue(ctx, global_obj);
 }
 
+/**
+ * @brief 初始化运行时处理器
+ * @param rt JS 运行时
+ * 
+ * 创建并初始化 JSThreadState 结构，包含：
+ * - OS 读写处理器链表
+ * - 信号处理器链表
+ * - 定时器链表
+ * - Worker 端口链表
+ * - 被拒绝的 Promise 链表
+ * 
+ * 如果启用 Worker，还设置 SharedArrayBuffer 内存管理函数。
+ */
 void js_std_init_handlers(JSRuntime *rt)
 {
     JSThreadState *ts;
@@ -4773,6 +4986,19 @@ void js_std_init_handlers(JSRuntime *rt)
 #endif
 }
 
+/**
+ * @brief 释放运行时处理器资源
+ * @param rt JS 运行时
+ * 
+ * 清理并释放所有运行时资源：
+ * - 所有 OS 读写处理器
+ * - 所有信号处理器
+ * - 所有定时器
+ * - 所有被拒绝的 Promise 条目
+ * - Worker 消息管道（如果启用）
+ * 
+ * 最后释放 JSThreadState 并清除运行时 opaque 指针。
+ */
 void js_std_free_handlers(JSRuntime *rt)
 {
     JSThreadState *ts = JS_GetRuntimeOpaque(rt);
