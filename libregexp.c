@@ -1068,6 +1068,28 @@ static int parse_unicode_property(REParseState *s, REStringList *cr,
 static int get_class_atom(REParseState *s, REStringList *cr,
                           const uint8_t **pp, BOOL inclass);
 
+/**
+ * parse_class_string_disjunction - 解析字符类字符串析取 (\q{...} 语法)
+ * 
+ * 支持 Unicode 正则的字符串析取语法：\q{abc|def|ghi}
+ * 匹配多个字符串中的任意一个（类似字符类的字符串版本）。
+ * 
+ * @s: 解析状态
+ * @cr: 输出字符串列表
+ * @pp: 输入字符串指针（指向'{'之后）
+ * @return: 0=成功，-1=失败
+ * 
+ * 语法示例:
+ * - \q{abc}     : 匹配字符串"abc"
+ * - \q{abc|def} : 匹配"abc"或"def"
+ * - \q{a|bc|def}: 匹配"a"或"bc"或"def"
+ * 
+ * 实现说明:
+ * 1. 解析每个析取项（用'|'分隔）
+ * 2. 将每个项转换为码点序列
+ * 3. 添加到字符串列表（REStringList）
+ * 4. 如果忽略大小写，进行大小写规范化
+ */
 static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
                                           const uint8_t **pp)
 {
@@ -1085,6 +1107,7 @@ static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
     p++;
     for(;;) {
         str.size = 0;
+        // 解析一个析取项（直到'|'或'}'）
         while (*p != '}' && *p != '|') {
             c = get_class_atom(s, NULL, &p, FALSE);
             if (c < 0)
@@ -1094,14 +1117,16 @@ static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
                 goto fail;
             }
         }
+        // 将码点序列添加到字符串列表
         if (re_string_add(cr, str.size / 4, (uint32_t *)str.buf)) {
             re_parse_out_of_memory(s);
             goto fail;
         }
         if (*p == '}')
             break;
-        p++;
+        p++;  // 跳过'|'
     }
+    // 忽略大小写时进行规范化
     if (s->ignore_case) {
         if (re_string_list_canonicalize(s, cr, TRUE))
             goto fail;
