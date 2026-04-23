@@ -339,7 +339,9 @@
 | 2026-04-23 | quickjs-opcode.h | 1 | 366 | 366 | 63,732 | 55.6% | quickjs-opcode.h 完成（字节码操作码：压栈/栈操作/函数调用/变量访问/属性访问/控制流/迭代器/算术逻辑运算/短操作码优化） |
 | 2026-04-23 | unicode_gen_def.h | 1 | 323 | 323 | 64,055 | 55.9% | unicode_gen_def.h 完成（Unicode 通用类别/脚本/二元属性/序列属性定义，共 150+ 脚本别名详细注释） |
 | 2026-04-23 | qjs.c | 1 | 568 | 568 | 64,623 | 56.4% | qjs.c 完成（独立解释器入口：命令行参数解析/内存跟踪/模块加载/事件循环/性能测试） |
-| 2026-04-23 | unicode_gen.c | 1 | 400 | 400 | 65,023 | 56.7% | unicode_gen.c P2 部分完成（文件头/全局变量/辅助函数/REString 哈希表/CCInfo 结构体/属性操作/parse_unicode_data/main 函数） |
+| 2026-04-23 | unicode_gen.c | 1 | 400 | 400 | 65,023 | 56.7% | unicode_gen.c P2 部分完成（文件头/全局变量/辅助函数/REString 哈希表/CCInfo 结构体/属性操作） |
+| 2026-04-23 | unicode_gen.c | 400 | 1300 | 900 | 65,923 | 57.5% | unicode_gen.c P2 继续（parse_unicode_data/parse_special_casing/parse_case_folding/parse_composition_exclusions/parse_derived_core_properties/parse_derived_norm_properties/parse_prop_list 详细注释） |
+| 2026-04-23 | unicode_gen.c | 1300 | 1700 | 400 | 66,323 | 57.8% | unicode_gen.c P2 继续（is_emoji_modifier/add_sequence_prop/parse_sequence_prop_list/parse_scripts/parse_script_extensions 详细注释，Emoji 序列处理逻辑） |
 
 ---
 
