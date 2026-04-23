@@ -2151,12 +2151,31 @@ void *JS_GetRuntimeOpaque(JSRuntime *rt)
     return rt->user_opaque;
 }
 
+/**
+ * 设置运行时不透明指针
+ * 
+ * 用于存储用户自定义的运行时上下文数据，可通过 JS_GetRuntimeOpaque 获取
+ * 常见用途：存储内存跟踪信息、调试数据、自定义状态等
+ * 
+ * @param rt QuickJS 运行时实例
+ * @param opaque 用户自定义指针（通常为结构体指针）
+ */
 void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque)
 {
     rt->user_opaque = opaque;
 }
 
 /* default memory allocation functions with memory limitation */
+
+/**
+ * 获取默认内存分配器的实际可用大小
+ * 
+ * 根据不同平台调用对应的 API 获取已分配内存的实际大小
+ * 用于内存统计和 GC 决策
+ * 
+ * @param ptr 内存指针
+ * @return 实际可用的字节数，平台不支持时返回 0
+ */
 static size_t js_def_malloc_usable_size(const void *ptr)
 {
 #if defined(__APPLE__)
@@ -2192,6 +2211,14 @@ static void *js_def_malloc(JSMallocState *s, size_t size)
     return ptr;
 }
 
+/**
+ * 默认内存释放函数
+ * 
+ * 释放由 js_def_malloc 分配的内存，并更新内存统计信息
+ * 
+ * @param s 内存管理状态（用于统计）
+ * @param ptr 要释放的内存指针，NULL 会被安全忽略
+ */
 static void js_def_free(JSMallocState *s, void *ptr)
 {
     if (!ptr)
@@ -2434,6 +2461,16 @@ BOOL JS_IsJobPending(JSRuntime *rt)
  * - 如果上下文引用计数为 1，*pctx 设为 NULL（上下文将被销毁）
  * - pctx 参数现已废弃，但保留以兼容旧代码
  */
+/**
+ * 执行待处理的异步任务
+ * 
+ * 处理运行时中所有待处理的 Promise 作业（Promise Jobs）
+ * 这是实现 JavaScript 异步/等待（async/await）机制的核心函数
+ * 
+ * @param rt QuickJS 运行时实例
+ * @param pctx 输出参数，返回执行作业的上下文（可为 NULL）
+ * @return 1 表示成功执行作业，0 表示无待处理作业，-1 表示出错
+ */
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
 {
     JSContext *ctx;
@@ -2590,21 +2627,25 @@ void JS_SetRuntimeInfo(JSRuntime *rt, const char *s)
         rt->rt_info = s;
 }
 
-/* ============================================================================
- * JS_FreeRuntime - 释放运行时实例
+/**
+ * 释放运行时实例
+ * 
  * 这是 QuickJS 最复杂的清理函数，按顺序释放所有资源
- * @rt: 运行时实例
+ * 必须确保所有 JSContext 都已释放后才能调用此函数
+ * 
+ * @param rt QuickJS 运行时实例
  * 
  * 清理顺序：
  * 1. 当前异常
- * 2. Job 队列
- * 3. GC 对象（运行 GC）
- * 4. 类定义
- * 5. Atom（调试模式下检查泄漏）
- * 6. Shape 哈希表
+ * 2. Job 队列（待处理的异步任务）
+ * 3. GC 对象（运行一次完整 GC）
+ * 4. 类定义（Class definitions）
+ * 5. Atom 哈希表（调试模式下检查泄漏）
+ * 6. Shape 哈希表（对象形状缓存）
  * 7. 字符串（调试模式下检查泄漏）
- * 8. 运行时结构本身
- * ============================================================================ */
+ * 8. 模块列表
+ * 9. 运行时结构本身
+ */
 void JS_FreeRuntime(JSRuntime *rt)
 {
     struct list_head *el, *el1;
@@ -2889,6 +2930,15 @@ void *JS_GetContextOpaque(JSContext *ctx)
     return ctx->user_opaque;
 }
 
+/**
+ * 设置上下文不透明指针
+ * 
+ * 用于存储用户自定义的上下文数据，可通过 JS_GetContextOpaque 获取
+ * 常见用途：存储全局对象引用、模块加载器状态、自定义环境等
+ * 
+ * @param ctx QuickJS 上下文实例
+ * @param opaque 用户自定义指针
+ */
 void JS_SetContextOpaque(JSContext *ctx, void *opaque)
 {
     ctx->user_opaque = opaque;
@@ -2904,6 +2954,16 @@ static inline void set_value(JSContext *ctx, JSValue *pval, JSValue new_val)
     JS_FreeValue(ctx, old_val);
 }
 
+/**
+ * 设置类的原型对象
+ * 
+ * 为指定的 ClassID 设置原型对象，用于实现 JavaScript 的继承机制
+ * 当创建该类的实例时，会自动将 prototype 设置为该对象的 [[Prototype]]
+ * 
+ * @param ctx QuickJS 上下文实例
+ * @param class_id 类 ID（通过 JS_NewClass 注册获得）
+ * @param obj 原型对象（通常为包含方法的对象）
+ */
 void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj)
 {
     JSRuntime *rt = ctx->rt;
@@ -2911,6 +2971,16 @@ void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj)
     set_value(ctx, &ctx->class_proto[class_id], obj);
 }
 
+/**
+ * 获取类的原型对象
+ * 
+ * 返回指定 ClassID 的原型对象的副本（引用计数 +1）
+ * 用于实现 Object.getPrototypeOf() 等操作
+ * 
+ * @param ctx QuickJS 上下文实例
+ * @param class_id 类 ID
+ * @return 原型对象的副本，如果 class_id 无效则返回 undefined
+ */
 JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id)
 {
     JSRuntime *rt = ctx->rt;
