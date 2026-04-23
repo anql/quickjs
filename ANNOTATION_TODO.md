@@ -343,6 +343,7 @@
 | 2026-04-23 | unicode_gen.c | 400 | 1300 | 900 | 65,923 | 57.5% | unicode_gen.c P2 继续（parse_unicode_data/parse_special_casing/parse_case_folding/parse_composition_exclusions/parse_derived_core_properties/parse_derived_norm_properties/parse_prop_list 详细注释） |
 | 2026-04-23 | unicode_gen.c | 1300 | 1700 | 400 | 66,323 | 57.8% | unicode_gen.c P2 继续（is_emoji_modifier/add_sequence_prop/parse_sequence_prop_list/parse_scripts/parse_script_extensions 详细注释，Emoji 序列处理逻辑） |
 | 2026-04-23 | unicode_gen.c | 1700 | 1950 | 250 | 66,573 | 58.0% | unicode_gen.c P2 继续（dump_cc_info/dump_unicode_data/is_complicated_case/RUN_TYPE 枚举/TableEntry 结构体注释，大小写转换压缩算法说明） |
+| 2026-04-23 | unicode_gen.c | 1950 | 2300 | 350 | 66,923 | 58.3% | unicode_gen.c P2 核心（find_run_type 函数完整注释：LSU 特殊三字符/13 种复杂运行类型识别逻辑/简单 UL/U/LF 运行检测） |
 
 ---
 

@@ -1991,6 +1991,33 @@ static int simple_to_lower(CCInfo *tab, int c)
 
 /* code (17), len (7), type (4) - 位域布局注释 */
 
+/**
+ * 查找并识别大小写转换运行类型
+ * 
+ * 这是整个压缩算法的核心函数。它分析从 code 开始的字符序列，
+ * 识别出符合哪种预定义运行类型（RUN_TYPE_*），并填充 TableEntry。
+ * 
+ * 算法流程：
+ * 1. 特殊检查：首先检查是否为希腊语最终 sigma（LSU）三字符模式
+ * 2. 复杂情况：如果当前字符是"复杂"大小写，尝试匹配 13 种复杂类型
+ * 3. 简单情况：如果是简单 1:1 映射，查找连续运行（UL/U/LF）
+ * 
+ * 运行类型优先级（从上到下）：
+ * 1. LSU: 希腊语最终 sigma 特殊三字符循环（Σ→σ→ς→Σ）
+ * 2. UF: 大写 + 折叠相同，连续运行
+ * 3. UF_EXT2: 带 2 扩展的大写 + 折叠（希腊语带 iota 下标）
+ * 4. U2L_399_EXT2: 大写→小写 + 0x0399 扩展
+ * 5. L: 小写连续运行
+ * 6. UF_D20: ASCII 大小写（差值 0x20）
+ * 7. UF_D1_EXT: 差值 1 + 扩展
+ * 8. LF_EXT2/UF_EXT2/UF_EXT3: 各种扩展类型
+ * 9. UL: 交替运行（小写↔大写）
+ * 10. U/LF: 简单大写或小写运行
+ * 
+ * @param te 输出表条目
+ * @param tab Unicode 字符数据库
+ * @param code 起始码点
+ */
 void find_run_type(TableEntry *te, CCInfo *tab, int code)
 {
     int is_lower, len;
@@ -2001,6 +2028,20 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
     ci2 = &tab[code + 2];
     te->code = code;
 
+    /* ========== 特殊情况 1: 希腊语最终 sigma（LSU） ==========
+     * 
+     * 希腊语 sigma 有三种形式：
+     * - Σ (U+03A3): 大写 Sigma
+     * - σ (U+03C3): 小写 sigma（词中形式）
+     * - ς (U+03C2): 小写最终 sigma（词尾形式）
+     * 
+     * 转换关系形成三字符循环：
+     * - Σ (code)   → 小写：σ (code+2), 折叠：σ (code+2), 无大写
+     * - σ (code+1) → 小写：σ (code+2), 折叠：σ (code+2), 大写：Σ (code)
+     * - ς (code+2) → 无小写，无折叠，大写：Σ (code)
+     * 
+     * 这是一个独特的三字符模式，用 RUN_TYPE_LSU 编码。
+     */
     if (ci->l_len == 1 && ci->l_data[0] == code + 2 &&
         ci->f_len == 1 && ci->f_data[0] == ci->l_data[0] &&
         ci->u_len == 0 &&
@@ -2018,7 +2059,20 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
         return;
     }
 
+    /* ========== 复杂大小写情况处理 ==========
+     * 
+     * 复杂情况包括：
+     * - 多字符映射（如 ß → SS）
+     * - 大写和小写同时存在
+     * - 折叠和小写不同
+     * 
+     * 按优先级尝试匹配各种运行类型：
+     */
     if (is_complicated_case(ci)) {
+        /* ----- 类型 1: UF (大写 + 折叠相同，连续运行) -----
+         * 模式：每个字符的大写和小写折叠相同，且连续递增
+         * 如：某些希腊字母的大写形式
+         */
         len = 1;
         while (code + len <= CHARCODE_MAX) {
             ci1 = &tab[code + len];
@@ -2036,6 +2090,12 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
             return;
         }
 
+        /* ----- 类型 2: UF_EXT2 (带 2 扩展的大写 + 折叠) -----
+         * 模式：大写和折叠都是 2 字符，第二个字符固定
+         * 特例：希腊语带 iota 下标的字母
+         * - 第二个字符：0x0399 (GREEK CAPITAL LETTER IOTA)
+         * - 折叠第二个字符：0x03B9 (GREEK SMALL LETTER IOTA)
+         */
         if (ci->l_len == 0 &&
             ci->u_len == 2 && ci->u_data[1] == 0x399 &&
             ci->f_len == 2 && ci->f_data[1] == 0x3B9 &&
@@ -2061,6 +2121,10 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
             return;
         }
 
+        /* ----- 类型 3: U2L_399_EXT2 (大写→小写 + 0x0399 扩展) -----
+         * 模式：大写 2 字符（含 0x0399），小写 1 字符，折叠=小写
+         * 特例：希腊语带 iota 下标的字母的小写形式
+         */
         if (ci->u_len == 2 && ci->u_data[1] == 0x399 &&
             ci->l_len == 1 &&
             ci->f_len == 1 && ci->f_data[0] == ci->l_data[0]) {
@@ -2084,6 +2148,9 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
             return;
         }
 
+        /* ----- 类型 4: L (小写连续运行) -----
+         * 模式：只有小写映射，无大写和折叠，连续递增
+         */
         if (ci->l_len == 1 && ci->u_len == 0 && ci->f_len == 0) {
             len = 1;
             while (code + len <= CHARCODE_MAX) {
@@ -2100,6 +2167,13 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
             return;
         }
 
+        /* ----- 类型 5-13: 单字符特殊情况 -----
+         * 这些类型长度都为 1，用不同的编码方式优化存储
+         */
+        
+        /* 类型 5: UF_D20 (ASCII 大小写，差值 0x20)
+         * 如：A (0x41) → a (0x61), 差值 0x20
+         */
         if (ci->l_len == 0 &&
             ci->u_len == 1 &&
             ci->u_data[0] < 0x1000 &&
@@ -2107,14 +2181,18 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
             te->len = 1;
             te->type = RUN_TYPE_UF_D20;
             te->data = ci->u_data[0];
-        } else if (ci->l_len == 0 &&
+        } 
+        /* 类型 6: UF_D1_EXT (差值 1 + 扩展) */
+        else if (ci->l_len == 0 &&
                    ci->u_len == 1 &&
                    ci->f_len == 1 && ci->f_data[0] == ci->u_data[0] + 1) {
             te->len = 1;
             te->type = RUN_TYPE_UF_D1_EXT;
             te->ext_data[0] = ci->u_data[0];
             te->ext_len = 1;
-        } else if (ci->l_len == 2 && ci->u_len == 0 && ci->f_len == 2 &&
+        } 
+        /* 类型 7: LF_EXT2 (小写 + 折叠，2 扩展字符) */
+        else if (ci->l_len == 2 && ci->u_len == 0 && ci->f_len == 2 &&
                    ci->l_data[0] == ci->f_data[0] &&
                    ci->l_data[1] == ci->f_data[1]) {
             te->len = 1;
@@ -2122,7 +2200,9 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
             te->ext_data[0] = ci->l_data[0];
             te->ext_data[1] = ci->l_data[1];
             te->ext_len = 2;
-        } else if (ci->u_len == 2 && ci->l_len == 0 && ci->f_len == 2 &&
+        } 
+        /* 类型 8: UF_EXT2 (大写 + 折叠，2 扩展字符) */
+        else if (ci->u_len == 2 && ci->l_len == 0 && ci->f_len == 2 &&
                    ci->f_data[0] == simple_to_lower(tab, ci->u_data[0]) &&
                    ci->f_data[1] == simple_to_lower(tab, ci->u_data[1])) {
             te->len = 1;
@@ -2130,7 +2210,9 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
             te->ext_data[0] = ci->u_data[0];
             te->ext_data[1] = ci->u_data[1];
             te->ext_len = 2;
-        } else if (ci->u_len == 3 && ci->l_len == 0 && ci->f_len == 3 &&
+        } 
+        /* 类型 9: UF_EXT3 (大写 + 折叠，3 扩展字符) */
+        else if (ci->u_len == 3 && ci->l_len == 0 && ci->f_len == 3 &&
                    ci->f_data[0] == simple_to_lower(tab, ci->u_data[0]) &&
                    ci->f_data[1] == simple_to_lower(tab, ci->u_data[1]) &&
                    ci->f_data[2] == simple_to_lower(tab, ci->u_data[2])) {
@@ -2140,7 +2222,9 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
             te->ext_data[1] = ci->u_data[1];
             te->ext_data[2] = ci->u_data[2];
             te->ext_len = 3;
-        } else if (ci->u_len == 2 && ci->l_len == 0 && ci->f_len == 1) {
+        } 
+        /* 类型 10: 特殊连字 U+FB05 (LATIN SMALL LIGATURE LONG S T) */
+        else if (ci->u_len == 2 && ci->l_len == 0 && ci->f_len == 1) {
             // U+FB05 LATIN SMALL LIGATURE LONG S T
             assert(code == 0xFB05);
             te->len = 1;
@@ -2148,8 +2232,10 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
             te->ext_data[0] = ci->u_data[0];
             te->ext_data[1] = ci->u_data[1];
             te->ext_len = 2;
-        } else if (ci->u_len == 3 && ci->l_len == 0 && ci->f_len == 1) {
-            // U+1FD3 GREEK SMALL LETTER IOTA WITH DIALYTIKA AND OXIA or
+        } 
+        /* 类型 11: 特殊希腊字母 U+1FD3/U+1FE3 */
+        else if (ci->u_len == 3 && ci->l_len == 0 && ci->f_len == 1) {
+            // U+1FD3 GREEK SMALL LETTER IOTA WITH DIALYTIKA AND OXIA
             // U+1FE3 GREEK SMALL LETTER UPSILON WITH DIALYTIKA AND OXIA
             assert(code == 0x1FD3 || code == 0x1FE3);
             te->len = 1;
@@ -2158,13 +2244,26 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
             te->ext_data[1] = ci->u_data[1];
             te->ext_data[2] = ci->u_data[2];
             te->ext_len = 3;
-        } else {
+        } 
+        else {
             printf("unsupported encoding case:\n");
             dump_cc_info(ci, code);
-            abort();
+            abort();  // 遇到未支持的编码情况，终止
         }
-    } else {
-        /* look for a run of identical conversions */
+    } 
+    /* ========== 简单大小写情况处理 ==========
+     * 
+     * 简单情况：1:1 映射，无多字符转换
+     * 尝试查找连续相同模式的运行
+     */
+    else {
+        /* ----- 类型：UL (交替运行：小写↔大写) -----
+         * 模式：连续的小写 - 大写对，如：
+         * a (小写) → A (大写), A (大写) → a (小写)
+         * b (小写) → B (大写), B (大写) → b (小写)
+         * 
+         * 这种模式在希腊语等脚本中常见。
+         */
         len = 0;
         for(;;) {
             if (code >= CHARCODE_MAX || len >= 126)
@@ -2178,7 +2277,7 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
                 break;
             if (ci1->u_len != 1 || ci1->u_data[0] != code + len)
                 break;
-            len += 2;
+            len += 2;  // 一次处理一对
         }
         if (len > 0) {
             te->len = len;
@@ -2187,8 +2286,11 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
             return;
         }
 
+        /* ----- 类型：U 或 LF (简单大写或小写运行) -----
+         * 模式：连续的大写或小写映射，递增
+         */
         ci = &tab[code];
-        is_lower = ci->l_len > 0;
+        is_lower = ci->l_len > 0;  // 判断是小写运行还是大写运行
         len = 1;
         while (code + len <= CHARCODE_MAX) {
             ci1 = &tab[code + len];
@@ -2207,10 +2309,10 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
         }
         te->len = len;
         if (is_lower) {
-            te->type = RUN_TYPE_LF;
+            te->type = RUN_TYPE_LF;  // 小写 + 折叠相同
             te->data = ci->l_data[0];
         } else {
-            te->type = RUN_TYPE_U;
+            te->type = RUN_TYPE_U;  // 大写运行
             te->data = ci->u_data[0];
         }
     }
