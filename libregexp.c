@@ -147,6 +147,12 @@ typedef struct {
     uint8_t size;
 } REOpCode;
 
+/**
+ * reopcode_info - 正则操作码信息表
+ * 
+ * 每个条目包含操作码名称（用于调试）和字节长度。
+ * 通过 libregexp-opcode.h 中的 DEF 宏生成。
+ */
 static const REOpCode reopcode_info[REOP_COUNT] = {
 #ifdef DUMP_REOP
 #define DEF(id, size) { #id, size },
@@ -164,11 +170,25 @@ static const REOpCode reopcode_info[REOP_COUNT] = {
 
 #define RE_HEADER_LEN 8
 
+/**
+ * is_digit - 判断字符是否为数字
+ * @c: 要检查的字符
+ * 返回：1=是数字 (0-9)，0=不是数字
+ */
 static inline int is_digit(int c) {
     return c >= '0' && c <= '9';
 }
 
-/* insert 'len' bytes at position 'pos'. Return < 0 if error. */
+/**
+ * dbuf_insert - 在动态缓冲区的指定位置插入数据
+ * @s: 动态缓冲区
+ * @pos: 插入位置（字节偏移）
+ * @len: 要插入的字节数
+ * 返回：0=成功，-1=内存错误
+ * 
+ * 功能：在缓冲区的 pos 位置插入 len 个字节（填充为 0）
+ *       原有数据向后移动，缓冲区大小增加 len
+ */
 static int dbuf_insert(DynBuf *s, int pos, int len)
 {
     if (dbuf_claim(s, len))
@@ -225,6 +245,15 @@ typedef struct {
     REString **hash_table;  // 哈希表数组
 } REStringList;
 
+/**
+ * re_string_hash - 计算字符串的哈希值
+ * @len: 字符串长度（码点数量）
+ * @buf: 码点数组
+ * 返回：32 位哈希值
+ * 
+ * 算法：使用质数 263 进行多项式滚动哈希，最后乘以黄金比例常数
+ *       0x61C88647 是 2^32 / φ（黄金比例），用于打散低位模式
+ */
 static uint32_t re_string_hash(int len, const uint32_t *buf)
 {
     int i;
@@ -235,6 +264,13 @@ static uint32_t re_string_hash(int len, const uint32_t *buf)
     return h * 0x61C88647;
 }
 
+/**
+ * re_string_list_init - 初始化字符串列表
+ * @s1: 解析状态（用于获取内存分配器）
+ * @s: 要初始化的字符串列表
+ * 
+ * 功能：初始化 CharRange 和哈希表为空状态
+ */
 static void re_string_list_init(REParseState *s1, REStringList *s)
 {
     cr_init(&s->cr, s1->opaque, lre_realloc);
@@ -244,6 +280,12 @@ static void re_string_list_init(REParseState *s1, REStringList *s)
     s->hash_table = NULL;
 }
 
+/**
+ * re_string_list_free - 释放字符串列表
+ * @s: 要释放的字符串列表
+ * 
+ * 功能：释放 CharRange 和哈希表占用的所有内存
+ */
 static void re_string_list_free(REStringList *s)
 {
     REString *p, *p_next;
