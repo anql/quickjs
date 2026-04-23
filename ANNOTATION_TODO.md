@@ -344,6 +344,16 @@
 | 2026-04-23 | unicode_gen.c | 1300 | 1700 | 400 | 66,323 | 57.8% | unicode_gen.c P2 继续（is_emoji_modifier/add_sequence_prop/parse_sequence_prop_list/parse_scripts/parse_script_extensions 详细注释，Emoji 序列处理逻辑） |
 | 2026-04-23 | unicode_gen.c | 1700 | 1950 | 250 | 66,573 | 58.0% | unicode_gen.c P2 继续（dump_cc_info/dump_unicode_data/is_complicated_case/RUN_TYPE 枚举/TableEntry 结构体注释，大小写转换压缩算法说明） |
 | 2026-04-23 | unicode_gen.c | 1950 | 2300 | 350 | 66,923 | 58.3% | unicode_gen.c P2 核心（find_run_type 函数完整注释：LSU 特殊三字符/13 种复杂运行类型识别逻辑/简单 UL/U/LF 运行检测） |
+| 2026-04-23 | unicode_gen.c | 2300 | 4200 | 1900 | 68,823 | 60.0% | unicode_gen.c P2 继续（dump_case_conv_table1/find_data_index/find_ext_data_index/build_conv_table 完整注释：大小写转换表构建流程/数据索引查找/四种索引计算阶段） |
+| 2026-04-23 | unicode_gen.c | 4200 | 4400 | 200 | 69,023 | 60.2% | unicode_gen.c P2 继续（dump_case_conv_table/sp_cc_cmp/dump_case_folding_special_cases/tabcmp/dump_str 完整注释：转换表输出/大小写折叠特殊案例处理） |
+| 2026-04-23 | unicode_gen.c | 4400 | 4600 | 200 | 69,223 | 60.4% | unicode_gen.c P2 继续（compute_internal_props/dump_byte_table/dump_index_table 完整注释：内部属性计算/字节表输出/索引表输出） |
+| 2026-04-23 | unicode_gen.c | 4600 | 4800 | 200 | 69,423 | 60.6% | unicode_gen.c P2 继续（build_prop_table 完整注释：Unicode 属性表构建/RLE 压缩编码/索引块生成） |
+| 2026-04-23 | unicode_gen.c | 4800 | 5000 | 200 | 69,623 | 60.8% | unicode_gen.c P2 继续（build_flags_tables/dump_name_table/build_general_category_table 完整注释：标志表/名称表/一般分类表） |
+| 2026-04-23 | unicode_gen.c | 5000 | 5200 | 200 | 69,823 | 61.0% | unicode_gen.c P2 继续（build_script_table/build_script_ext_table/build_prop_list_table 完整注释：脚本表/脚本扩展表/属性列表表） |
+| 2026-04-23 | unicode_gen.c | 5200 | 5400 | 200 | 70,023 | 61.2% | unicode_gen.c P2 继续（is_emoji_hair_color/mark_zwj_string/zwj_encode_string 完整注释：Emoji 发色判断/ZWJ 序列标记/序列编码） |
+| 2026-04-23 | unicode_gen.c | 5400 | 5600 | 200 | 70,223 | 61.4% | unicode_gen.c P2 继续（build_rgi_emoji_zwj_sequence/build_sequence_prop_list_table 完整注释：RGI Emoji ZWJ 序列构建/序列属性表） |
+| 2026-04-23 | unicode_gen.c | 5600 | 5800 | 200 | 70,423 | 61.6% | unicode_gen.c P2 继续（build_cc_table 完整注释：组合类表构建/RLE 压缩/索引块生成） |
+| 2026-04-23 | unicode_gen.c | 5800 | 6000 | 200 | 70,623 | 61.8% | unicode_gen.c P2 继续（DecompTypeEnum/decomp_type_str/get_decomp_run_size/get_short_code/is_short/is_16bit/to_lower_simple 完整注释：分解类型枚举/游程大小计算/短编码判断） |
 
 ---
 

@@ -2318,11 +2318,17 @@ void find_run_type(TableEntry *te, CCInfo *tab, int code)
     }
 }
 
-TableEntry conv_table[1000];
-int conv_table_len;
-int ext_data[1000];
-int ext_data_len;
+/* 大小写转换表全局变量 */
+TableEntry conv_table[1000];    // 转换表条目数组
+int conv_table_len;             // 表条目数量
+int ext_data[1000];             // 扩展数据数组（用于多字符映射）
+int ext_data_len;               // 扩展数据数量
 
+/**
+ * 转储大小写转换表（调试用）
+ * 
+ * 输出格式：码点 长度 运行类型 数据 [扩展数据...]
+ */
 void dump_case_conv_table1(void)
 {
     int i, j;
@@ -2340,6 +2346,14 @@ void dump_case_conv_table1(void)
     printf("table_len=%d ext_len=%d\n", conv_table_len, ext_data_len);
 }
 
+/**
+ * 在转换表中查找数据索引
+ * 
+ * @param conv_table 转换表
+ * @param len 表长度
+ * @param data 要查找的数据（码点）
+ * @return 索引值，未找到返回 -1
+ */
 int find_data_index(const TableEntry *conv_table, int len, int data)
 {
     int i;
@@ -2352,6 +2366,14 @@ int find_data_index(const TableEntry *conv_table, int len, int data)
     return -1;
 }
 
+/**
+ * 查找或添加扩展数据索引
+ * 
+ * 扩展数据用于存储无法直接索引的多字符映射
+ * 
+ * @param data 要查找的数据
+ * @return 索引值（新添加的返回新索引）
+ */
 int find_ext_data_index(int data)
 {
     int i;
@@ -2364,6 +2386,20 @@ int find_ext_data_index(int data)
     return ext_data_len - 1;
 }
 
+/**
+ * 构建大小写转换表
+ * 
+ * 遍历所有 Unicode 码点，识别大小写转换模式，
+ * 将连续的相同模式压缩为运行（run），生成紧凑的转换表。
+ * 
+ * 处理流程：
+ * 1. 遍历所有码点，跳过无大小写变化的字符
+ * 2. 调用 find_run_type 识别运行类型
+ * 3. 为每个运行类型计算数据索引
+ * 4. 处理扩展数据（多字符映射）
+ * 
+ * @param tab Unicode 字符信息数组
+ */
 void build_conv_table(CCInfo *tab)
 {
     int code, i, j;
@@ -2373,6 +2409,7 @@ void build_conv_table(CCInfo *tab)
     te = conv_table;
     for(code = 0; code <= CHARCODE_MAX; code++) {
         ci = &tab[code];
+        // 跳过无大小写变化的字符
         if (ci->u_len == 0 && ci->l_len == 0 && ci->f_len == 0)
             continue;
         assert(te - conv_table < countof(conv_table));
@@ -2389,18 +2426,21 @@ void build_conv_table(CCInfo *tab)
     }
     conv_table_len = te - conv_table;
 
-    /* find the data index */
+    /* 第一阶段：查找数据索引 */
+    /* 为每个转换条目找到其在表中的引用位置 */
     for(i = 0; i < conv_table_len; i++) {
         int data_index;
         te = &conv_table[i];
 
         switch(te->type) {
-        case RUN_TYPE_U:
-        case RUN_TYPE_L:
-        case RUN_TYPE_UF:
-        case RUN_TYPE_LF:
+        case RUN_TYPE_U:  // 大写转换
+        case RUN_TYPE_L:  // 小写转换
+        case RUN_TYPE_UF: // 大写 + 折叠相同
+        case RUN_TYPE_LF: // 小写 + 折叠相同
+            // 在表中查找目标码点的索引
             data_index = find_data_index(conv_table, conv_table_len, te->data);
             if (data_index < 0) {
+                // 未找到，转换为扩展类型（使用 ext_data 存储）
                 switch(te->type) {
                 case RUN_TYPE_U:
                     te->type = RUN_TYPE_U_EXT;
@@ -2420,13 +2460,14 @@ void build_conv_table(CCInfo *tab)
                 te->data_index = data_index;
             }
             break;
-        case RUN_TYPE_UF_D20:
+        case RUN_TYPE_UF_D20:  // 特殊类型：数据索引直接计算
             te->data_index = te->data;
             break;
         }
     }
 
-    /* find the data index for ext_data */
+    /* 第二阶段：为 UF_EXT3 类型计算数据索引 */
+    /* 3 个扩展数据，每个占用 4 位（共 12 位） */
     for(i = 0; i < conv_table_len; i++) {
         te = &conv_table[i];
         if (te->type == RUN_TYPE_UF_EXT3) {
@@ -2434,13 +2475,15 @@ void build_conv_table(CCInfo *tab)
             v = 0;
             for(j = 0; j < 3; j++) {
                 p = find_ext_data_index(te->ext_data[j]);
-                assert(p < 16);
-                v = (v << 4) | p;
+                assert(p < 16);  // 确保在 4 位范围内
+                v = (v << 4) | p;  // 打包成 12 位索引
             }
             te->data_index = v;
         }
     }
 
+    /* 第三阶段：为 EXT2 类型计算数据索引 */
+    /* 2 个扩展数据，每个占用 6 位（共 12 位） */
     for(i = 0; i < conv_table_len; i++) {
         te = &conv_table[i];
         if (te->type == RUN_TYPE_LF_EXT2 ||
@@ -2450,13 +2493,14 @@ void build_conv_table(CCInfo *tab)
             v = 0;
             for(j = 0; j < 2; j++) {
                 p = find_ext_data_index(te->ext_data[j]);
-                assert(p < 64);
-                v = (v << 6) | p;
+                assert(p < 64);  // 确保在 6 位范围内
+                v = (v << 6) | p;  // 打包成 12 位索引
             }
             te->data_index = v;
         }
     }
 
+    /* 第四阶段：为单扩展类型计算数据索引 */
     for(i = 0; i < conv_table_len; i++) {
         te = &conv_table[i];
         if (te->type == RUN_TYPE_UF_D1_EXT ||
@@ -2470,6 +2514,16 @@ void build_conv_table(CCInfo *tab)
 #endif
 }
 
+/**
+ * 输出大小写转换表到 C 文件
+ * 
+ * 生成三个表：
+ * 1. case_conv_table1: 主表（32 位/条目），包含码点、长度、类型、数据索引高 8 位
+ * 2. case_conv_table2: 辅表（8 位/条目），包含数据索引低 8 位
+ * 3. case_conv_ext: 扩展数据表（16 位/条目）
+ * 
+ * @param f 输出文件指针
+ */
 void dump_case_conv_table(FILE *f)
 {
     int i;
@@ -2483,6 +2537,7 @@ void dump_case_conv_table(FILE *f)
         if (i % 4 == 0)
             fprintf(f, "\n   ");
         te = &conv_table[i];
+        // 编码格式：[17 位码点][7 位长度][4 位类型][4 位数据索引高 8 位]
         v = te->code << (32 - 17);
         v |= te->len << (32 - 17 - 7);
         v |= te->type << (32 - 17 - 7 - 4);
@@ -2491,6 +2546,7 @@ void dump_case_conv_table(FILE *f)
     }
     fprintf(f, "\n};\n\n");
 
+    // 输出表 2：数据索引低 8 位
     total_tables++;
     total_table_bytes += conv_table_len;
     fprintf(f, "static const uint8_t case_conv_table2[%d] = {", conv_table_len);
@@ -2502,6 +2558,7 @@ void dump_case_conv_table(FILE *f)
     }
     fprintf(f, "\n};\n\n");
 
+    // 输出扩展数据表
     total_tables++;
     total_table_bytes += ext_data_len * sizeof(uint16_t);
     fprintf(f, "static const uint16_t case_conv_ext[%d] = {", ext_data_len);
@@ -2514,8 +2571,17 @@ void dump_case_conv_table(FILE *f)
 }
 
 
-static CCInfo *global_tab;
+static CCInfo *global_tab;  // 全局字符信息表（用于排序比较）
 
+/**
+ * 大小写折叠比较函数（用于 qsort）
+ * 
+ * 按折叠长度和折叠数据排序，将相同折叠结果的字符排在一起
+ * 
+ * @param p1 第一个字符的索引指针
+ * @param p2 第二个字符的索引指针
+ * @return 比较结果（-1/0/1）
+ */
 static int sp_cc_cmp(const void *p1, const void *p2)
 {
     CCInfo *c1 = &global_tab[*(const int *)p1];
@@ -2529,8 +2595,18 @@ static int sp_cc_cmp(const void *p1, const void *p2)
     }
 }
 
-/* dump the case special cases (multi character results which are
-   identical and need specific handling in lre_canonicalize() */
+/**
+ * 转储大小写折叠特殊案例
+ * 
+ * 识别并输出多字符折叠结果相同的字符，这些需要在 lre_canonicalize() 中特殊处理
+ * 
+ * 处理流程：
+ * 1. 创建排列数组并排序（按折叠结果分组）
+ * 2. 查找折叠长度>1 且折叠结果相同的字符组
+ * 3. 输出这些特殊案例供调试
+ * 
+ * @param tab Unicode 字符信息数组
+ */
 void dump_case_folding_special_cases(CCInfo *tab)
 {
     int i, len, j;
@@ -2540,16 +2616,19 @@ void dump_case_folding_special_cases(CCInfo *tab)
     for(i = 0; i <= CHARCODE_MAX; i++)
         perm[i] = i;
     global_tab = tab;
+    // 按折叠结果排序，相同结果的会排在一起
     qsort(perm, CHARCODE_MAX + 1, sizeof(perm[0]), sp_cc_cmp);
     for(i = 0; i <= CHARCODE_MAX;) {
         if (tab[perm[i]].f_len <= 1) {
             i++;
         } else {
+            // 查找相同折叠结果的连续范围
             len = 1;
             while ((i + len) <= CHARCODE_MAX && !sp_cc_cmp(&perm[i], &perm[i + len]))
                 len++;
 
             if (len > 1) {
+                // 输出多字符折叠的特殊案例
                 for(j = i; j < i + len; j++)
                     dump_cc_info(&tab[perm[j]], perm[j]);
             }
@@ -2561,6 +2640,14 @@ void dump_case_folding_special_cases(CCInfo *tab)
 }
 
 
+/**
+ * 比较两个整数数组
+ * 
+ * @param tab1 第一个数组
+ * @param tab2 第二个数组
+ * @param n 数组长度
+ * @return 0 表示相同，-1 表示不同
+ */
 int tabcmp(const int *tab1, const int *tab2, int n)
 {
     int i;
@@ -2571,6 +2658,13 @@ int tabcmp(const int *tab1, const int *tab2, int n)
     return 0;
 }
 
+/**
+ * 转储字符串（调试用）
+ * 
+ * @param str 标签名称
+ * @param buf 字符缓冲区（码点数组）
+ * @param len 缓冲区长度
+ */
 void dump_str(const char *str, const int *buf, int len)
 {
     int i;
@@ -2580,6 +2674,18 @@ void dump_str(const char *str, const int *buf, int len)
     printf("\n");
 }
 
+/**
+ * 计算内部属性
+ * 
+ * 为优化表大小，计算原始属性与派生属性的差异值。
+ * 这样只需要存储变化的部分，减少表大小。
+ * 
+ * 计算的属性包括：
+ * - Cased1: Cased 属性的差异（无大小写变化时）
+ * - ID_Continue1: ID_Continue & ~ID_Start
+ * - XID_Start1/XID_Continue1: 扩展标识符的差异
+ * - Changes_When_*1: 各种变化属性的差异
+ */
 void compute_internal_props(void)
 {
     int i;
@@ -2589,21 +2695,29 @@ void compute_internal_props(void)
         CCInfo *ci = &unicode_db[i];
         has_ul = (ci->u_len != 0 || ci->l_len != 0 || ci->f_len != 0);
         if (has_ul) {
+            // 有大小写变化的字符必然有 Cased 属性
             assert(get_prop(i, PROP_Cased));
         } else {
+            // 无大小写变化时，存储 Cased 的差异值
             set_prop(i, PROP_Cased1, get_prop(i, PROP_Cased));
         }
+        // ID_Continue1 = ID_Continue AND (NOT ID_Start)
         set_prop(i, PROP_ID_Continue1,
                  get_prop(i, PROP_ID_Continue) & (get_prop(i, PROP_ID_Start) ^ 1));
+        // XID_Start1 = ID_Start XOR XID_Start（差异值）
         set_prop(i, PROP_XID_Start1,
                  get_prop(i, PROP_ID_Start) ^ get_prop(i, PROP_XID_Start));
+        // XID_Continue1 = ID_Continue XOR XID_Continue（差异值）
         set_prop(i, PROP_XID_Continue1,
                  get_prop(i, PROP_ID_Continue) ^ get_prop(i, PROP_XID_Continue));
+        // 标题化变化差异
         set_prop(i, PROP_Changes_When_Titlecased1,
                  get_prop(i, PROP_Changes_When_Titlecased) ^ (ci->u_len != 0));
+        // 大小写折叠变化差异
         set_prop(i, PROP_Changes_When_Casefolded1,
                  get_prop(i, PROP_Changes_When_Casefolded) ^ (ci->f_len != 0));
         /* XXX: reduce table size (438 bytes) */
+        // NFKC 折叠变化差异
         set_prop(i, PROP_Changes_When_NFKC_Casefolded1,
                  get_prop(i, PROP_Changes_When_NFKC_Casefolded) ^ (ci->f_len != 0));
 #if 0
@@ -2621,6 +2735,14 @@ void compute_internal_props(void)
     }
 }
 
+/**
+ * 输出字节表到 C 文件
+ * 
+ * @param f 输出文件指针
+ * @param cname 表名称
+ * @param tab 数据表
+ * @param len 表长度
+ */
 void dump_byte_table(FILE *f, const char *cname, const uint8_t *tab, int len)
 {
     int i;
@@ -2636,6 +2758,17 @@ void dump_byte_table(FILE *f, const char *cname, const uint8_t *tab, int len)
     fprintf(f, "\n};\n\n");
 }
 
+/**
+ * 输出索引表到 C 文件
+ * 
+ * 索引表用于快速定位属性表中的位置。
+ * 每 3 个字节编码：[21 位码点][11 位偏移]
+ * 
+ * @param f 输出文件指针
+ * @param cname 表名称
+ * @param tab 数据表
+ * @param len 表长度
+ */
 void dump_index_table(FILE *f, const char *cname, const uint8_t *tab, int len)
 {
     int i, code, offset;
@@ -2644,6 +2777,7 @@ void dump_index_table(FILE *f, const char *cname, const uint8_t *tab, int len)
     total_index_bytes += len;
     fprintf(f, "static const uint8_t %s[%d] = {\n", cname, len);
     for(i = 0; i < len; i += 3) {
+        // 解码：3 字节 = 21 位码点 + 11 位偏移
         code = tab[i] + (tab[i+1] << 8) + ((tab[i+2] & 0x1f) << 16);
         offset = ((i / 3) + 1) * 32 + (tab[i+2] >> 5);
         fprintf(f, "    0x%02x, 0x%02x, 0x%02x,", tab[i], tab[i+1], tab[i+2]);
@@ -2653,8 +2787,24 @@ void dump_index_table(FILE *f, const char *cname, const uint8_t *tab, int len)
     fprintf(f, "};\n\n");
 }
 
-#define PROP_BLOCK_LEN 32
+#define PROP_BLOCK_LEN 32  // 属性表索引块大小
 
+/**
+ * 构建 Unicode 属性表
+ * 
+ * 使用游程编码（RLE）压缩属性数据。
+ * 编码格式：
+ * - 00..3F: 2 个打包长度（3 位 + 3 位）
+ * - 40..5F: 5 位 + 1 字节额外长度
+ * - 60..7F: 5 位 + 2 字节额外长度
+ * - 80..FF: 7 位长度
+ * 长度需要 +1 得到实际字符数，真假值交替。
+ * 
+ * @param f 输出文件指针
+ * @param name 属性名称
+ * @param prop_index 属性索引
+ * @param add_index 是否添加索引表（用于快速查找）
+ */
 void build_prop_table(FILE *f, const char *name, int prop_index, BOOL add_index)
 {
     int i, j, n, v, offset, code;
@@ -2667,17 +2817,17 @@ void build_prop_table(FILE *f, const char *name, int prop_index, BOOL add_index)
 
     dbuf_init(dbuf1);
 
+    // 第一阶段：收集游程长度
     for(i = 0; i <= CHARCODE_MAX;) {
         v = get_prop(i, prop_index);
         j = i + 1;
         while (j <= CHARCODE_MAX && get_prop(j, prop_index) == v) {
             j++;
         }
-        n = j - i;
+        n = j - i;  // 游程长度
         if (j == (CHARCODE_MAX + 1) && v == 0)
-            break; /* no need to encode last zero run */
-        //printf("%05x: %d %d\n", i, n, v);
-        dbuf_put_u32(dbuf1, n - 1);
+            break; /* 最后一个 0 游程不需要编码 */
+        dbuf_put_u32(dbuf1, n - 1);  // 存储长度 -1
         i += n;
     }
 
@@ -2686,51 +2836,56 @@ void build_prop_table(FILE *f, const char *name, int prop_index, BOOL add_index)
     buf = (uint32_t *)dbuf1->buf;
     buf_len = dbuf1->size / sizeof(buf[0]);
 
-    /* the first value is assumed to be 0 */
+    /* 第一个值假设为 0 */
     assert(get_prop(0, prop_index) == 0);
 
     block_end_pos = PROP_BLOCK_LEN;
     i = 0;
-    code = 0;
-    bit = 0;
+    code = 0;  // 当前码点位置
+    bit = 0;   // 当前属性值（0/1 交替）
     while (i < buf_len) {
+        // 添加索引条目（每 32 个字符块）
         if (add_index && dbuf->size >= block_end_pos && bit == 0) {
             offset = (dbuf->size - block_end_pos);
             /* XXX: offset could be larger in case of runs of small
                lengths. Could add code to change the encoding to
                prevent it at the expense of one byte loss */
             assert(offset <= 7);
-            v = code | (offset << 21);
+            v = code | (offset << 21);  // [21 位码点][11 位偏移]
             dbuf_putc(dbuf2, v);
             dbuf_putc(dbuf2, v >> 8);
             dbuf_putc(dbuf2, v >> 16);
             block_end_pos += PROP_BLOCK_LEN;
         }
 
-        /* Compressed byte encoding:
-           00..3F: 2 packed lengths: 3-bit + 3-bit
-           40..5F: 5-bits plus extra byte for length
-           60..7F: 5-bits plus 2 extra bytes for length
-           80..FF: 7-bit length
-           lengths must be incremented to get character count
-           Ranges alternate between false and true return value.
+        /* 压缩字节编码：
+           00..3F: 2 个打包长度：3 位 + 3 位
+           40..5F: 5 位 + 1 字节额外长度
+           60..7F: 5 位 + 2 字节额外长度
+           80..FF: 7 位长度
+           长度需要 +1 得到实际字符数
+           范围在 false 和 true 返回值之间交替
          */
         v = buf[i];
         code += v + 1;
         bit ^= 1;
         if (v < 8 && (i + 1) < buf_len && buf[i + 1] < 8) {
+            // 两个短游程打包成一个字节
             code += buf[i + 1] + 1;
             bit ^= 1;
             dbuf_putc(dbuf, (v << 3) | buf[i + 1]);
             i += 2;
         } else if (v < 128) {
+            // 单字节编码：0x80-0xFF 表示 0-127
             dbuf_putc(dbuf, 0x80 + v);
             i++;
         } else if (v < (1 << 13)) {
+            // 双字节编码：0x40-0x5F + 1 字节
             dbuf_putc(dbuf, 0x40 + (v >> 8));
             dbuf_putc(dbuf, v);
             i++;
         } else {
+            // 三字节编码：0x60-0x7F + 2 字节
             assert(v < (1 << 21));
             dbuf_putc(dbuf, 0x60 + (v >> 16));
             dbuf_putc(dbuf, v >> 8);
@@ -2740,7 +2895,7 @@ void build_prop_table(FILE *f, const char *name, int prop_index, BOOL add_index)
     }
 
     if (add_index) {
-        /* last index entry */
+        /* 添加最后一个索引条目（上界） */
         v = code;
         dbuf_putc(dbuf2, v);
         dbuf_putc(dbuf2, v >> 8);
@@ -2763,6 +2918,17 @@ void build_prop_table(FILE *f, const char *name, int prop_index, BOOL add_index)
     dbuf_free(dbuf2);
 }
 
+/**
+ * 构建所有标志表
+ * 
+ * 生成以下属性表：
+ * - Cased1: 有大小写变化的字符
+ * - Case_Ignorable: 大小写可忽略字符
+ * - ID_Start: 标识符起始字符
+ * - ID_Continue1: 标识符继续字符（非起始）
+ * 
+ * @param f 输出文件指针
+ */
 void build_flags_tables(FILE *f)
 {
     build_prop_table(f, "Cased1", PROP_Cased1, TRUE);
@@ -2799,6 +2965,21 @@ void dump_name_table(FILE *f, const char *cname, const char **tab_name, int len,
     fprintf(f, ";\n\n");
 }
 
+/**
+ * 构建一般分类表（General Category Table）
+ * 
+ * Unicode 一般分类（GC）将字符分为 30+ 个类别，如：
+ * - Lu: 大写字母 (Letter, uppercase)
+ * - Ll: 小写字母 (Letter, lowercase)
+ * - Nd: 十进制数字 (Number, decimal digit)
+ * - 等等
+ * 
+ * 压缩策略：
+ * - Lu/Ll 交替运行合并为特殊类型 31
+ * - 游程长度编码：1 字节或 2-4 字节变长
+ * 
+ * @param f 输出文件指针
+ */
 void build_general_category_table(FILE *f)
 {
     int i, v, j, n, n1;
@@ -2807,12 +2988,14 @@ void build_general_category_table(FILE *f)
     int cw_count, cw_len_count[4], cw_start;
 #endif
 
+    // 输出枚举定义
     fprintf(f, "typedef enum {\n");
     for(i = 0; i < GCAT_COUNT; i++)
         fprintf(f, "    UNICODE_GC_%s,\n", unicode_gc_name[i]);
     fprintf(f, "    UNICODE_GC_COUNT,\n");
     fprintf(f, "} UnicodeGCEnum;\n\n");
 
+    // 输出类别名称表
     dump_name_table(f, "unicode_gc_name_table",
                     unicode_gc_name, GCAT_COUNT,
                     unicode_gc_short_name);
@@ -2829,42 +3012,52 @@ void build_general_category_table(FILE *f)
         j = i + 1;
         while (j <= CHARCODE_MAX && unicode_db[j].general_category == v)
             j++;
-        n = j - i;
-        /* compress Lu/Ll runs */
+        n = j - i;  // 游程长度
+        /* 压缩 Lu/Ll 交替运行（大写字母后跟小写字母的模式） */
         if (v == GCAT_Lu) {
             n1 = 1;
+            // 检查是否是 Lu/Ll 交替模式（v + (n1 & 1) 会在 Lu 和 Ll 之间切换）
             while ((i + n1) <= CHARCODE_MAX && unicode_db[i + n1].general_category == (v + (n1 & 1))) {
                 n1++;
             }
             if (n1 > n) {
-                v = 31;
+                v = 31;  // 特殊类型：Lu/Ll 交替
                 n = n1;
             }
         }
-        //        printf("%05x %05x %d\n", i, n, v);
-        n--;
+        n--;  // 存储长度 -1
 #ifdef DUMP_TABLE_SIZE
         cw_count++;
         cw_start = dbuf->size;
 #endif
+        /* 游程长度编码：
+           n < 7:       1 字节 [5 位长度][5 位类别]
+           n < 135:     2 字节 [1111 前缀][5 位类别][8 位扩展长度]
+           n < 16519:   3 字节 [1111 前缀][5 位类别][14 位扩展长度]
+           n < 4210847: 4 字节 [1111 前缀][5 位类别][22 位扩展长度]
+         */
         if (n < 7) {
+            // 短游程：1 字节编码
             dbuf_putc(dbuf, (n << 5) | v);
         } else if (n < 7 + 128) {
+            // 中等游程：2 字节编码
             n1 = n - 7;
             assert(n1 < 128);
-            dbuf_putc(dbuf, (0xf << 5) | v);
+            dbuf_putc(dbuf, (0xf << 5) | v);  // 前缀 1111
             dbuf_putc(dbuf, n1);
         } else if (n < 7 + 128 + (1 << 14)) {
+            // 长游程：3 字节编码
             n1 = n - (7 + 128);
             assert(n1 < (1 << 14));
             dbuf_putc(dbuf, (0xf << 5) | v);
-            dbuf_putc(dbuf, (n1 >> 8) + 128);
+            dbuf_putc(dbuf, (n1 >> 8) + 128);  // 高字节标记
             dbuf_putc(dbuf, n1);
         } else {
+            // 超长游程：4 字节编码
             n1 = n - (7 + 128 + (1 << 14));
             assert(n1 < (1 << 22));
             dbuf_putc(dbuf, (0xf << 5) | v);
-            dbuf_putc(dbuf, (n1 >> 16) + 128 + 64);
+            dbuf_putc(dbuf, (n1 >> 16) + 128 + 64);  // 高字节标记
             dbuf_putc(dbuf, n1 >> 8);
             dbuf_putc(dbuf, n1);
         }
@@ -2885,6 +3078,23 @@ void build_general_category_table(FILE *f)
     dbuf_free(dbuf);
 }
 
+/**
+ * 构建脚本表（Script Table）
+ * 
+ * Unicode 脚本（Script）表示字符所属的书写系统，如：
+ * - Latin: 拉丁字母
+ * - Han: 汉字
+ * - Arabic: 阿拉伯文
+ * - Cyrillic: 西里尔字母
+ * - 等等（共 150+ 种脚本）
+ * 
+ * 压缩策略：
+ * - type=0: 常见脚本（通常是 Unknown/Common/Inherited）
+ * - type=1: 需要显式存储脚本 ID
+ * - 游程长度编码：1-3 字节变长
+ * 
+ * @param f 输出文件指针
+ */
 void build_script_table(FILE *f)
 {
     int i, v, j, n, n1, type;
@@ -2893,12 +3103,14 @@ void build_script_table(FILE *f)
     int cw_count, cw_len_count[4], cw_start;
 #endif
 
+    // 输出脚本枚举定义
     fprintf(f, "typedef enum {\n");
     for(i = 0; i < SCRIPT_COUNT; i++)
         fprintf(f, "    UNICODE_SCRIPT_%s,\n", unicode_script_name[i]);
     fprintf(f, "    UNICODE_SCRIPT_COUNT,\n");
     fprintf(f, "} UnicodeScriptEnum;\n\n");
 
+    // 输出脚本名称表
     dump_name_table(f, "unicode_script_name_table",
                     unicode_script_name, SCRIPT_COUNT,
                     unicode_script_short_name);
@@ -2923,24 +3135,36 @@ void build_script_table(FILE *f)
         cw_count++;
         cw_start = dbuf->size;
 #endif
+        /* 脚本表编码：
+           type=0: 常见脚本（不需要存储脚本 ID）
+           type=1: 需要显式存储脚本 ID
+           
+           n < 96:       1 字节 [7 位长度][1 位类型]
+           n < 4192:     2 字节 [7 位前缀][1 位类型][8 位扩展长度] + [脚本 ID]
+           n < 1090592:  3 字节 [7 位前缀][1 位类型][20 位扩展长度] + [脚本 ID]
+         */
         if (v == 0)
-            type = 0;
+            type = 0;  // 常见脚本（Unknown/Common）
         else
-            type = 1;
+            type = 1;  // 需要存储脚本 ID
         if (n < 96) {
+            // 短游程：1 字节
             dbuf_putc(dbuf, n | (type << 7));
         } else if (n < 96 + (1 << 12)) {
+            // 中等游程：2 字节 + 脚本 ID
             n1 = n - 96;
             assert(n1 < (1 << 12));
             dbuf_putc(dbuf, ((n1 >> 8) + 96) | (type << 7));
             dbuf_putc(dbuf, n1);
         } else {
+            // 长游程：3 字节 + 脚本 ID
             n1 = n - (96 + (1 << 12));
             assert(n1 < (1 << 20));
             dbuf_putc(dbuf, ((n1 >> 16) + 112) | (type << 7));
             dbuf_putc(dbuf, n1 >> 8);
             dbuf_putc(dbuf, n1);
         }
+        // type=1 时需要存储脚本 ID
         if (type != 0)
             dbuf_putc(dbuf, v);
 
@@ -2961,6 +3185,17 @@ void build_script_table(FILE *f)
     dbuf_free(dbuf);
 }
 
+/**
+ * 构建脚本扩展表（Script Extensions Table）
+ * 
+ * 脚本扩展（Script_Extension）表示字符可以被多个脚本共用。
+ * 例如：某些标点符号可以被 Latin、Cyrillic、Greek 等多个脚本使用。
+ * 
+ * 存储格式：
+ * [游程长度 1-3 字节][扩展长度 1 字节][脚本 ID 列表]
+ * 
+ * @param f 输出文件指针
+ */
 void build_script_ext_table(FILE *f)
 {
     int i, j, n, n1, script_ext_len;
@@ -2973,6 +3208,7 @@ void build_script_ext_table(FILE *f)
     for(i = 0; i <= CHARCODE_MAX;) {
         script_ext_len = unicode_db[i].script_ext_len;
         j = i + 1;
+        // 查找具有相同脚本扩展的连续范围
         while (j <= CHARCODE_MAX &&
                unicode_db[j].script_ext_len == script_ext_len &&
                !memcmp(unicode_db[j].script_ext, unicode_db[i].script_ext,
@@ -2980,24 +3216,26 @@ void build_script_ext_table(FILE *f)
             j++;
         }
         n = j - i;
-#if defined(DUMP_TABLE_SIZE)
-        cw_count++;
-#endif
-        n--;
+        n--;  // 存储长度 -1
+        /* 游程长度编码 */
         if (n < 128) {
+            // 短游程：1 字节
             dbuf_putc(dbuf, n);
         } else if (n < 128 + (1 << 14)) {
+            // 中等游程：2 字节
             n1 = n - 128;
             assert(n1 < (1 << 14));
             dbuf_putc(dbuf, (n1 >> 8) + 128);
             dbuf_putc(dbuf, n1);
         } else {
+            // 长游程：3 字节
             n1 = n - (128 + (1 << 14));
             assert(n1 < (1 << 22));
             dbuf_putc(dbuf, (n1 >> 16) + 128 + 64);
             dbuf_putc(dbuf, n1 >> 8);
             dbuf_putc(dbuf, n1);
         }
+        // 存储脚本扩展数据
         dbuf_putc(dbuf, script_ext_len);
         for(j = 0; j < script_ext_len; j++)
             dbuf_putc(dbuf, unicode_db[i].script_ext[j]);
@@ -3016,37 +3254,50 @@ void build_script_ext_table(FILE *f)
 /* the following properties are synthetized so no table is necessary */
 #define PROP_TABLE_COUNT PROP_ASCII
 
+/**
+ * 构建属性列表表（Property List Table）
+ * 
+ * 生成所有 Unicode 二元属性表（如 ASCII_Hex_Digit, White_Space 等）
+ * 以及相关的枚举和查找表。
+ * 
+ * @param f 输出文件指针
+ */
 void build_prop_list_table(FILE *f)
 {
     int i;
 
+    // 为每个属性生成压缩表
     for(i = 0; i < PROP_TABLE_COUNT; i++) {
         if (i == PROP_ID_Start ||
             i == PROP_Case_Ignorable ||
             i == PROP_ID_Continue1) {
-            /* already generated */
+            /* 这些属性已经在 build_flags_tables 中生成 */
         } else {
             build_prop_table(f, unicode_prop_name[i], i, FALSE);
         }
     }
 
+    // 输出属性枚举定义
     fprintf(f, "typedef enum {\n");
     for(i = 0; i < PROP_COUNT; i++)
         fprintf(f, "    UNICODE_PROP_%s,\n", unicode_prop_name[i]);
     fprintf(f, "    UNICODE_PROP_COUNT,\n");
     fprintf(f, "} UnicodePropertyEnum;\n\n");
 
+    // 输出属性名称表（从 ASCII_Hex_Digit 开始）
     i = PROP_ASCII_Hex_Digit;
     dump_name_table(f, "unicode_prop_name_table",
                     unicode_prop_name + i, PROP_XID_Start - i + 1,
                     unicode_prop_short_name + i);
 
+    // 输出属性表指针数组
     fprintf(f, "static const uint8_t * const unicode_prop_table[] = {\n");
     for(i = 0; i < PROP_TABLE_COUNT; i++) {
         fprintf(f, "    unicode_prop_%s_table,\n", unicode_prop_name[i]);
     }
     fprintf(f, "};\n\n");
 
+    // 输出属性表长度数组
     fprintf(f, "static const uint16_t unicode_prop_len_table[] = {\n");
     for(i = 0; i < PROP_TABLE_COUNT; i++) {
         fprintf(f, "    countof(unicode_prop_%s_table),\n", unicode_prop_name[i]);
@@ -3054,61 +3305,89 @@ void build_prop_list_table(FILE *f)
     fprintf(f, "};\n\n");
 }
 
+/**
+ * 判断是否为 Emoji 发色字符
+ * 
+ * 发色字符范围：U+1F9B0..U+1F9B3
+ * - 1F9B0: 🦰 红发
+ * - 1F9B1: 🦱 卷发
+ * - 1F9B2: 🦲 秃头
+ * - 1F9B3: 🦳 白发
+ * 
+ * @param c 字符码点
+ * @return TRUE 表示是发色字符
+ */
 static BOOL is_emoji_hair_color(uint32_t c)
 {
     return (c >= 0x1F9B0 && c <= 0x1F9B3);
 }
 
-#define EMOJI_MOD_NONE   0
-#define EMOJI_MOD_TYPE1  1
-#define EMOJI_MOD_TYPE2  2
-#define EMOJI_MOD_TYPE2D 3
+/* Emoji 修饰符类型 */
+#define EMOJI_MOD_NONE   0  // 无修饰符
+#define EMOJI_MOD_TYPE1  1  // 单皮肤修饰符（5 种肤色）
+#define EMOJI_MOD_TYPE2  2  // 双皮肤修饰符（25 种组合）
+#define EMOJI_MOD_TYPE2D 3  // 双皮肤修饰符（去重，20 种组合）
 
+/**
+ * 标记 ZWJ（零宽连接符）Emoji 序列
+ * 
+ * 检查并标记所有相关的 Emoji 变体序列，包括：
+ * - 皮肤修饰符变体（5 种肤色）
+ * - 发色变体（4 种发色）
+ * - 组合变体
+ * 
+ * @param sl 字符串列表（哈希表）
+ * @param buf 字符缓冲区
+ * @param len 缓冲区长度
+ * @param mod_type 修饰符类型
+ * @param mod_pos 修饰符位置数组
+ * @param hc_pos 发色字符位置（-1 表示无）
+ * @param mark_flag TRUE 表示标记，FALSE 表示检查
+ * @return TRUE 表示所有变体都存在
+ */
 static BOOL mark_zwj_string(REStringList *sl, uint32_t *buf, int len, int mod_type, int *mod_pos,
                             int hc_pos, BOOL mark_flag)
 {
     REString *p;
     int i, n_mod, i0, i1, hc_count, j;
 
-#if 0
-    if (mark_flag)
-        printf("mod_type=%d\n", mod_type);
-#endif
-    
+    // 计算变体数量
     switch(mod_type) {
     case EMOJI_MOD_NONE:
-        n_mod = 1;
+        n_mod = 1;  // 无修饰符
         break;
     case EMOJI_MOD_TYPE1:
-        n_mod = 5;
+        n_mod = 5;  // 5 种肤色
         break;
     case EMOJI_MOD_TYPE2:
-        n_mod = 25;
+        n_mod = 25; // 5x5=25 种双肤色组合
         break;
     case EMOJI_MOD_TYPE2D:
-        n_mod = 20;
+        n_mod = 20; // 去重后的双肤色组合（排除相同肤色）
         break;
     default:
         assert(0);
     }
+    // 计算发色变体数量
     if (hc_pos >= 0)
-        hc_count = 4;
+        hc_count = 4;  // 4 种发色
     else
         hc_count = 1;
-    /* check that all the related strings are present */
+    /* 检查所有相关字符串是否存在 */
     for(j = 0; j < hc_count; j++) {
         for(i = 0; i < n_mod; i++) {
+            // 生成变体字符
             switch(mod_type) {
             case EMOJI_MOD_NONE:
                 break;
             case EMOJI_MOD_TYPE1:
-                buf[mod_pos[0]] = 0x1f3fb + i;
+                buf[mod_pos[0]] = 0x1f3fb + i;  // 肤色修饰符
                 break;
             case EMOJI_MOD_TYPE2:
             case EMOJI_MOD_TYPE2D:
                 i0 = i / 5;
                 i1 = i % 5;
-                /* avoid identical values */
+                /* 避免相同值（TYPE2D 模式） */
                 if (mod_type == EMOJI_MOD_TYPE2D && i0 >= i1)
                     i0++;
                 buf[mod_pos[0]] = 0x1f3fb + i0;
@@ -3118,19 +3397,39 @@ static BOOL mark_zwj_string(REStringList *sl, uint32_t *buf, int len, int mod_ty
                 assert(0);
             }
 
+            // 设置发色字符
             if (hc_pos >= 0)
                 buf[hc_pos] = 0x1F9B0 + j;
             
+            // 查找字符串
             p = re_string_find(sl, len, buf, FALSE);
             if (!p)
                 return FALSE;
             if (mark_flag)
-                p->flags |= 1;
+                p->flags |= 1;  // 标记为已处理
         }
     }
     return TRUE;
 }
 
+/**
+ * 编码 ZWJ Emoji 序列
+ * 
+ * 将 Unicode 字符序列压缩编码为紧凑格式：
+ * - 基本字符：13 位码点（偏移编码）
+ * - 修饰符标志：3 位类型
+ * - 呈现选择器标志：1 位
+ * 
+ * 编码格式：每字符 2 字节 [低 8 位][高 8 位]
+ * 前置长度字节表示字符数
+ * 
+ * @param dbuf 输出缓冲区
+ * @param buf 输入字符缓冲区
+ * @param len 缓冲区长度
+ * @param mod_type 修饰符类型
+ * @param mod_pos 修饰符位置数组
+ * @param hc_pos 发色字符位置
+ */
 static void zwj_encode_string(DynBuf *dbuf, const uint32_t *buf, int len, int mod_type, int *mod_pos,
                               int hc_pos)
 {
@@ -3141,30 +3440,32 @@ static void zwj_encode_string(DynBuf *dbuf, const uint32_t *buf, int len, int mo
     j = 0;
     for(i = 0; i < len;) {
         c = buf[i++];
+        // 编码字符码点（压缩格式）
         if (c >= 0x2000 && c <= 0x2fff) {
-            code = c - 0x2000;
+            code = c - 0x2000;  // 常用符号区
         } else if (c >= 0x1f000 && c <= 0x1ffff) {
-            code = c - 0x1f000 + 0x1000;
+            code = c - 0x1f000 + 0x1000;  // Emoji 区
         } else {
             assert(0);
         }
+        // 检查是否有皮肤修饰符
         if (i < len && is_emoji_modifier(buf[i])) {
-            /* modifier */
-            code |= (mod_type << 13);
+            code |= (mod_type << 13);  // 添加修饰符类型标志
             i++;
         }
+        // 检查是否有呈现选择器（U+FE0F）
         if (i < len && buf[i] == 0xfe0f) {
-            /* presentation selector present */
-            code |= 0x8000;
+            code |= 0x8000;  // 添加呈现选择器标志
             i++;
         }
+        // 检查是否有 ZWJ（零宽连接符 U+200D）
         if (i < len) {
-            /* zero width join */
             assert(buf[i] == 0x200d);
             i++;
         }
         buf1[j++] = code;
     }
+    // 输出长度 + 编码数据
     dbuf_putc(dbuf, j);
     for(i = 0; i < j; i++) {
         dbuf_putc(dbuf, buf1[i]);
@@ -3172,6 +3473,25 @@ static void zwj_encode_string(DynBuf *dbuf, const uint32_t *buf, int len, int mo
     }
 }
 
+/**
+ * 构建 RGI（Recommended for General Interchange）Emoji ZWJ 序列表
+ * 
+ * RGI Emoji 是 Unicode 联盟推荐用于通用交换的 Emoji 序列。
+ * 本函数处理所有 ZWJ 连接序列，包括：
+ * - 家庭序列（👨‍👩‍👧‍👦 等）
+ * - 职业序列（👨‍⚕️ 等）
+ * - 国旗序列（🏴󠁧󠁢󠁥󠁮󠁧󠁿 等）
+ * - 其他多字符组合
+ * 
+ * 处理流程：
+ * 1. 遍历所有 ZWJ 序列
+ * 2. 识别皮肤修饰符和发色字符
+ * 3. 标记所有相关变体（避免重复）
+ * 4. 编码为紧凑格式
+ * 
+ * @param f 输出文件指针
+ * @param sl ZWJ 序列字符串列表
+ */
 static void build_rgi_emoji_zwj_sequence(FILE *f, REStringList *sl)
 {
     int mod_pos[2], mod_count, hair_color_pos, j, h;
@@ -3179,32 +3499,19 @@ static void build_rgi_emoji_zwj_sequence(FILE *f, REStringList *sl)
     uint32_t buf[SEQ_MAX_LEN];
     DynBuf dbuf;
 
-#if 0
-    {
-        for(h = 0; h < sl->hash_size; h++) {
-            for(p = sl->hash_table[h]; p != NULL; p = p->next) {
-                for(j = 0; j < p->len; j++)
-                    printf(" %04x", p->buf[j]);
-                printf("\n");
-            }
-        }
-        exit(0);
-    }
-#endif
-    //    printf("rgi_emoji_zwj_sequence: n=%d\n", sl->n_strings);
-
     dbuf_init(&dbuf);
     
-    /* avoid duplicating strings with emoji modifiers or hair colors */
+    /* 遍历所有 ZWJ 序列，避免重复处理有修饰符或发色的字符串 */
     for(h = 0; h < sl->hash_size; h++) {
         for(p = sl->hash_table[h]; p != NULL; p = p->next) {
-            if (p->flags) /* already examined */
+            if (p->flags) /* 已检查过 */
                 continue;
             mod_count = 0;
             hair_color_pos = -1;
+            // 扫描字符串，识别修饰符和发色字符位置
             for(j = 0; j < p->len; j++) {
                 if (is_emoji_modifier(p->buf[j])) {
-                    assert(mod_count < 2);
+                    assert(mod_count < 2);  // 最多 2 个修饰符
                     mod_pos[mod_count++] = j;
                 } else if (is_emoji_hair_color(p->buf[j])) {
                     hair_color_pos = j;
@@ -3213,17 +3520,20 @@ static void build_rgi_emoji_zwj_sequence(FILE *f, REStringList *sl)
             }
             
             if (mod_count != 0 || hair_color_pos >= 0) {
+                // 确定修饰符类型
                 int mod_type;
                 if (mod_count == 0)
                     mod_type = EMOJI_MOD_NONE;
                 else if (mod_count == 1)
-                    mod_type = EMOJI_MOD_TYPE1;
+                    mod_type = EMOJI_MOD_TYPE1;  // 单修饰符
                 else
-                    mod_type = EMOJI_MOD_TYPE2;
+                    mod_type = EMOJI_MOD_TYPE2;  // 双修饰符
                 
+                // 尝试标记所有变体
                 if (mark_zwj_string(sl, buf, p->len, mod_type, mod_pos, hair_color_pos, FALSE)) {
                     mark_zwj_string(sl, buf, p->len, mod_type, mod_pos, hair_color_pos, TRUE);
                 } else if (mod_type == EMOJI_MOD_TYPE2) {
+                    // TYPE2 失败则尝试 TYPE2D（去重版本）
                     mod_type = EMOJI_MOD_TYPE2D;
                     if (mark_zwj_string(sl, buf, p->len, mod_type, mod_pos, hair_color_pos, FALSE)) {
                         mark_zwj_string(sl, buf, p->len, mod_type, mod_pos, hair_color_pos, TRUE);
@@ -3232,37 +3542,54 @@ static void build_rgi_emoji_zwj_sequence(FILE *f, REStringList *sl)
                         goto keep;
                     }
                 }
+                // 标准化发色字符
                 if (hair_color_pos >= 0)
                     buf[hair_color_pos] = 0x1f9b0;
-                /* encode the string */
+                /* 编码字符串 */
                 zwj_encode_string(&dbuf, buf, p->len, mod_type, mod_pos, hair_color_pos);
             } else {
             keep:
+                // 无修饰符/发色的普通序列
                 zwj_encode_string(&dbuf, buf, p->len, EMOJI_MOD_NONE, NULL, -1);
             }
         }
     }
     
-    /* Encode */
+    /* 输出编码后的序列表 */
     dump_byte_table(f, "unicode_rgi_emoji_zwj_sequence", dbuf.buf, dbuf.size);
 
     dbuf_free(&dbuf);
 }
 
+/**
+ * 构建序列属性列表表
+ * 
+ * 生成 Unicode 序列属性相关的表，包括：
+ * - 序列属性枚举定义
+ * - 序列属性名称表
+ * - RGI Emoji Tag 序列（国旗序列等）
+ * - RGI Emoji ZWJ 序列（家庭、职业等组合）
+ * 
+ * @param f 输出文件指针
+ */
 void build_sequence_prop_list_table(FILE *f)
 {
     int i;
+    // 输出序列属性枚举定义
     fprintf(f, "typedef enum {\n");
     for(i = 0; i < SEQUENCE_PROP_COUNT; i++)
         fprintf(f, "    UNICODE_SEQUENCE_PROP_%s,\n", unicode_sequence_prop_name[i]);
     fprintf(f, "    UNICODE_SEQUENCE_PROP_COUNT,\n");
     fprintf(f, "} UnicodeSequencePropertyEnum;\n\n");
 
+    // 输出序列属性名称表
     dump_name_table(f, "unicode_sequence_prop_name_table",
                     unicode_sequence_prop_name, SEQUENCE_PROP_COUNT, NULL);
 
+    // 输出 RGI Emoji Tag 序列（用于国旗序列）
     dump_byte_table(f, "unicode_rgi_emoji_tag_sequence", rgi_emoji_tag_sequence.buf, rgi_emoji_tag_sequence.size);
 
+    // 输出 RGI Emoji ZWJ 序列
     build_rgi_emoji_zwj_sequence(f, &rgi_emoji_zwj_sequence);
 }
 
@@ -3386,12 +3713,28 @@ void check_flags(void)
 
 #endif
 
-#define CC_BLOCK_LEN 32
+#define CC_BLOCK_LEN 32  // 组合类表索引块大小
 
+/**
+ * 构建组合类表（Combining Class Table）
+ * 
+ * 组合类（Canonical Combining Class, CCC）用于 Unicode 规范化，
+ * 决定字符在重排序时的行为。CCC=0 表示不重排，CCC>0 表示需要重排。
+ * 
+ * 压缩策略：
+ * - type 0: CCC=0（起始字符）
+ * - type 1: CCC 线性递增
+ * - type 2: CCC=0（特殊标记）
+ * - type 3: CCC=230（特殊标记）
+ * - 游程长度编码：1-3 字节变长
+ * 
+ * 参考：https://www.unicode.org/reports/tr44/#Canonical_Combining_Class_Values
+ * 
+ * @param f 输出文件指针
+ */
 void build_cc_table(FILE *f)
 {
-    // Compress combining class table
-    // see: https://www.unicode.org/reports/tr44/#Canonical_Combining_Class_Values
+    // 压缩组合类表
     int i, cc, n, type, n1, block_end_pos;
     DynBuf dbuf_s, *dbuf = &dbuf_s;
     DynBuf dbuf1_s, *dbuf1 = &dbuf1_s;
@@ -3425,23 +3768,24 @@ void build_cc_table(FILE *f)
                    unicode_db[i + n].combining_class == cc)
                 n++;
         }
-        /* no need to encode the last run */
+        /* 不需要编码最后一个游程（默认为 0） */
         if (cc == 0 && (i + n - 1) == CHARCODE_MAX)
             break;
 #ifdef DUMP_CC_TABLE
         printf("%05x %6d %d %d\n", i, n, type, cc);
 #endif
+        // 确定类型
         if (type == 0) {
             if (cc == 0)
-                type = 2;
+                type = 2;  // CCC=0 的特殊标记
             else if (cc == 230)
-                type = 3;
+                type = 3;  // CCC=230 的特殊标记
         }
-        n1 = n - 1;
+        n1 = n - 1;  // 存储长度 -1
 
-        /* add an entry to the index if necessary */
+        /* 添加索引条目（每 32 个字符块） */
         if (dbuf->size >= block_end_pos) {
-            v = i | ((dbuf->size - block_end_pos) << 21);
+            v = i | ((dbuf->size - block_end_pos) << 21);  // [21 位码点][11 位偏移]
             dbuf_putc(dbuf1, v);
             dbuf_putc(dbuf1, v >> 8);
             dbuf_putc(dbuf1, v >> 16);
@@ -3450,20 +3794,23 @@ void build_cc_table(FILE *f)
 #if defined(DUMP_CC_TABLE) || defined(DUMP_TABLE_SIZE)
         cw_start = dbuf->size;
 #endif
-        /* Compressed run length encoding:
-           - 2 high order bits are combining class type
-           -         0:0, 1:230, 2:extra byte linear progression, 3:extra byte
-           - 00..2F: range length (add 1)
-           - 30..37: 3-bit range-length + 1 extra byte
-           - 38..3F: 3-bit range-length + 2 extra byte
+        /* 压缩游程长度编码：
+           - 高 2 位是组合类类型
+           -         0:CCC=0, 1:CCC=230, 2:额外字节线性递增, 3:额外字节
+           - 00..2F: 范围长度（+1）
+           - 30..37: 3 位长度 + 1 额外字节
+           - 38..3F: 3 位长度 + 2 额外字节
          */
         if (n1 < 48) {
+            // 短游程：1 字节
             dbuf_putc(dbuf, n1 | (type << 6));
         } else if (n1 < 48 + (1 << 11)) {
+            // 中等游程：2 字节
             n1 -= 48;
             dbuf_putc(dbuf, ((n1 >> 8) + 48) | (type << 6));
             dbuf_putc(dbuf, n1);
         } else {
+            // 长游程：3 字节
             n1 -= 48 + (1 << 11);
             assert(n1 < (1 << 20));
             dbuf_putc(dbuf, ((n1 >> 16) + 56) | (type << 6));
@@ -3500,44 +3847,61 @@ void build_cc_table(FILE *f)
     dbuf_free(dbuf1);
 }
 
-/* maximum length of decomposition: 18 chars (1), then 8 */
+/* 最大分解长度：18 字符（特殊情况），通常 8 字符 */
 #ifndef USE_TEST
+/**
+ * 分解类型枚举
+ * 
+ * Unicode 字符分解（Decomposition）将复合字符分解为基础字符序列。
+ * 例如：á (U+00E1) → a (U+0061) + ́ (U+0301)
+ * 
+ * 类型说明：
+ * - C1: 单 16 位字符
+ * - L1-L7: 1-7 个 16 位字符表
+ * - LL1-LL2: 18 位字符表（支持扩展字符）
+ * - S1-S5: 8 位短字符表
+ * - I1-I4_*: 递增编码（连续码点）
+ * - B1-B18: 基值 + 偏移编码
+ * - LS2: 长 + 短双字符
+ * - PAT3: 三字符模式（首尾相同）
+ * - S2_UL/S2_LS2_UL: 大小写配对优化
+ */
 typedef enum {
-    DECOMP_TYPE_C1, /* 16 bit char */
-    DECOMP_TYPE_L1, /* 16 bit char table */
-    DECOMP_TYPE_L2,
-    DECOMP_TYPE_L3,
-    DECOMP_TYPE_L4,
-    DECOMP_TYPE_L5, /* XXX: not used */
-    DECOMP_TYPE_L6, /* XXX: could remove */
-    DECOMP_TYPE_L7, /* XXX: could remove */
-    DECOMP_TYPE_LL1, /* 18 bit char table */
-    DECOMP_TYPE_LL2,
-    DECOMP_TYPE_S1, /* 8 bit char table */
-    DECOMP_TYPE_S2,
-    DECOMP_TYPE_S3,
-    DECOMP_TYPE_S4,
-    DECOMP_TYPE_S5,
-    DECOMP_TYPE_I1, /* increment 16 bit char value */
-    DECOMP_TYPE_I2_0,
-    DECOMP_TYPE_I2_1,
-    DECOMP_TYPE_I3_1,
-    DECOMP_TYPE_I3_2,
-    DECOMP_TYPE_I4_1,
-    DECOMP_TYPE_I4_2,
-    DECOMP_TYPE_B1, /* 16 bit base + 8 bit offset */
-    DECOMP_TYPE_B2,
-    DECOMP_TYPE_B3,
-    DECOMP_TYPE_B4,
-    DECOMP_TYPE_B5,
-    DECOMP_TYPE_B6,
-    DECOMP_TYPE_B7,
-    DECOMP_TYPE_B8,
-    DECOMP_TYPE_B18,
-    DECOMP_TYPE_LS2,
-    DECOMP_TYPE_PAT3,
-    DECOMP_TYPE_S2_UL,
-    DECOMP_TYPE_LS2_UL,
+    DECOMP_TYPE_C1,    /* 单个 16 位字符 */
+    DECOMP_TYPE_L1,    /* 16 位字符表（1 字符） */
+    DECOMP_TYPE_L2,    /* 16 位字符表（2 字符） */
+    DECOMP_TYPE_L3,    /* 16 位字符表（3 字符） */
+    DECOMP_TYPE_L4,    /* 16 位字符表（4 字符） */
+    DECOMP_TYPE_L5,    /* 16 位字符表（5 字符，未使用） */
+    DECOMP_TYPE_L6,    /* 16 位字符表（6 字符，可移除） */
+    DECOMP_TYPE_L7,    /* 16 位字符表（7 字符，可移除） */
+    DECOMP_TYPE_LL1,   /* 18 位字符表（1 字符，支持扩展） */
+    DECOMP_TYPE_LL2,   /* 18 位字符表（2 字符，支持扩展） */
+    DECOMP_TYPE_S1,    /* 8 位短字符表（1 字符） */
+    DECOMP_TYPE_S2,    /* 8 位短字符表（2 字符） */
+    DECOMP_TYPE_S3,    /* 8 位短字符表（3 字符） */
+    DECOMP_TYPE_S4,    /* 8 位短字符表（4 字符） */
+    DECOMP_TYPE_S5,    /* 8 位短字符表（5 字符） */
+    DECOMP_TYPE_I1,    /* 递增 16 位字符值（1 字符） */
+    DECOMP_TYPE_I2_0,  /* 递增（2 字符，第 0 位递增） */
+    DECOMP_TYPE_I2_1,  /* 递增（2 字符，第 1 位递增） */
+    DECOMP_TYPE_I3_1,  /* 递增（3 字符，第 1 位递增） */
+    DECOMP_TYPE_I3_2,  /* 递增（3 字符，第 2 位递增） */
+    DECOMP_TYPE_I4_1,  /* 递增（4 字符，第 1 位递增） */
+    DECOMP_TYPE_I4_2,  /* 递增（4 字符，第 2 位递增） */
+    DECOMP_TYPE_B1,    /* 16 位基值 + 8 位偏移（1 字符） */
+    DECOMP_TYPE_B2,    /* 16 位基值 + 8 位偏移（2 字符） */
+    DECOMP_TYPE_B3,    /* 16 位基值 + 8 位偏移（3 字符） */
+    DECOMP_TYPE_B4,    /* 16 位基值 + 8 位偏移（4 字符） */
+    DECOMP_TYPE_B5,    /* 16 位基值 + 8 位偏移（5 字符） */
+    DECOMP_TYPE_B6,    /* 16 位基值 + 8 位偏移（6 字符） */
+    DECOMP_TYPE_B7,    /* 16 位基值 + 8 位偏移（7 字符） */
+    DECOMP_TYPE_B8,    /* 16 位基值 + 8 位偏移（8 字符） */
+    DECOMP_TYPE_B18,   /* 16 位基值 + 8 位偏移（18 字符） */
+    DECOMP_TYPE_LS2,   /* 长 + 短双字符 */
+    DECOMP_TYPE_PAT3,  /* 三字符模式（首尾相同） */
+    DECOMP_TYPE_S2_UL, /* 8 位大小写配对（2 字符） */
+    DECOMP_TYPE_LS2_UL,/* 长 + 短大小写配对（2 字符） */
 } DecompTypeEnum;
 #endif
 
@@ -3587,50 +3951,72 @@ const int decomp_incr_tab[4][4] = {
 };
 
 /*
-  entry size:
-  type   bits
-  code   18
-  len    7
-  compat 1
-  type   5
-  index  16
-  total  47
+  分解表条目大小（47 位，打包为 6 字节）：
+  字段   位数   说明
+  code   18    起始码点
+  len    7     游程长度
+  compat 1     兼容分解标志
+  type   5     分解类型
+  index  16    数据索引
+  total  47    总计
 */
 
+/**
+ * 分解表条目结构
+ * 
+ * 用于动态规划算法，找到最优的分解表压缩方案
+ */
 typedef struct {
-    int code;
-    uint8_t len;
-    uint8_t type;
-    uint8_t c_len;
-    uint16_t c_min;
-    uint16_t data_index;
-    int cost; /* size in bytes from this entry to the end */
+    int code;           // 起始码点
+    uint8_t len;        // 游程长度
+    uint8_t type;       // 分解类型
+    uint8_t c_len;      // 字符长度（分解结果的字符数）
+    uint16_t c_min;     // 最小字符值（用于基值 + 偏移编码）
+    uint16_t data_index;// 数据索引
+    int cost;           // 从该条目到末尾的字节大小（用于动态规划）
 } DecompEntry;
 
+/**
+ * 计算分解游程的大小（字节数）
+ * 
+ * 根据不同的分解类型，计算压缩后占用的字节数。
+ * 用于动态规划算法选择最优压缩方案。
+ * 
+ * @param de 分解条目
+ * @return 字节大小
+ */
 int get_decomp_run_size(const DecompEntry *de)
 {
     int s;
-    s = 6;
+    s = 6;  // 基础条目大小（6 字节）
     if (de->type <= DECOMP_TYPE_C1) {
-        /* nothing more */
+        // 单字符：无额外数据
     } else if (de->type <= DECOMP_TYPE_L7) {
+        // 16 位字符表：每字符 2 字节
         s += de->len * de->c_len * 2;
     } else if (de->type <= DECOMP_TYPE_LL2) {
-        /* 18 bits per char */
+        // 18 位字符表：每字符 18 位（压缩打包）
         s += (de->len * de->c_len * 18 + 7) / 8;
     } else if (de->type <= DECOMP_TYPE_S5) {
+        // 8 位短字符表：每字符 1 字节
         s += de->len * de->c_len;
     } else if (de->type <= DECOMP_TYPE_I4_2) {
+        // 递增编码：2 字节基值
         s += de->c_len * 2;
     } else if (de->type <= DECOMP_TYPE_B18) {
+        // 基值 + 偏移：2 字节基值 + 每字符 1 字节偏移
         s += 2 + de->len * de->c_len;
     } else if (de->type <= DECOMP_TYPE_LS2) {
+        // 长 + 短双字符：每字符 3 字节
         s += de->len * 3;
     } else if (de->type <= DECOMP_TYPE_PAT3) {
+        // 三字符模式：4 字节固定 + 每字符 2 字节
         s += 4 + de->len * 2;
     } else if (de->type <= DECOMP_TYPE_S2_UL) {
+        // 8 位大小写配对：每字符 1 字节
         s += de->len;
     } else if (de->type <= DECOMP_TYPE_LS2_UL) {
+        // 长 + 短大小写配对：每对 3 字节
         s += (de->len / 2) * 3;
     } else {
         abort();
@@ -3638,17 +4024,30 @@ int get_decomp_run_size(const DecompEntry *de)
     return s;
 }
 
+/* 短字符映射表：特殊字符的压缩编码 */
 static const uint16_t unicode_short_table[2] = { 0x2044, 0x2215 };
 
-/* return -1 if not found */
+/**
+ * 获取短字符编码
+ * 
+ * 将常用字符映射到 8 位短编码，节省表空间。
+ * 编码规则：
+ * - 0x00-0x7F: ASCII 字符直接映射
+ * - 0x80-0xCF: U+0300..U+034F（组合变音符号）
+ * - 0xD0-0xD1: 特殊字符（0x2044, 0x2215）
+ * 
+ * @param c 字符码点
+ * @return 短编码，未找到返回 -1
+ */
 int get_short_code(int c)
 {
     int i;
     if (c < 0x80) {
-        return c;
+        return c;  // ASCII 直接返回
     } else if (c >= 0x300 && c < 0x350) {
-        return c - 0x300 + 0x80;
+        return c - 0x300 + 0x80;  // 组合变音符号
     } else {
+        // 特殊字符查表
         for(i = 0; i < countof(unicode_short_table); i++) {
             if (c == unicode_short_table[i])
                 return i + 0x80 + 0x50;
@@ -3657,11 +4056,24 @@ int get_short_code(int c)
     }
 }
 
+/**
+ * 判断字符是否可短编码
+ * 
+ * @param code 字符码点
+ * @return TRUE 表示可短编码
+ */
 static BOOL is_short(int code)
 {
     return get_short_code(code) >= 0;
 }
 
+/**
+ * 判断字符数组是否全部可短编码
+ * 
+ * @param tab 字符数组
+ * @param len 数组长度
+ * @return TRUE 表示全部可短编码
+ */
 static BOOL is_short_tab(const int *tab, int len)
 {
     int i;
@@ -3672,6 +4084,13 @@ static BOOL is_short_tab(const int *tab, int len)
     return TRUE;
 }
 
+/**
+ * 判断字符数组是否全部为 16 位
+ * 
+ * @param tab 字符数组
+ * @param len 数组长度
+ * @return TRUE 表示全部在 16 位范围内
+ */
 static BOOL is_16bit(const int *tab, int len)
 {
     int i;
@@ -3682,9 +4101,20 @@ static BOOL is_16bit(const int *tab, int len)
     return TRUE;
 }
 
+/**
+ * 简单小写转换
+ * 
+ * 处理 Latin1 和西里尔字母的简单小写规则：
+ * - Latin1 (U+0041..U+005A): +0x20 → (U+0061..U+007A)
+ * - Cyrillic (U+0410..U+042F): +0x20 → (U+0430..U+044F)
+ * - 其他：+1（特殊情况）
+ * 
+ * @param c 大写字符
+ * @return 小写字符
+ */
 static uint32_t to_lower_simple(uint32_t c)
 {
-    /* Latin1 and Cyrillic */
+    /* Latin1 和西里尔字母 */
     if (c < 0x100 || (c >= 0x410 && c <= 0x42f))
         c += 0x20;
     else
