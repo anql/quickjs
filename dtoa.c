@@ -72,6 +72,25 @@ typedef struct {
     limb_t tab[];
 } mpb_t;
 
+/**
+ * mp_add_ui - 多精度整数加单精度整数
+ * 
+ * 计算 tab[] += b，支持进位传播。
+ * 
+ * @tab: 多精度整数数组（小端序，tab[0] 是最低位）
+ * @b: 单精度加数
+ * @n: tab 数组的长度（limb 数量）
+ * @return: 最终进位（0 或 1）
+ * 
+ * 算法说明:
+ * - 从低位到高位逐位相加
+ * - k 保存进位值
+ * - 如果进位为 0 则提前退出（优化）
+ * 
+ * 示例:
+ * tab = [0xFFFFFFFF, 0x00000001], b = 1
+ * 结果：tab = [0x00000000, 0x00000002], 返回 0
+ */
 static limb_t mp_add_ui(limb_t *tab, limb_t b, size_t n)
 {
     size_t i;
@@ -82,13 +101,32 @@ static limb_t mp_add_ui(limb_t *tab, limb_t b, size_t n)
         if (k == 0)
             break;
         a = tab[i] + k;
-        k = (a < k);
+        k = (a < k);  // 检测进位：如果和小于加数，说明溢出
         tab[i] = a;
     }
     return k;
 }
 
-/* tabr[] = taba[] * b + l. Return the high carry */
+/**
+ * mp_mul1 - 多精度整数乘以单精度整数
+ * 
+ * 计算 tabr[] = taba[] * b + l（带初始进位）。
+ * 
+ * @tabr: 输出数组（多精度结果）
+ * @taba: 输入数组（被乘数）
+ * @n: 数组长度（limb 数量）
+ * @b: 单精度乘数
+ * @l: 初始进位值
+ * @return: 最终进位（高位扩展）
+ * 
+ * 算法说明:
+ * - 使用双精度中间结果 (dlimb_t) 避免溢出
+ * - 逐位相乘并累加进位
+ * - 结果的低 LIMB_BITS 位存入 tabr，高位作为新的进位
+ * 
+ * 数据流:
+ * taba[i] * b + l → t (双精度) → tabr[i] = t & 0xFFFFFFFF, l = t >> 32
+ */
 static limb_t mp_mul1(limb_t *tabr, const limb_t *taba, limb_t n, 
                       limb_t b, limb_t l)
 {
@@ -98,12 +136,28 @@ static limb_t mp_mul1(limb_t *tabr, const limb_t *taba, limb_t n,
     for(i = 0; i < n; i++) {
         t = (dlimb_t)taba[i] * (dlimb_t)b + l;
         tabr[i] = t;
-        l = t >> LIMB_BITS;
+        l = t >> LIMB_BITS;  // 提取高 32 位作为进位
     }
     return l;
 }
 
-/* WARNING: d must be >= 2^(LIMB_BITS-1) */
+/**
+ * udiv1norm_init - 初始化规范化除法的倒数
+ * 
+ * 计算 d 的乘法逆元近似值，用于快速除法。
+ * 
+ * @d: 除数（必须 >= 2^(LIMB_BITS-1)，即最高位为 1）
+ * @return: 乘法逆元近似值 d_inv
+ * 
+ * 算法原理:
+ * - 使用 Newton-Raphson 迭代法计算 1/d 的近似值
+ * - 公式：d_inv = floor((2^64 - 1 - d) * 2^32 / d)
+ * - 这个近似值可以用于后续的 udiv1norm 快速除法
+ * 
+ * 前置条件:
+ * - d 必须是"规范化"的，即最高位为 1（d >= 2^31）
+ * - 如果 d 不满足此条件，需要先左移使其规范化
+ */
 static inline limb_t udiv1norm_init(limb_t d)
 {
     limb_t a0, a1;
@@ -112,43 +166,94 @@ static inline limb_t udiv1norm_init(limb_t d)
     return (((dlimb_t)a1 << LIMB_BITS) | a0) / d;
 }
 
-/* return the quotient and the remainder in '*pr'of 'a1*2^LIMB_BITS+a0
-   / d' with 0 <= a1 < d. */
+/**
+ * udiv1norm - 规范化单精度除法（使用乘法逆元）
+ * 
+ * 计算 (a1 * 2^LIMB_BITS + a0) / d，返回商和余数。
+ * 使用预计算的乘法逆元 d_inv 加速除法运算。
+ * 
+ * @pr: 输出参数，存储余数
+ * @a1: 被除数的高 32 位（必须满足 0 <= a1 < d）
+ * @a0: 被除数的低 32 位
+ * @d: 除数（必须 >= 2^(LIMB_BITS-1)）
+ * @d_inv: udiv1norm_init(d) 返回的乘法逆元
+ * @return: 商
+ * 
+ * 算法说明:
+ * 1. 使用乘法逆元估算商：q ≈ (a1 * 2^64 + a0) * d_inv / 2^64
+ * 2. 计算余数并调整商，确保 0 <= r < d
+ * 3. 通过检查余数范围修正商的误差（最多调整±1）
+ * 
+ * 性能优势:
+ * - 避免了昂贵的硬件除法指令
+ * - 使用乘法和移位代替除法
+ * - 在需要多次除以同一个数时特别有效
+ */
 static inline limb_t udiv1norm(limb_t *pr, limb_t a1, limb_t a0,
                                 limb_t d, limb_t d_inv)
 {
     limb_t n1m, n_adj, q, r, ah;
     dlimb_t a;
-    n1m = ((slimb_t)a0 >> (LIMB_BITS - 1));
-    n_adj = a0 + (n1m & d);
-    a = (dlimb_t)d_inv * (a1 - n1m) + n_adj;
+    n1m = ((slimb_t)a0 >> (LIMB_BITS - 1));  // a0 的符号位扩展
+    n_adj = a0 + (n1m & d);  // 调整 a0
+    a = (dlimb_t)d_inv * (a1 - n1m) + n_adj;  // 估算商
     q = (a >> LIMB_BITS) + a1;
     /* compute a - q * r and update q so that the remainder is between
        0 and d - 1 */
     a = ((dlimb_t)a1 << LIMB_BITS) | a0;
-    a = a - (dlimb_t)q * d - d;
+    a = a - (dlimb_t)q * d - d;  // 计算余数并调整
     ah = a >> LIMB_BITS;
-    q += 1 + ah;
-    r = (limb_t)a + (ah & d);
+    q += 1 + ah;  // 修正商
+    r = (limb_t)a + (ah & d);  // 最终余数
     *pr = r;
     return q;
 }
 
+/**
+ * mp_div1 - 多精度整数除以单精度整数
+ * 
+ * 计算 tabr[] = taba[] / b，返回余数。
+ * 
+ * @tabr: 输出数组（商）
+ * @taba: 输入数组（被除数）
+ * @n: 数组长度
+ * @b: 除数（单精度）
+ * @r: 初始余数（通常为 0）
+ * @return: 最终余数
+ * 
+ * 算法说明:
+ * - 从高位到低位逐位除法（长除法）
+ * - 每次将余数左移 LIMB_BITS 位，加上当前位，然后除以 b
+ * - 使用双精度中间结果避免溢出
+ */
 static limb_t mp_div1(limb_t *tabr, const limb_t *taba, limb_t n,
                       limb_t b, limb_t r)
 {
     slimb_t i;
     dlimb_t a1;
     for(i = n - 1; i >= 0; i--) {
-        a1 = ((dlimb_t)r << LIMB_BITS) | taba[i];
+        a1 = ((dlimb_t)r << LIMB_BITS) | taba[i];  // 余数 + 当前位
         tabr[i] = a1 / b;
         r = a1 % b;
     }
     return r;
 }
 
-/* r = (a + high*B^n) >> shift. Return the remainder r (0 <= r < 2^shift). 
-   1 <= shift <= LIMB_BITS - 1 */
+/**
+ * mp_shr - 多精度整数右移（带高位输入）
+ * 
+ * 计算 tab_r[] = (tab[] + high * B^n) >> shift。
+ * 
+ * @tab_r: 输出数组
+ * @tab: 输入数组
+ * @n: 数组长度
+ * @shift: 移位位数（1 <= shift < LIMB_BITS）
+ * @high: 高位输入（相当于在 tab[n] 位置的值）
+ * @return: 移出的低位余数（0 <= r < 2^shift）
+ * 
+ * 数据流:
+ * [high][tab[n-1]]...[tab[0]] >> shift → [tab_r[n-1]]...[tab_r[0]] + 余数
+ */
 static limb_t mp_shr(limb_t *tab_r, const limb_t *tab, mp_size_t n, 
                      int shift, limb_t high)
 {
@@ -159,14 +264,27 @@ static limb_t mp_shr(limb_t *tab_r, const limb_t *tab, mp_size_t n,
     l = high;
     for(i = n - 1; i >= 0; i--) {
         a = tab[i];
-        tab_r[i] = (a >> shift) | (l << (LIMB_BITS - shift));
-        l = a;
+        tab_r[i] = (a >> shift) | (l << (LIMB_BITS - shift));  // 当前位右移 + 低位补进
+        l = a;  // 保存当前位，用于下一轮
     }
-    return l & (((limb_t)1 << shift) - 1);
+    return l & (((limb_t)1 << shift) - 1);  // 返回移出的最低位
 }
 
-/* r = (a << shift) + low. 1 <= shift <= LIMB_BITS - 1, 0 <= low <
-   2^shift. */
+/**
+ * mp_shl - 多精度整数左移（带低位输入）
+ * 
+ * 计算 tab_r[] = (tab[] << shift) + low。
+ * 
+ * @tab_r: 输出数组
+ * @tab: 输入数组
+ * @n: 数组长度
+ * @shift: 移位位数（1 <= shift < LIMB_BITS）
+ * @low: 低位输入（填充到 tab_r[0] 的低位）
+ * @return: 移出的高位进位
+ * 
+ * 数据流:
+ * [tab[n-1]]...[tab[0]][low] << shift → 进位 + [tab_r[n-1]]...[tab_r[0]]
+ */
 static limb_t mp_shl(limb_t *tab_r, const limb_t *tab, mp_size_t n, 
               int shift, limb_t low)
 {
@@ -177,24 +295,43 @@ static limb_t mp_shl(limb_t *tab_r, const limb_t *tab, mp_size_t n,
     l = low;
     for(i = 0; i < n; i++) {
         a = tab[i];
-        tab_r[i] = (a << shift) | l;
-        l = (a >> (LIMB_BITS - shift)); 
+        tab_r[i] = (a << shift) | l;  // 当前位左移 + 低位补进
+        l = (a >> (LIMB_BITS - shift));  // 提取移出的高位
     }
-    return l;
+    return l;  // 返回最终进位
 }
 
+/**
+ * mp_div1norm - 规范化多精度除法（使用乘法逆元优化）
+ * 
+ * 计算 tabr[] = taba[] / b，使用 udiv1norm 加速。
+ * 
+ * @tabr: 输出数组（商）
+ * @taba: 输入数组（被除数）
+ * @n: 数组长度
+ * @b: 除数（必须已规范化，即最高位为 1）
+ * @r: 初始余数
+ * @b_inv: udiv1norm_init(b) 返回的乘法逆元
+ * @shift: 规范化移位量（b 左移了多少位才达到规范化）
+ * @return: 最终余数
+ * 
+ * 算法流程:
+ * 1. 如果需要，先将被除数左移 shift 位（与除数对齐）
+ * 2. 使用 udiv1norm 逐位除法（避免硬件除法）
+ * 3. 将余数右移 shift 位（还原）
+ */
 static no_inline limb_t mp_div1norm(limb_t *tabr, const limb_t *taba, limb_t n,
                                     limb_t b, limb_t r, limb_t b_inv, int shift)
 {
     slimb_t i;
 
     if (shift != 0) {
-        r = (r << shift) | mp_shl(tabr, taba, n, shift, 0);
+        r = (r << shift) | mp_shl(tabr, taba, n, shift, 0);  // 被除数左移对齐
     }
     for(i = n - 1; i >= 0; i--) {
-        tabr[i] = udiv1norm(&r, r, taba[i], b, b_inv);
+        tabr[i] = udiv1norm(&r, r, taba[i], b, b_inv);  // 快速除法
     }
-    r >>= shift;
+    r >>= shift;  // 余数右移还原
     return r;
 }
 
@@ -211,6 +348,18 @@ static __maybe_unused void mpb_dump(const char *str, const mpb_t *a)
     printf("\n");
 }
 
+/**
+ * mpb_renorm - 多精度数规范化
+ * 
+ * 移除前导零，确保最高位非零（除非值为 0）。
+ * 
+ * @r: 多精度数（输入输出）
+ * 
+ * 不变量:
+ * - r->len >= 1
+ * - 如果 r->len > 1，则 r->tab[r->len-1] != 0
+ * - 如果值为 0，则 r->len = 1 且 r->tab[0] = 0
+ */
 static void mpb_renorm(mpb_t *r)
 {
     while (r->len > 1 && r->tab[r->len - 1] == 0)
@@ -238,7 +387,27 @@ static const uint32_t pow5_inv_table[13] = {
 };
 #endif
 
-/* return a^b */
+/**
+ * pow_ui - 计算整数幂 a^b
+ * 
+ * 使用快速幂算法（平方 - 乘法）。
+ * 
+ * @a: 底数
+ * @b: 指数
+ * @return: a 的 b 次幂
+ * 
+ * 优化策略:
+ * 1. 特殊情况快速返回：b=0 返回 1，b=1 返回 a
+ * 2. 对于 5^b 和 10^b（b<=17），使用预计算表（pow5_table）
+ * 3. 一般情况使用二进制快速幂：
+ *    - 从最高位到最低位扫描指数 b
+ *    - 每次平方结果
+ *    - 如果当前位为 1，再乘以 a
+ * 
+ * 示例:
+ * 5^3 = 5 * 5 * 5 = 125
+ * 10^2 = 100
+ */
 static uint64_t pow_ui(uint32_t a, uint32_t b)
 {
     int i, n_bits;
@@ -251,23 +420,43 @@ static uint64_t pow_ui(uint32_t a, uint32_t b)
     if ((a == 5 || a == 10) && b <= 17) {
         r = pow5_table[b - 1];
         if (b >= 14) {
-            r |= (uint64_t)pow5h_table[b - 14] << 32;
+            r |= (uint64_t)pow5h_table[b - 14] << 32;  // 高 32 位
         }
         if (a == 10)
-            r <<= b;
+            r <<= b;  // 10^b = 5^b * 2^b
         return r;
     }
 #endif
     r = a;
-    n_bits = 32 - clz32(b);
+    n_bits = 32 - clz32(b);  // b 的位数
     for(i = n_bits - 2; i >= 0; i--) {
-        r *= r;
+        r *= r;  // 平方
         if ((b >> i) & 1)
-            r *= a;
+            r *= a;  // 如果当前位为 1，乘以 a
     }
     return r;
 }
 
+/**
+ * pow_ui_inv - 计算整数幂的规范化形式和乘法逆元
+ * 
+ * 计算 r = a^b，并返回其规范化形式和乘法逆元。
+ * 
+ * @pr_inv: 输出参数，存储乘法逆元（用于快速除法）
+ * @pshift: 输出参数，存储规范化移位量
+ * @a: 底数
+ * @b: 指数
+ * @return: a^b 的规范化形式（左移 shift 位后）
+ * 
+ * 输出说明:
+ * - 返回值 r：a^b 左移 shift 位后的值（最高位为 1）
+ * - *pr_inv：r 的乘法逆元（用于 udiv1norm）
+ * - *pshift：规范化移位量
+ * 
+ * 用途:
+ * - 为后续的 mp_div1norm 做准备
+ * - 在浮点数转换中用于计算 5^(-b) 等倒数
+ */
 static uint32_t pow_ui_inv(uint32_t *pr_inv, int *pshift, uint32_t a, uint32_t b)
 {
     uint32_t r_inv, r;
@@ -275,16 +464,16 @@ static uint32_t pow_ui_inv(uint32_t *pr_inv, int *pshift, uint32_t a, uint32_t b
 #ifdef USE_POW5_TABLE
     if (a == 5 && b >= 1 && b <= 13) {
         r = pow5_table[b - 1];
-        shift = clz32(r);
-        r <<= shift;
-        r_inv = pow5_inv_table[b - 1];
+        shift = clz32(r);  // 前导零计数
+        r <<= shift;  // 左移规范化
+        r_inv = pow5_inv_table[b - 1];  // 预计算的逆元
     } else
 #endif
     {
         r = pow_ui(a, b);
         shift = clz32(r);
         r <<= shift;
-        r_inv = udiv1norm_init(r);
+        r_inv = udiv1norm_init(r);  // 计算逆元
     }
     *pshift = shift;
     *pr_inv = r_inv;
@@ -292,24 +481,69 @@ static uint32_t pow_ui_inv(uint32_t *pr_inv, int *pshift, uint32_t a, uint32_t b
 }
 
 enum {
-    JS_RNDN, /* round to nearest, ties to even */
-    JS_RNDNA, /* round to nearest, ties away from zero */
-    JS_RNDZ,
+    JS_RNDN, /* round to nearest, ties to even - 四舍五入到最近，平局时取偶数 */
+    JS_RNDNA, /* round to nearest, ties away from zero - 四舍五入到最近，平局时远离零 */
+    JS_RNDZ, /* round toward zero - 向零舍入（截断） */
 };
 
+/**
+ * mpb_get_bit - 获取多精度数的指定位
+ * 
+ * @r: 多精度数
+ * @k: 位索引（0 = 最低位）
+ * @return: 第 k 位的值（0 或 1）
+ * 
+ * 实现说明:
+ * - 计算位所在的 limb 索引：l = k / LIMB_BITS
+ * - 计算在 limb 内的位偏移：k % LIMB_BITS
+ * - 如果超出范围，返回 0
+ */
 static int mpb_get_bit(const mpb_t *r, int k)
 {
     int l;
     
     l = (unsigned)k / LIMB_BITS;
-    k = k & (LIMB_BITS - 1);
+    k = k & (LIMB_BITS - 1);  // k % LIMB_BITS
     if (l >= r->len)
         return 0;
     else
         return (r->tab[l] >> k) & 1;
 }
 
-/* compute round(r / 2^shift). 'shift' can be negative */
+/**
+ * mpb_shr_round - 多精度数右移并舍入
+ * 
+ * 计算 r = round(r / 2^shift)，支持负 shift（即左移）。
+ * 
+ * @r: 多精度数（输入输出）
+ * @shift: 移位量（正=右移，负=左移）
+ * @rnd_mode: 舍入模式
+ *   - JS_RNDZ: 向零舍入（直接截断）
+ *   - JS_RNDN: 四舍五入到最近，平局时取偶数（IEEE 754 默认）
+ *   - JS_RNDNA: 四舍五入到最近，平局时远离零
+ * 
+ * 左移情况 (shift < 0):
+ * 1. 计算需要移动的 limb 数 l 和位偏移 shift
+ * 2. 先处理位偏移：调用 mp_shl 左移
+ * 3. 再处理 limb 偏移：整体移动数组
+ * 
+ * 右移情况 (shift > 0):
+ * 1. 确定舍入模式，计算是否需要 +1
+ *    - JS_RNDZ: 直接截断，不加 1
+ *    - JS_RNDN/JS_RNDNA: 检查被移出的位
+ *      * bit1 = 第 (shift-1) 位（最高被移出位）
+ *      * bit2 = 所有更低位的 OR（是否有非零位）
+ *      * 如果 bit1=1 且 bit2=1：向上舍入
+ *      * 如果 bit1=1 且 bit2=0：平局，检查保留位（取偶）
+ * 2. 计算 limb 偏移 l 和位偏移 shift
+ * 3. 移动数组并右移
+ * 4. 如果需要，加 1（处理进位）
+ * 
+ * 示例:
+ * r = 0b1101 (13), shift = 2, JS_RNDN
+ * bit1 = 第 1 位 = 0, bit2 = 第 0 位 = 1
+ * 结果：0b11 (3)，因为 13/4 = 3.25 ≈ 3
+ */
 static void mpb_shr_round(mpb_t *r, int shift, int rnd_mode)
 {
     int l, i;
@@ -317,6 +551,7 @@ static void mpb_shr_round(mpb_t *r, int shift, int rnd_mode)
     if (shift == 0)
         return;
     if (shift < 0) {
+        // 左移情况
         shift = -shift;
         l = (unsigned)shift / LIMB_BITS;
         shift = shift & (LIMB_BITS - 1);
@@ -333,20 +568,21 @@ static void mpb_shr_round(mpb_t *r, int shift, int rnd_mode)
             r->len += l;
         }
     } else {
+        // 右移情况（带舍入）
         limb_t bit1, bit2;
         int k, add_one;
         
         switch(rnd_mode) {
         default:
         case JS_RNDZ:
-            add_one = 0;
+            add_one = 0;  // 向零舍入：直接截断
             break;
         case JS_RNDN:
         case JS_RNDNA:
-            bit1 = mpb_get_bit(r, shift - 1);
+            bit1 = mpb_get_bit(r, shift - 1);  // 最高被移出位
             if (bit1) {
                 if (rnd_mode == JS_RNDNA) {
-                    bit2 = 1;
+                    bit2 = 1;  // 平局时总是远离零
                 } else {
                     /* bit2 = oring of all the bits after bit1 */
                     bit2 = 0;
@@ -361,13 +597,13 @@ static void mpb_shr_round(mpb_t *r, int shift, int rnd_mode)
                     }
                 }
                 if (bit2) {
-                    add_one = 1;
+                    add_one = 1;  // 大于一半，向上舍入
                 } else {
                     /* round to even */
-                    add_one = mpb_get_bit(r, shift);
+                    add_one = mpb_get_bit(r, shift);  // 平局时取偶数
                 }
             } else {
-                add_one = 0;
+                add_one = 0;  // 小于一半，向下舍入
             }
             break;
         }
@@ -397,7 +633,17 @@ static void mpb_shr_round(mpb_t *r, int shift, int rnd_mode)
     }
 }
 
-/* return -1, 0 or 1 */
+/**
+ * mpb_cmp - 比较多精度数大小
+ * 
+ * @a: 第一个多精度数
+ * @b: 第二个多精度数
+ * @return: -1 (a<b), 0 (a==b), 1 (a>b)
+ * 
+ * 比较策略:
+ * 1. 先比较长度（limb 数量）- 长度不同直接判断
+ * 2. 长度相同则从高位到低位逐位比较
+ */
 static int mpb_cmp(const mpb_t *a, const mpb_t *b)
 {
     mp_size_t i;
@@ -416,6 +662,16 @@ static int mpb_cmp(const mpb_t *a, const mpb_t *b)
     return 0;
 }
 
+/**
+ * mpb_set_u64 - 将 uint64 转换为多精度数
+ * 
+ * @r: 输出多精度数
+ * @m: 输入 64 位整数
+ * 
+ * 根据 LIMB_BITS 大小决定占用几个 limb：
+ * - LIMB_BITS=64: 只需 1 个 limb
+ * - LIMB_BITS=32: 可能需要 2 个 limb
+ */
 static void mpb_set_u64(mpb_t *r, uint64_t m)
 {
 #if LIMB_BITS == 64
@@ -431,6 +687,14 @@ static void mpb_set_u64(mpb_t *r, uint64_t m)
 #endif
 }
 
+/**
+ * mpb_get_u64 - 将多精度数转换为 uint64
+ * 
+ * @r: 输入多精度数
+ * @return: 64 位整数值
+ * 
+ * 注意：如果多精度数超过 64 位，高位会被截断
+ */
 static uint64_t mpb_get_u64(mpb_t *r)
 {
 #if LIMB_BITS == 64
@@ -444,7 +708,21 @@ static uint64_t mpb_get_u64(mpb_t *r)
 #endif
 }
 
-/* floor_log2() = position of the first non zero bit or -1 if zero. */
+/**
+ * mpb_floor_log2 - 计算多精度数的 floor(log2(x))
+ * 
+ * @a: 多精度数
+ * @return: 最高非零位的位置，或 -1（如果为零）
+ * 
+ * 计算公式:
+ * floor_log2(x) = a->len * LIMB_BITS - 1 - clz32(最高 limb)
+ * 
+ * 示例:
+ * - x = 0 → 返回 -1
+ * - x = 1 (2^0) → 返回 0
+ * - x = 8 (2^3) → 返回 3
+ * - x = 2^100 → 返回 100
+ */
 static int mpb_floor_log2(mpb_t *a)
 {
     limb_t v;
@@ -470,20 +748,41 @@ static const uint32_t mul_log2_radix_table[JS_RADIX_MAX - 1] = {
     0x3251dd, 0x31e8d6, 0x318465,
 };
 
-/* return floor(a / log2(radix)) for -2048 <= a <= 2047 */
+/**
+ * mul_log2_radix - 计算 floor(a / log2(radix))
+ * 
+ * 用于进制转换时估算结果位数。
+ * 
+ * @a: 输入值（通常是对数域的指数，范围 -2048 到 2047）
+ * @radix: 目标进制（2-36）
+ * @return: floor(a / log2(radix))
+ * 
+ * 算法说明:
+ * 1. 如果 radix 是 2 的幂（2,4,8,16,32）：
+ *    - 直接使用位移除法：a / log2(radix)
+ *    - 例如：radix=16 时，log2(16)=4，返回 a/4
+ * 2. 其他进制：
+ *    - 使用预计算的乘法表 mul_log2_radix_table
+ *    - 公式：(a * mult) >> 24，其中 mult ≈ 2^24 / log2(radix)
+ *    - 避免浮点运算，提高性能
+ * 
+ * 应用场景:
+ * - 浮点数转字符串时估算输出长度
+ * - 例如：2^100 转 10 进制大约有 100/log2(10) ≈ 30 位
+ */
 static int mul_log2_radix(int a, int radix)
 {
     int radix_bits, mult;
 
     if ((radix & (radix - 1)) == 0) {
         /* if the radix is a power of two better to do it exactly */
-        radix_bits = 31 - clz32(radix);
+        radix_bits = 31 - clz32(radix);  // log2(radix)
         if (a < 0)
-            a -= radix_bits - 1;
+            a -= radix_bits - 1;  // 负数调整
         return a / radix_bits;
     } else {
         mult = mul_log2_radix_table[radix - 2];
-        return ((int64_t)a * mult) >> MUL_LOG2_RADIX_BASE_LOG2;
+        return ((int64_t)a * mult) >> MUL_LOG2_RADIX_BASE_LOG2;  // 定点数乘法
     }
 }
 
@@ -529,6 +828,17 @@ static void mul_log2_radix_test(void)
 }
 #endif
 
+/**
+ * u32toa_len - 将 uint32 转换为固定长度的十进制字符串
+ * 
+ * @buf: 输出缓冲区（必须至少有 len 字节）
+ * @n: 输入整数
+ * @len: 输出字符串长度（不足时前面补 0）
+ * 
+ * 示例:
+ * n=123, len=5 → "00123"
+ * n=42, len=2 → "42"
+ */
 static void u32toa_len(char *buf, uint32_t n, size_t len)
 {
     int digit, i;
@@ -539,7 +849,18 @@ static void u32toa_len(char *buf, uint32_t n, size_t len)
     }
 }
 
-/* for power of 2 radixes. len >= 1 */
+/**
+ * u64toa_bin_len - 将 uint64 转换为二进制进制的字符串（2/4/8/16/32 进制）
+ * 
+ * @buf: 输出缓冲区
+ * @n: 输入整数
+ * @radix_bits: 每个字符表示的位数（1=2 进制，4=16 进制，5=32 进制）
+ * @len: 输出字符串长度
+ * 
+ * 示例:
+ * n=255, radix_bits=4 (16 进制), len=2 → "ff"
+ * n=7, radix_bits=3 (8 进制), len=1 → "7"
+ */
 static void u64toa_bin_len(char *buf, uint64_t n, unsigned int radix_bits, int len)
 {
     int digit, i;
@@ -547,7 +868,7 @@ static void u64toa_bin_len(char *buf, uint64_t n, unsigned int radix_bits, int l
 
     mask = (1 << radix_bits) - 1;
     for(i = len - 1; i >= 0; i--) {
-        digit = n & mask;
+        digit = n & mask;  // 提取最低 radix_bits 位
         n >>= radix_bits;
         if (digit < 10)
             digit += '0';
@@ -557,10 +878,13 @@ static void u64toa_bin_len(char *buf, uint64_t n, unsigned int radix_bits, int l
     }
 }
 
-/* len >= 1. 2 <= radix <= 36 */
-static void limb_to_a(char *buf, limb_t n, unsigned int radix, int len)
-{
-    int digit, i;
+/**
+ * limb_to_a - 将 limb_t 转换为任意进制字符串（2-36 进制）
+ * 
+ * @buf: 输出缓冲区
+ * @n: 输入整数
+ * @radix: 目标进制（2-36）
+ * @len: 输出字符串长度
 
     if (radix == 10) {
         /* specific case with constant divisor */
@@ -587,6 +911,15 @@ static void limb_to_a(char *buf, limb_t n, unsigned int radix, int len)
     }
 }
 
+/**
+ * u32toa - 将 uint32 转换为十进制字符串（无前导零）
+ * 
+ * @buf: 输出缓冲区（至少 10 字节）
+ * @n: 输入整数
+ * @return: 字符串长度
+ * 
+ * 算法：从低位到高位逐位提取，然后反转
+ */
 size_t u32toa(char *buf, uint32_t n)
 {
     char buf1[10], *q;
@@ -602,6 +935,13 @@ size_t u32toa(char *buf, uint32_t n)
     return len;
 }
 
+/**
+ * i32toa - 将 int32 转换为十进制字符串（带符号）
+ * 
+ * @buf: 输出缓冲区
+ * @n: 输入整数
+ * @return: 字符串长度（含负号）
+ */
 size_t i32toa(char *buf, int32_t n)
 {
     if (n >= 0) {
@@ -613,10 +953,29 @@ size_t i32toa(char *buf, int32_t n)
 }
 
 #ifdef USE_FAST_INT
+/**
+ * u64toa - 将 uint64 转换为十进制字符串（快速路径优化）
+ * 
+ * @buf: 输出缓冲区（至少 20 字节）
+ * @n: 输入 64 位整数
+ * @return: 字符串长度
+ * 
+ * 优化策略:
+ * 1. 如果 n < 2^32，直接使用 u32toa（快速路径）
+ * 2. 否则，将 n 分解为高 9 位和低 9 位（以 10^9 为基数）
+ *    - n = n1 * 10^9 + n2
+ *    - 分别转换 n1 和 n2
+ *    - n2 固定输出 9 位（不足补零）
+ * 
+ * 示例:
+ * n = 12345678901234567890
+ * n1 = 12345678901, n2 = 234567890
+ * 输出："12345678901" + "234567890"
+ */
 size_t u64toa(char *buf, uint64_t n)
 {
     if (n < 0x100000000) {
-        return u32toa(buf, n);
+        return u32toa(buf, n);  // 快速路径
     } else {
         uint64_t n1;
         char *q = buf;
@@ -638,7 +997,7 @@ size_t u64toa(char *buf, uint64_t n)
         } else {
             q += u32toa(q, n1);
         }
-        u32toa_len(q, n, 9);
+        u32toa_len(q, n, 9);  // 低 9 位固定长度（补零）
         q += 9;
         return q - buf;
     }
@@ -655,17 +1014,36 @@ size_t i64toa(char *buf, int64_t n)
 }
 
 /* XXX: only tested for 1 <= n < 2^53 */
+/**
+ * u64toa_radix - 将 uint64 转换为任意进制字符串（2-36 进制）
+ * 
+ * @buf: 输出缓冲区
+ * @n: 输入 64 位整数
+ * @radix: 目标进制（2-36）
+ * @return: 字符串长度
+ * 
+ * 优化策略:
+ * 1. radix=10：使用优化的 u64toa
+ * 2. radix 是 2 的幂（2/4/8/16/32）：
+ *    - 使用位运算代替除法
+ *    - 长度 = ceil(64 / radix_bits)
+ *    - 调用 u64toa_bin_len（快速路径）
+ * 3. 其他进制：
+ *    - 使用通用除法算法
+ *    - 从低位到高位逐位提取
+ *    - 最大长度 41 位（3 进制时最长）
+ */
 size_t u64toa_radix(char *buf, uint64_t n, unsigned int radix)
 {
     int radix_bits, l;
     if (likely(radix == 10))
         return u64toa(buf, n);
     if ((radix & (radix - 1)) == 0) {
-        radix_bits = 31 - clz32(radix);
+        radix_bits = 31 - clz32(radix);  // log2(radix)
         if (n == 0)
             l = 1;
         else
-            l = (64 - clz64(n) + radix_bits - 1) / radix_bits;
+            l = (64 - clz64(n) + radix_bits - 1) / radix_bits;  // ceil(位数/radix_bits)
         u64toa_bin_len(buf, n, radix_bits, l);
         return l;
     } else {
@@ -720,19 +1098,40 @@ static const uint32_t radix_base_table[JS_RADIX_MAX - 1] = {
 };
 
 /* XXX: remove the table ? */
+/**
+ * dtoa_max_digits_table - 各进制下 double 的最大有效位数
+ * 
+ * 计算公式：ceil(53 / log2(radix)) + 1
+ * 53 是 IEEE 754 double 的尾数位数（包括隐含的 1）
+ * 
+ * 用途：限制 dtoa 输出的最大位数，避免无限循环
+ */
 static uint8_t dtoa_max_digits_table[JS_RADIX_MAX - 1] = {
     54, 35, 28, 24, 22, 20, 19, 18, 17, 17, 16, 16, 15, 15, 15, 14, 14, 14, 14, 14, 13, 13, 13, 13, 13, 13, 13, 12, 12, 12, 12, 12, 12, 12, 12,
 };
 
-/* we limit the maximum number of significant digits for atod to about
-   128 bits of precision for non power of two bases. The only
-   requirement for Javascript is at least 20 digits in base 10. For
-   power of two bases, we do an exact rounding in all the cases. */
+/**
+ * atod_max_digits_table - 各进制下 atod 解析的最大有效位数
+ * 
+ * 限制精度到约 128 位（非 2 幂进制），JavaScript 要求至少 20 位（10 进制）
+ * 2 的幂进制使用精确舍入
+ * 
+ * 计算公式:
+ * - 2 的幂：floor(64 / log2(radix))
+ * - 其他：floor(128 / log2(radix))
+ */
 static uint8_t atod_max_digits_table[JS_RADIX_MAX - 1] = {
      64, 80, 32, 55, 49, 45, 21, 40, 38, 37, 35, 34, 33, 32, 16, 31, 30, 30, 29, 29, 28, 28, 27, 27, 27, 26, 26, 26, 26, 25, 12, 25, 25, 24, 24,
 };
 
-/* if abs(d) >= B^max_exponent, it is an overflow */
+/**
+ * max_exponent - 各进制下的溢出阈值指数
+ * 
+ * 如果 |d| >= radix^max_exponent，则判定为溢出（返回 Infinity）
+ * 
+ * 计算公式：ceil(1024 / log2(radix))
+ * 1024 接近 double 的最大指数（1023）
+ */
 static const int16_t max_exponent[JS_RADIX_MAX - 1] = {
  1024,   647,   512,   442,   397,   365,   342,   324, 
   309,   297,   286,   277,   269,   263,   256,   251, 
@@ -741,7 +1140,14 @@ static const int16_t max_exponent[JS_RADIX_MAX - 1] = {
   202,   200,   199, 
 };
 
-/* if abs(d) <= B^min_exponent, it is an underflow */
+/**
+ * min_exponent - 各进制下的下溢阈值指数
+ * 
+ * 如果 |d| <= radix^min_exponent，则判定为下溢（返回 0 或次正规数）
+ * 
+ * 计算公式：floor(-1075 / log2(radix))
+ * -1075 接近 double 的最小指数（-1022）减去尾数位数（53）
+ */
 static const int16_t min_exponent[JS_RADIX_MAX - 1] = {
 -1075,  -679,  -538,  -463,  -416,  -383,  -359,  -340, 
  -324,  -311,  -300,  -291,  -283,  -276,  -269,  -263, 
@@ -842,8 +1248,31 @@ void build_tables(void)
 }
 #endif
 
-/* n_digits >= 1. 0 <= dot_pos <= n_digits. If dot_pos == n_digits,
-   the dot is not displayed. 'a' is modified. */
+/**
+ * output_digits - 将多精度整数转换为指定进制的字符串
+ * 
+ * @buf: 输出缓冲区
+ * @a: 多精度整数（会被修改/销毁）
+ * @radix: 目标进制（2-36）
+ * @n_digits1: 输出数字位数
+ * @dot_pos: 小数点位置（0-based，等于 n_digits1 时不显示小数点）
+ * @return: 输出字符串长度（含小数点）
+ * 
+ * 算法说明:
+ * 1. 2 的幂进制（2/4/8/16/32）：
+ *    - 使用位运算快速提取
+ *    - 每次处理 digits_per_limb 位
+ *    - 右移并舍入
+ * 2. 其他进制：
+ *    - 使用除法逐段提取
+ *    - 每次除以 radix^digits_per_limb
+ *    - 余数转换为字符串
+ * 3. 插入小数点（如果需要）
+ * 
+ * 示例:
+ * a=12345, radix=10, n_digits1=5, dot_pos=2
+ * 输出："123.45"（长度 6）
+ */
 static int output_digits(char *buf,
                          mpb_t *a, int radix, int n_digits1,
                          int dot_pos)
@@ -859,6 +1288,7 @@ static int output_digits(char *buf,
     }
     digits_per_limb = digits_per_limb_table[radix - 2];
     if (radix_bits != 0) {
+        // 2 的幂进制：快速路径
         for(;;) {
             n = min_int(n_digits, digits_per_limb);
             n_digits -= n;
@@ -868,6 +1298,7 @@ static int output_digits(char *buf,
             mpb_shr_round(a, digits_per_limb * radix_bits, JS_RNDZ);
         }
     } else {
+        // 其他进制：除法路径
         limb_t r;
         while (n_digits != 0) {
             n = min_int(n_digits, digits_per_limb);
@@ -888,8 +1319,36 @@ static int output_digits(char *buf,
     return len;
 }
 
-/* return (a, e_offset) such that a = a * (radix1*2^radix_shift)^f *
-   2^-e_offset. 'f' can be negative. */
+/**
+ * mul_pow - 计算 a * (radix1 * 2^radix_shift)^f
+ * 
+ * 用于浮点数进制转换中的幂运算。
+ * 
+ * @a: 多精度数（输入输出，会被修改）
+ * @radix1: 进制的奇数部分（radix = radix1 * 2^radix_shift）
+ * @radix_shift: 进制的 2 的幂次
+ * @f: 指数（可正可负）
+ * @is_int: 是否为整数运算
+ * @e: 目标精度位数
+ * @return: e_offset（指数偏移量）
+ * 
+ * 数学公式:
+ * a_new = a * (radix1 * 2^radix_shift)^f * 2^(-e_offset)
+ * 
+ * 算法说明:
+ * 1. f >= 0（乘法）：
+ *    - 分段计算 radix1^n
+ *    - 使用 mp_mul1 逐段相乘
+ * 2. f < 0（除法）：
+ *    - 计算额外的精度位（用于舍入）
+ *    - 左移对齐
+ *    - 使用 mp_div1norm 快速除法
+ *    - 余数 OR 到最低位（用于舍入）
+ * 
+ * 应用场景:
+ * - 将浮点数从二进制转换为其他进制
+ * - 计算 m * 2^e * radix^f
+ */
 static int mul_pow(mpb_t *a, int radix1, int radix_shift, int f, BOOL is_int, int e)
 {
     int e_offset, d, n, n0;
@@ -910,7 +1369,7 @@ static int mul_pow(mpb_t *a, int radix1, int radix_shift, int f, BOOL is_int, in
                 }
                 h = mp_mul1(a->tab, a->tab, a->len, b, 0);
                 if (h != 0) {
-                    a->tab[a->len++] = h;
+                    a->tab[a->len++] = h;  // 处理进位
                 }
                 f -= n;
             }
@@ -944,7 +1403,7 @@ static int mul_pow(mpb_t *a, int radix1, int radix_shift, int f, BOOL is_int, in
                     n0 = n;
                 }
                 r = mp_div1norm(a->tab, a->tab, a->len, b, 0, b_inv, shift);
-                rem |= r;
+                rem |= r;  // 累积余数（用于舍入）
                 mpb_renorm(a);
                 f -= n;
             }
@@ -966,7 +1425,30 @@ static void mul_pow_round(mpb_t *tmp1, uint64_t m, int e, int radix1, int radix_
     mpb_shr_round(tmp1, -e + e_offset, rnd_mode);
 }
 
-/* return round(a*2^e_offset) rounded as a float64. 'a' is modified */
+/**
+ * round_to_d - 将多精度数舍入为 IEEE 754 double 格式
+ * 
+ * @pe: 输出参数，存储指数
+ * @a: 多精度数（输入输出，会被修改/销毁）
+ * @e_offset: 指数偏移量
+ * @rnd_mode: 舍入模式（JS_RNDN/JS_RNDNA/JS_RNDZ）
+ * @return: 尾数 m（52 位，隐含最高位 1）
+ * 
+ * 输出格式:
+ * 返回 (m, e) 使得 m * 2^(e-53) = round(a * 2^e_offset)
+ * 其中 2^52 <= m < 2^53（规格化数）或 m=0（零）
+ * 
+ * 处理情况:
+ * 1. 零：a=0 时返回 m=0
+ * 2. 次正规数：e < -1021 时，精度降低
+ * 3. 规格化数：标准 53 位精度
+ * 4. 尾数溢出：舍入后 m >= 2^53 时，右移并增加指数
+ * 
+ * IEEE 754 double 格式:
+ * - 符号位：1 位（由调用者处理）
+ * - 指数：11 位（偏移 1023）
+ * - 尾数：52 位（隐含最高位 1）
+ */
 static uint64_t round_to_d(int *pe, mpb_t *a, int e_offset, int rnd_mode)
 {
     int e;
@@ -979,17 +1461,17 @@ static uint64_t round_to_d(int *pe, mpb_t *a, int e_offset, int rnd_mode)
     } else {
         int prec, prec1, e_min;
         e = mpb_floor_log2(a) + 1 - e_offset;
-        prec1 = 53;
-        e_min = -1021;
+        prec1 = 53;  // double 的尾数位数
+        e_min = -1021;  // 次正规数的最小指数
         if (e < e_min) {
             /* subnormal result or zero */
-            prec = prec1 - (e_min - e);
+            prec = prec1 - (e_min - e);  // 精度降低
         } else {
             prec = prec1;
         }
         mpb_shr_round(a, e + e_offset - prec, rnd_mode);
         m = mpb_get_u64(a);
-        m <<= (53 - prec);
+        m <<= (53 - prec);  // 左移到标准位置
         /* mantissa overflow due to rounding */
         if (m >= (uint64_t)1 << 53) {
             m >>= 1;
