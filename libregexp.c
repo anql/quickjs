@@ -301,6 +301,16 @@ static void re_string_list_free(REStringList *s)
     cr_free(&s->cr);
 }
 
+/**
+ * @brief 打印字符的转义表示
+ * @param c 要打印的字符（Unicode 码点）
+ * @param is_range 是否在字符范围上下文中（影响连字符和右括号的转义）
+ * 
+ * 用于调试输出，将字符以可读形式打印：
+ * - 特殊字符（单引号、反斜杠、连字符、右括号）使用反斜杠转义
+ * - 可打印 ASCII 字符（0x20-0x7E）直接输出
+ * - 其他字符使用 \u{XXXX} 格式输出 Unicode 码点
+ */
 static void lre_print_char(int c, BOOL is_range)
 {
     if (c == '\'' || c == '\\' ||
@@ -313,6 +323,17 @@ static void lre_print_char(int c, BOOL is_range)
     }
 }
 
+/**
+ * @brief 调试函数：打印字符串列表的详细内容
+ * @param str 标题字符串
+ * @param s 要打印的字符串列表
+ * 
+ * 用于调试，输出字符串列表的两个部分：
+ * - 字符范围（ranges）：以区间形式显示所有字符范围
+ * - 字符串哈希表：逐个打印哈希表中存储的字符串
+ * 
+ * 仅在调试模式下使用（__maybe_unused 标记）
+ */
 static __maybe_unused void re_string_list_dump(const char *str, const REStringList *s)
 {
     REString *p;
@@ -344,6 +365,26 @@ static __maybe_unused void re_string_list_dump(const char *str, const REStringLi
     }
 }
 
+/**
+ * @brief 在字符串列表中查找或添加字符串
+ * @param s 字符串列表
+ * @param len 字符串长度（字符数）
+ * @param buf 字符串缓冲区（Unicode 码点数组）
+ * @param h0 预计算的哈希值
+ * @param add_flag 是否允许添加新字符串（TRUE=找不到则添加）
+ * @return 1=找到，0=未找到且不添加，-1=内存错误
+ * 
+ * 核心算法：
+ * 1. 使用哈希值的高位作为哈希表索引
+ * 2. 在链表中线性搜索匹配的字符串（比较哈希值、长度、内容）
+ * 3. 如果未找到且 add_flag 为真，则扩容哈希表并插入新字符串
+ * 4. 哈希表扩容策略：当元素数量超过容量时，位数 +1，容量翻倍
+ * 
+ * 返回值含义：
+ * - 1: 字符串已存在（或成功添加）
+ * - 0: 字符串不存在且未添加
+ * - -1: 内存分配失败
+ */
 static int re_string_find2(REStringList *s, int len, const uint32_t *buf,
                            uint32_t h0, BOOL add_flag)
 {
@@ -400,6 +441,16 @@ static int re_string_find2(REStringList *s, int len, const uint32_t *buf,
     return 1;
 }
 
+/**
+ * @brief 在字符串列表中查找字符串（计算哈希值版本）
+ * @param s 字符串列表
+ * @param len 字符串长度
+ * @param buf 字符串缓冲区
+ * @param add_flag 是否允许添加
+ * @return 1=找到，0=未找到，-1=错误
+ * 
+ * 包装函数：先计算字符串哈希值，然后调用 re_string_find2
+ */
 static int re_string_find(REStringList *s, int len, const uint32_t *buf,
                           BOOL add_flag)
 {
@@ -408,6 +459,17 @@ static int re_string_find(REStringList *s, int len, const uint32_t *buf,
     return re_string_find2(s, len, buf, h0, add_flag);
 }
 
+/**
+ * @brief 向字符串列表添加单个字符或字符串
+ * @param s 字符串列表
+ * @param len 字符串长度
+ * @param buf 字符串缓冲区
+ * @return 0=成功，-1=内存错误
+ * 
+ * 优化策略：
+ * - 长度为 1 的字符串：直接添加到字符范围（CharRange），使用区间并集操作
+ * - 长度>1 的字符串：使用哈希表存储，调用 re_string_find 添加
+ */
 /* return -1 if memory error, 0 if OK */
 static int re_string_add(REStringList *s, int len, const uint32_t *buf)
 {
@@ -419,6 +481,21 @@ static int re_string_add(REStringList *s, int len, const uint32_t *buf)
     return 0;
 }
 
+/**
+ * @brief 对两个字符串列表执行集合运算
+ * @param a 目标列表（结果存储于此）
+ * @param b 源列表
+ * @param op 运算类型（CR_OP_UNION=并集，CR_OP_INTER=交集，CR_OP_SUB=差集）
+ * @return 0=成功，-1=内存错误
+ * 
+ * 运算流程：
+ * 1. 先对字符范围部分执行指定的集合运算（cr_op1）
+ * 2. 根据运算类型处理字符串哈希表部分：
+ *    - 并集：将 b 的所有字符串添加到 a
+ *    - 交集/差集：遍历 a 的字符串，检查是否在 b 中存在，不符合的删除
+ * 
+ * 注意：交集和差集运算会释放 a 的旧字符串列表
+ */
 /* a = a op b */
 static int re_string_list_op(REStringList *a, REStringList *b, int op)
 {
@@ -507,11 +584,28 @@ static int re_string_list_canonicalize(REParseState *s1,
     return 0;
 }
 
+/**
+ * @brief 数字字符范围 \d = [0-9]
+ * 
+ * 格式：第一个元素是区间数量，后续每两个元素表示一个区间 [start, end+1)
+ */
 static const uint16_t char_range_d[] = {
     1,
     0x0030, 0x0039 + 1,
 };
 
+/**
+ * @brief 空白字符范围 \s
+ * 
+ * 包含以下 Unicode 字符：
+ * - 控制字符：HT(0x09), LF(0x0A), VT(0x0B), FF(0x0C), CR(0x0D)
+ * - 空格：SPACE(0x20), NBSP(0x00A0)
+ * - 各种 Unicode 空格：EN QUAD 到 HAIR SPACE(0x2000-0x200A)
+ * - 行/段分隔符：LINE SEPARATOR(0x2028), PARAGRAPH SEPARATOR(0x2029)
+ * - 窄空格：NARROW NBSP(0x202F), MEDIUM MATH SPACE(0x205F)
+ * - 全角空格：IDEOGRAPHIC SPACE(0x3000)
+ * - BOM：ZERO WIDTH NO-BREAK SPACE(0xFEFF)
+ */
 /* code point ranges for Zs,Zl or Zp property */
 static const uint16_t char_range_s[] = {
     10,
@@ -530,6 +624,12 @@ static const uint16_t char_range_s[] = {
     0xFEFF, 0xFEFF + 1,
 };
 
+/**
+ * @brief 单词字符范围 \w = [0-9A-Za-z_]
+ * 
+ * 包含：数字 0-9、大写字母 A-Z、下划线_、小写字母 a-z
+ * 注意：仅包含 ASCII 字符，不包含 Unicode 字母
+ */
 static const uint16_t char_range_w[] = {
     4,
     0x0030, 0x0039 + 1,
@@ -555,6 +655,22 @@ static const uint16_t * const char_range_table[] = {
     char_range_w,
 };
 
+/**
+ * @brief 初始化字符范围类（\d, \D, \s, \S, \w, \W）
+ * @param s 解析状态
+ * @param cr 输出的字符串列表（包含字符范围）
+ * @param c 字符类标识符
+ * @return 0=成功，-1=失败
+ * 
+ * 参数 c 的编码：
+ * - 低 1 位：是否取反（1=取反，如 \D 是 \d 的取反）
+ * - 高位部分：索引 char_range_table（0=\d, 1=\s, 2=\w）
+ * 
+ * 流程：
+ * 1. 从预定义表中获取字符范围数据
+ * 2. 将所有区间点添加到字符范围
+ * 3. 如果需要取反，调用 cr_invert 进行补集运算
+ */
 static int cr_init_char_range(REParseState *s, REStringList *cr, uint32_t c)
 {
     BOOL invert;
@@ -580,6 +696,26 @@ static int cr_init_char_range(REParseState *s, REStringList *cr, uint32_t c)
 }
 
 #ifdef DUMP_REOP
+/**
+ * @brief 调试函数：打印正则字节码的可读形式
+ * @param buf 字节码缓冲区
+ * @param buf_len 字节码长度
+ * 
+ * 输出内容包括：
+ * - 文件头信息：标志位、捕获组数量、寄存器数量
+ * - 命名组信息（如果有）
+ * - 字节码指令序列：每条指令的操作码和操作数
+ * 
+ * 支持的指令格式：
+ * - 字符指令：显示字符本身或 Unicode 码点
+ * - 跳转指令：计算并显示目标地址
+ * - 循环指令：显示寄存器编号、循环次数、目标地址
+ * - 捕获组指令：显示组编号
+ * - 反向引用：显示引用的捕获组列表
+ * - 集合指令：显示寄存器编号和值
+ * 
+ * 仅在 DUMP_REOP 调试模式下编译
+ */
 static __maybe_unused void lre_dump_bytecode(const uint8_t *buf,
                                                      int buf_len)
 {
@@ -733,11 +869,27 @@ static __maybe_unused void lre_dump_bytecode(const uint8_t *buf,
 }
 #endif
 
+/**
+ * @brief 发射单个操作码字节
+ * @param s 解析状态（包含字节码缓冲区）
+ * @param op 操作码
+ * 
+ * 最简单的发射函数，仅写入一个字节的操作码
+ */
 static void re_emit_op(REParseState *s, int op)
 {
     dbuf_putc(&s->byte_code, op);
 }
 
+/**
+ * @brief 发射操作码 + 32 位无符号整数操作数
+ * @param s 解析状态
+ * @param op 操作码
+ * @param val 32 位操作数值
+ * @return 操作数在字节码中的偏移位置
+ * 
+ * 用于需要记录操作数位置的场景（如后续回填跳转目标）
+ */
 /* return the offset of the u32 value */
 static int re_emit_op_u32(REParseState *s, int op, uint32_t val)
 {
@@ -748,6 +900,16 @@ static int re_emit_op_u32(REParseState *s, int op, uint32_t val)
     return pos;
 }
 
+/**
+ * @brief 发射跳转指令（计算相对偏移）
+ * @param s 解析状态
+ * @param op 操作码
+ * @param val 目标绝对地址
+ * @return 操作数在字节码中的偏移位置
+ * 
+ * 自动计算相对偏移：target_offset = dest_addr - (current_pos + 4)
+ * 其中 4 字节 = 操作码 1 字节 + 操作数 4 字节 - 1（已写入操作码）
+ */
 static int re_emit_goto(REParseState *s, int op, uint32_t val)
 {
     int pos;
@@ -757,6 +919,14 @@ static int re_emit_goto(REParseState *s, int op, uint32_t val)
     return pos;
 }
 
+/**
+ * @brief 发射跳转指令（8 位参数 +32 位目标地址）
+ * @param s 解析状态
+ * @param op 操作码
+ * @param arg 8 位参数（如寄存器编号）
+ * @param val 目标绝对地址
+ * @return 操作数在字节码中的偏移位置
+ */
 static int re_emit_goto_u8(REParseState *s, int op, uint32_t arg, uint32_t val)
 {
     int pos;
@@ -767,6 +937,15 @@ static int re_emit_goto_u8(REParseState *s, int op, uint32_t arg, uint32_t val)
     return pos;
 }
 
+/**
+ * @brief 发射跳转指令（8 位参数 +32 位参数 +32 位目标地址）
+ * @param s 解析状态
+ * @param op 操作码
+ * @param arg0 第一个 8 位参数
+ * @param arg1 第二个 32 位参数
+ * @param val 目标绝对地址
+ * @return 操作数在字节码中的偏移位置
+ */
 static int re_emit_goto_u8_u32(REParseState *s, int op, uint32_t arg0, uint32_t arg1, uint32_t val)
 {
     int pos;
@@ -778,18 +957,40 @@ static int re_emit_goto_u8_u32(REParseState *s, int op, uint32_t arg0, uint32_t 
     return pos;
 }
 
+/**
+ * @brief 发射操作码 + 8 位无符号整数操作数
+ * @param s 解析状态
+ * @param op 操作码
+ * @param val 8 位操作数值
+ */
 static void re_emit_op_u8(REParseState *s, int op, uint32_t val)
 {
     dbuf_putc(&s->byte_code, op);
     dbuf_putc(&s->byte_code, val);
 }
 
+/**
+ * @brief 发射操作码 + 16 位无符号整数操作数
+ * @param s 解析状态
+ * @param op 操作码
+ * @param val 16 位操作数值
+ */
 static void re_emit_op_u16(REParseState *s, int op, uint32_t val)
 {
     dbuf_putc(&s->byte_code, op);
     dbuf_put_u16(&s->byte_code, val);
 }
 
+/**
+ * @brief 格式化正则表达式解析错误信息
+ * @param s 解析状态（错误信息存储于 s->u.error_msg）
+ * @param fmt 格式化字符串（printf 风格）
+ * @param ... 可变参数
+ * @return -1（始终返回 -1 表示错误）
+ * 
+ * 使用 vsnprintf 安全地格式化错误信息，限制在 error_msg 缓冲区大小内
+ * __attribute__((format(printf, 2, 3))) 用于编译器格式字符串检查
+ */
 static int __attribute__((format(printf, 2, 3))) re_parse_error(REParseState *s, const char *fmt, ...)
 {
     va_list ap;
@@ -799,11 +1000,33 @@ static int __attribute__((format(printf, 2, 3))) re_parse_error(REParseState *s,
     return -1;
 }
 
+/**
+ * @brief 报告内存不足错误
+ * @param s 解析状态
+ * @return -1
+ * 
+ * 包装函数，调用 re_parse_error 生成 "out of memory" 错误信息
+ */
 static int re_parse_out_of_memory(REParseState *s)
 {
     return re_parse_error(s, "out of memory");
 }
 
+/**
+ * @brief 解析数字序列（十进制）
+ * @param pp 输入字符串指针的指针（解析后更新）
+ * @param allow_overflow 是否允许溢出（TRUE=溢出时返回 INT32_MAX，FALSE=溢出返回 -1）
+ * @return 解析的数字值，或 -1（溢出且不允许）
+ * 
+ * 解析规则：
+ * - 连续读取十进制数字字符（'0'-'9'）
+ * - 使用 uint64_t 累加，检测是否超过 INT32_MAX
+ * - 如果没有数字，返回 0
+ * 
+ * 溢出处理：
+ * - allow_overflow=TRUE: 溢出时返回 INT32_MAX
+ * - allow_overflow=FALSE: 溢出时返回 -1
+ */
 /* If allow_overflow is false, return -1 in case of
    overflow. Otherwise return INT32_MAX. */
 static int parse_digits(const uint8_t **pp, BOOL allow_overflow)
