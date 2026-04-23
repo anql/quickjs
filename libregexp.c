@@ -1300,15 +1300,36 @@ static int get_class_atom(REParseState *s, REStringList *cr,
     return c;
 }
 
+/**
+ * re_emit_range - 发射字符范围字节码
+ * 
+ * 将 CharRange 中的字符范围转换为字节码指令。
+ * 根据字符码点范围选择 16 位或 32 位操作码以优化空间。
+ * 
+ * @s: 解析状态
+ * @cr: 字符范围集合（已排序的不相交区间）
+ * @return: 0=成功，-1=失败
+ * 
+ * 优化策略:
+ * - 空范围：发射 REOP_char32 -1（匹配失败）
+ * - 全在 BMP 内（<=0xffff）：使用 REOP_range（16 位编码）
+ * - 超出 BMP：使用 REOP_range32（32 位编码）
+ * - 忽略大小写模式：使用 *_i  variants
+ * 
+ * 字节码格式:
+ * REOP_range: [opcode:1][count:2][ranges: count*(low:2 + high:2)]
+ * REOP_range32: [opcode:1][count:2][ranges: count*(low:4 + high:4)]
+ */
 static int re_emit_range(REParseState *s, const CharRange *cr)
 {
     int len, i;
     uint32_t high;
 
-    len = (unsigned)cr->len / 2;
+    len = (unsigned)cr->len / 2;  // 区间数量（每个区间 2 个点：start, end）
     if (len >= 65535)
         return re_parse_error(s, "too many ranges");
     if (len == 0) {
+        // 空范围：匹配任何字符都失败
         re_emit_op_u32(s, REOP_char32, -1);
     } else {
         high = cr->points[cr->len - 1];
@@ -1317,6 +1338,7 @@ static int re_emit_range(REParseState *s, const CharRange *cr)
         if (high <= 0xffff) {
             /* can use 16 bit ranges with the conversion that 0xffff =
                infinity */
+            // 使用 16 位范围操作码（节省空间）
             re_emit_op_u16(s, s->ignore_case ? REOP_range_i : REOP_range, len);
             for(i = 0; i < cr->len; i += 2) {
                 dbuf_put_u16(&s->byte_code, cr->points[i]);
@@ -1326,6 +1348,7 @@ static int re_emit_range(REParseState *s, const CharRange *cr)
                 dbuf_put_u16(&s->byte_code, high);
             }
         } else {
+            // 使用 32 位范围操作码（支持全 Unicode）
             re_emit_op_u16(s, s->ignore_case ? REOP_range32_i : REOP_range32, len);
             for(i = 0; i < cr->len; i += 2) {
                 dbuf_put_u32(&s->byte_code, cr->points[i]);
@@ -1360,11 +1383,13 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
     //    re_string_list_dump("sl", sl);
     if (sl->n_strings == 0) {
         /* simple case: only characters */
+        // 简单情况：只有字符范围，没有多字符字符串
         if (re_emit_range(s, &sl->cr))
             return -1;
     } else {
         /* at least one string list is present : match the longest ones first */
         /* XXX: add a new op_switch opcode to compile as a trie */
+        // 复杂情况：有多字符字符串，优先匹配长的（TODO: 可用 trie 优化）
         tab = lre_realloc(s->opaque, NULL, sizeof(tab[0]) * sl->n_strings);
         if (!tab) {
             re_parse_out_of_memory(s);
@@ -1372,6 +1397,7 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
         }
         has_empty_string = FALSE;
         n = 0;
+        // 收集所有非空字符串到数组
         for(i = 0; i < sl->hash_size; i++) {
             for(p = sl->hash_table[i]; p != NULL; p = p->next) {
                 if (p->len == 0) {
@@ -1383,27 +1409,31 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
         }
         assert(n <= sl->n_strings);
         
+        // 按长度降序排序（长字符串优先匹配）
         rqsort(tab, n, sizeof(tab[0]), re_string_cmp_len, NULL);
 
         last_match_pos = -1;
+        // 为每个字符串生成匹配代码
         for(i = 0; i < n; i++) {
             p = tab[i];
             is_last = !has_empty_string && sl->cr.len == 0 && i == (n - 1);
             if (!is_last)
-                split_pos = re_emit_op_u32(s, REOP_split_next_first, 0);
+                split_pos = re_emit_op_u32(s, REOP_split_next_first, 0);  // 分支点
             else
                 split_pos = 0;
+            // 发射字符串的每个字符
             for(j = 0; j < p->len; j++) {
                 re_emit_char(s, p->buf[j]);
             }
             if (!is_last) {
-                last_match_pos = re_emit_op_u32(s, REOP_goto, last_match_pos);
-                put_u32(s->byte_code.buf + split_pos, s->byte_code.size - (split_pos + 4));
+                last_match_pos = re_emit_op_u32(s, REOP_goto, last_match_pos);  // 跳转到匹配成功点
+                put_u32(s->byte_code.buf + split_pos, s->byte_code.size - (split_pos + 4));  // 回填分支偏移
             }
         }
 
         if (sl->cr.len != 0) {
             /* char range */
+            // 添加字符范围匹配
             is_last = !has_empty_string;
             if (!is_last)
                 split_pos = re_emit_op_u32(s, REOP_split_next_first, 0);
@@ -1418,6 +1448,7 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
         }
 
         /* patch the 'goto match' */
+        // 回填所有 goto 指令，指向匹配成功后的位置
         while (last_match_pos != -1) {
             int next_pos = get_u32(s->byte_code.buf + last_match_pos);
             put_u32(s->byte_code.buf + last_match_pos, s->byte_code.size - (last_match_pos + 4));
