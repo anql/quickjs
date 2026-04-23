@@ -3560,6 +3560,16 @@ static JSAtom JS_DupAtomRT(JSRuntime *rt, JSAtom v)
     return v;
 }
 
+/**
+ * JS_DupAtom - 增加 Atom 引用计数
+ * @ctx: 上下文
+ * @v: Atom 值
+ * 返回: 增加引用计数后的 Atom
+ * 
+ * 说明：
+ * - 仅对非常量 Atom 增加引用计数
+ * - 常量 Atom 直接返回，无需计数
+ */
 JSAtom JS_DupAtom(JSContext *ctx, JSAtom v)
 {
     JSRuntime *rt;
@@ -18049,6 +18059,16 @@ static JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val, BOOL is_ToP
     }
 }
 
+/**
+ * JS_ToString - 将值转换为字符串
+ * @ctx: 上下文
+ * @val: 要转换的 JSValue
+ * 返回: 转换后的字符串 JSValue
+ * 
+ * 说明：
+ * - 支持所有 JS 类型（Number, Boolean, Object, Symbol 等）
+ * - 遵循 ECMAScript ToString 抽象操作
+ */
 JSValue JS_ToString(JSContext *ctx, JSValueConst val)
 {
     return JS_ToStringInternal(ctx, val, FALSE);
@@ -18069,6 +18089,16 @@ static JSValue JS_ToLocaleStringFree(JSContext *ctx, JSValue val)
     return JS_InvokeFree(ctx, val, JS_ATOM_toLocaleString, 0, NULL);
 }
 
+/**
+ * JS_ToPropertyKey - 将值转换为属性键
+ * @ctx: 上下文
+ * @val: 要转换的 JSValue
+ * 返回: 转换后的属性键（字符串或 Symbol）
+ * 
+ * 说明：
+ * - 用于对象属性访问时的键转换
+ * - Symbol 类型保持不变，其他类型转为字符串
+ */
 JSValue JS_ToPropertyKey(JSContext *ctx, JSValueConst val)
 {
     return JS_ToStringInternal(ctx, val, TRUE);
@@ -20419,6 +20449,18 @@ static BOOL js_strict_eq(JSContext *ctx, JSValueConst op1, JSValueConst op2)
                          JS_EQ_STRICT);
 }
 
+/**
+ * JS_StrictEq - 严格相等比较 (===)
+ * @ctx: 上下文
+ * @op1: 操作数 1
+ * @op2: 操作数 2
+ * 返回: TRUE 如果两值严格相等
+ * 
+ * 说明：
+ * - 实现 ECMAScript Strict Equality Comparison
+ * - 类型不同直接返回 FALSE
+ * - NaN !== NaN
+ */
 BOOL JS_StrictEq(JSContext *ctx, JSValueConst op1, JSValueConst op2)
 {
     return js_strict_eq(ctx, op1, op2);
@@ -20431,6 +20473,18 @@ static BOOL js_same_value(JSContext *ctx, JSValueConst op1, JSValueConst op2)
                          JS_EQ_SAME_VALUE);
 }
 
+/**
+ * JS_SameValue - SameValue 比较
+ * @ctx: 上下文
+ * @op1: 操作数 1
+ * @op2: 操作数 2
+ * 返回: TRUE 如果两值 SameValue 相等
+ * 
+ * 说明：
+ * - 用于 Map/Set 的键比较
+ * - 与 === 类似，但 NaN === NaN
+ * - +0 和 -0 视为不同
+ */
 BOOL JS_SameValue(JSContext *ctx, JSValueConst op1, JSValueConst op2)
 {
     return js_same_value(ctx, op1, op2);
@@ -20443,6 +20497,18 @@ static BOOL js_same_value_zero(JSContext *ctx, JSValueConst op1, JSValueConst op
                          JS_EQ_SAME_VALUE_ZERO);
 }
 
+/**
+ * JS_SameValueZero - SameValueZero 比较
+ * @ctx: 上下文
+ * @op1: 操作数 1
+ * @op2: 操作数 2
+ * 返回: TRUE 如果两值 SameValueZero 相等
+ * 
+ * 说明：
+ * - 用于 Array.includes 等
+ * - NaN === NaN
+ * - +0 和 -0 视为相同
+ */
 BOOL JS_SameValueZero(JSContext *ctx, JSValueConst op1, JSValueConst op2)
 {
     return js_same_value_zero(ctx, op1, op2);
@@ -26069,6 +26135,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     return ret_val;
 }
 
+/**
+ * JS_Call - 调用 JavaScript 函数
+ * @ctx: 上下文
+ * @func_obj: 函数对象
+ * @this_obj: this 绑定对象
+ * @argc: 参数个数
+ * @argv: 参数数组
+ * 返回: 函数返回值
+ * 
+ * 说明：
+ * - 最常用的函数调用 API
+ * - 自动复制参数数组（安全）
+ */
 JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                 int argc, JSValueConst *argv)
 {
@@ -26209,6 +26288,19 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
     }
 }
 
+/**
+ * JS_CallConstructor2 - 以构造函数方式调用函数（指定 new.target）
+ * @ctx: 上下文
+ * @func_obj: 构造函数对象
+ * @new_target: new.target 值（用于继承）
+ * @argc: 参数个数
+ * @argv: 参数数组
+ * 返回: 新创建的对象或返回值
+ * 
+ * 说明：
+ * - 用于实现 new 操作符
+ * - 支持类继承时的 new.target 绑定
+ */
 JSValue JS_CallConstructor2(JSContext *ctx, JSValueConst func_obj,
                             JSValueConst new_target,
                             int argc, JSValueConst *argv)
@@ -26218,6 +26310,18 @@ JSValue JS_CallConstructor2(JSContext *ctx, JSValueConst func_obj,
                                       JS_CALL_FLAG_COPY_ARGV);
 }
 
+/**
+ * JS_CallConstructor - 以构造函数方式调用函数
+ * @ctx: 上下文
+ * @func_obj: 构造函数对象
+ * @argc: 参数个数
+ * @argv: 参数数组
+ * 返回: 新创建的对象或返回值
+ * 
+ * 说明：
+ * - 用于实现 new 操作符
+ * - new.target 默认为 func_obj 自身
+ */
 JSValue JS_CallConstructor(JSContext *ctx, JSValueConst func_obj,
                            int argc, JSValueConst *argv)
 {
@@ -26226,6 +26330,19 @@ JSValue JS_CallConstructor(JSContext *ctx, JSValueConst func_obj,
                                       JS_CALL_FLAG_COPY_ARGV);
 }
 
+/**
+ * JS_Invoke - 调用对象的方法
+ * @ctx: 上下文
+ * @this_val: 调用对象（this 绑定）
+ * @atom: 方法名 Atom
+ * @argc: 参数个数
+ * @argv: 参数数组
+ * 返回: 方法返回值
+ * 
+ * 说明：
+ * - 等价于 this_val[atom](...argv)
+ * - 自动获取并调用属性方法
+ */
 JSValue JS_Invoke(JSContext *ctx, JSValueConst this_val, JSAtom atom,
                   int argc, JSValueConst *argv)
 {
@@ -29138,12 +29255,16 @@ static void skip_shebang(const uint8_t **pp, const uint8_t *buf_end)
     }
 }
 
-/* return true if 'input' contains the source of a module
-   (heuristic). 'input' must be a zero terminated.
-
-   Heuristic: skip comments and expect 'import' keyword not followed
-   by '(' or '.' or export keyword.
-*/
+/**
+ * JS_DetectModule - 检测代码是否为模块
+ * @input: 源代码字符串（必须以'\0'结尾）
+ * @input_len: 代码长度
+ * 返回: TRUE 如果检测到模块语法
+ * 
+ * 说明：
+ * - 启发式检测：跳过注释后查找 import/export 关键字
+ * - import 后跟 '(' 或 '.' 则不是模块（是函数调用或属性访问）
+ */
 BOOL JS_DetectModule(const char *input, size_t input_len)
 {
     const uint8_t *p = (const uint8_t *)input;
@@ -35255,6 +35376,16 @@ int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val)
     return 0;
 }
 
+/**
+ * JS_GetModulePrivateValue - 获取模块私有值
+ * @ctx: 上下文
+ * @m: 模块定义
+ * 返回: 模块私有值的副本
+ * 
+ * 说明：
+ * - 用于存储模块级别的私有状态
+ * - 返回值的引用计数已增加
+ */
 JSValue JS_GetModulePrivateValue(JSContext *ctx, JSModuleDef *m)
 {
     return JS_DupValue(ctx, m->private_value);
@@ -36012,6 +36143,17 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
     return JS_EXCEPTION;
 }
 
+/**
+ * JS_GetModuleNamespace - 获取模块命名空间对象
+ * @ctx: 上下文
+ * @m: 模块定义
+ * 返回: 模块命名空间对象（包含所有导出）
+ * 
+ * 说明：
+ * - 用于实现 import * as ns from "module"
+ * - 首次调用时构建命名空间对象并缓存
+ * - 返回值的引用计数已增加
+ */
 JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m)
 {
     if (JS_IsUndefined(m->module_ns)) {
@@ -36427,8 +36569,17 @@ static int js_link_module(JSContext *ctx, JSModuleDef *m)
     return 0;
 }
 
-/* return JS_ATOM_NULL if the name cannot be found. Only works with
-   not striped bytecode functions. */
+/**
+ * JS_GetScriptOrModuleName - 获取当前脚本或模块的文件名
+ * @ctx: 上下文
+ * @n_stack_levels: 向上遍历的栈帧层数
+ * 返回: 文件名的 Atom（找不到返回 JS_ATOM_NULL）
+ * 
+ * 说明：
+ * - 用于获取当前执行上下文的源文件信息
+ * - 仅适用于未剥离调试信息的字节码函数
+ * - 从调试信息中获取 filename
+ */
 JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels)
 {
     JSStackFrame *sf;
@@ -36464,11 +36615,28 @@ JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels)
     }
 }
 
+/**
+ * JS_GetModuleName - 获取模块名称
+ * @ctx: 上下文
+ * @m: 模块定义
+ * 返回: 模块名称的 Atom（引用计数已增加）
+ */
 JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m)
 {
     return JS_DupAtom(ctx, m->module_name);
 }
 
+/**
+ * JS_GetImportMeta - 获取模块的 import.meta 对象
+ * @ctx: 上下文
+ * @m: 模块定义
+ * 返回: import.meta 对象（首次调用时创建）
+ * 
+ * 说明：
+ * - 用于实现 import.meta 语法
+ * - 按需创建以节省内存
+ * - 返回值的引用计数已增加
+ */
 JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m)
 {
     JSValue obj;
@@ -36594,8 +36762,18 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
     JS_FreeValue(ctx, evaluate_promise);
 }
 
-/* Return a promise or an exception in case of memory error. Used by
-   os.Worker() */
+/**
+ * JS_LoadModule - 加载并执行模块
+ * @ctx: 上下文
+ * @basename: 基础路径（用于相对路径解析）
+ * @filename: 模块文件名
+ * 返回: Promise 对象（模块加载完成后 resolve）
+ * 
+ * 说明：
+ * - 异步加载模块，返回 Promise
+ * - 用于实现动态 import()
+ * - 也用于 os.Worker() 的模块加载
+ */
 JSValue JS_LoadModule(JSContext *ctx, const char *basename,
                       const char *filename)
 {
@@ -43409,6 +43587,16 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
     return ret_val;
 }
 
+/**
+ * JS_EvalFunction - 执行已编译的函数对象
+ * @ctx: 上下文
+ * @fun_obj: 字节码函数对象
+ * 返回: 执行结果
+ * 
+ * 说明：
+ * - 用于执行 JS_CompileFunction 等编译后的结果
+ * - 在全局上下文中执行
+ */
 JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
 {
     return JS_EvalFunctionInternal(ctx, fun_obj, ctx->global_obj, NULL, NULL);
@@ -43571,6 +43759,20 @@ static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
 
 }
 
+/**
+ * JS_EvalThis - 在指定 this 上下文中执行代码
+ * @ctx: 上下文
+ * @this_obj: this 绑定对象
+ * @input: 源代码字符串
+ * @input_len: 代码长度
+ * @filename: 文件名（用于错误报告）
+ * @eval_flags: 评估标志（JS_EVAL_TYPE_* 等）
+ * 返回: 执行结果
+ * 
+ * 说明：
+ * - 仅支持 GLOBAL 或 MODULE 类型
+ * - 允许自定义 this 绑定
+ */
 JSValue JS_EvalThis(JSContext *ctx, JSValueConst this_obj,
                     const char *input, size_t input_len,
                     const char *filename, int eval_flags)
@@ -43585,6 +43787,20 @@ JSValue JS_EvalThis(JSContext *ctx, JSValueConst this_obj,
     return ret;
 }
 
+/**
+ * JS_Eval - 执行 JavaScript 代码
+ * @ctx: 上下文
+ * @input: 源代码字符串（必须以'\0'结尾）
+ * @input_len: 代码长度
+ * @filename: 文件名（用于错误报告）
+ * @eval_flags: 评估标志
+ * 返回: 执行结果
+ * 
+ * 说明：
+ * - 最常用的代码执行入口
+ * - 支持全局/模块/直接 eval
+ * - 默认在全局对象上下文中执行
+ */
 JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
                 const char *filename, int eval_flags)
 {
@@ -45897,6 +46113,19 @@ static void bc_reader_free(BCReaderState *s)
     js_free(s->ctx, s->objects);
 }
 
+/**
+ * JS_ReadObject - 读取二进制序列化的 JS 对象
+ * @ctx: 上下文
+ * @buf: 二进制数据缓冲区
+ * @buf_len: 数据长度
+ * @flags: 读取标志（JS_READ_OBJ_*）
+ * 返回: 反序列化后的 JSValue
+ * 
+ * 说明：
+ * - 用于加载 JS_WriteObject 生成的二进制数据
+ * - 支持字节码、共享数组缓冲等高级特性
+ * - flags 控制允许的数据类型
+ */
 JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                        int flags)
 {
@@ -56440,12 +56669,33 @@ JSValue JS_ParseJSON3(JSContext *ctx, const char *buf, size_t buf_len,
     return JS_EXCEPTION;
 }
 
+/**
+ * JS_ParseJSON2 - 解析 JSON 字符串（带标志）
+ * @ctx: 上下文
+ * @buf: JSON 字符串
+ * @buf_len: 字符串长度
+ * @filename: 文件名（用于错误报告）
+ * @flags: 解析标志
+ * 返回: 解析后的 JSValue
+ */
 JSValue JS_ParseJSON2(JSContext *ctx, const char *buf, size_t buf_len,
                       const char *filename, int flags)
 {
     return JS_ParseJSON3(ctx, buf, buf_len, filename, flags, NULL);
 }
 
+/**
+ * JS_ParseJSON - 解析 JSON 字符串
+ * @ctx: 上下文
+ * @buf: JSON 字符串
+ * @buf_len: 字符串长度
+ * @filename: 文件名（用于错误报告）
+ * 返回: 解析后的 JSValue
+ * 
+ * 说明：
+ * - 标准 JSON 解析入口
+ * - 遵循 ECMAScript JSON.parse 语义
+ */
 JSValue JS_ParseJSON(JSContext *ctx, const char *buf, size_t buf_len,
                      const char *filename)
 {
@@ -56995,6 +57245,19 @@ exception:
     return -1;
 }
 
+/**
+ * JS_JSONStringify - 将 JS 值序列化为 JSON 字符串
+ * @ctx: 上下文
+ * @obj: 要序列化的对象
+ * @replacer: 替换函数或属性数组（可选）
+ * @space0: 缩进（数字或字符串）
+ * 返回: JSON 字符串 JSValue
+ * 
+ * 说明：
+ * - 实现 ECMAScript JSON.stringify 语义
+ * - replacer 可过滤/转换属性
+ * - space0 控制输出格式（缩进）
+ */
 JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
                          JSValueConst replacer, JSValueConst space0)
 {
@@ -60102,6 +60365,16 @@ typedef struct JSPromiseReactionData {
     JSValue handler;
 } JSPromiseReactionData;
 
+/**
+ * JS_PromiseState - 获取 Promise 状态
+ * @ctx: 上下文
+ * @promise: Promise 对象
+ * 返回: Promise 状态枚举（pending/fulfilled/rejected）
+ * 
+ * 说明：
+ * - 返回 JSPromiseStateEnum 枚举值
+ * - 无效对象返回 -1
+ */
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValue promise)
 {
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
@@ -60110,6 +60383,16 @@ JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValue promise)
     return s->promise_state;
 }
 
+/**
+ * JS_PromiseResult - 获取 Promise 结果值
+ * @ctx: 上下文
+ * @promise: Promise 对象
+ * 返回: Promise 的结果值（引用计数已增加）
+ * 
+ * 说明：
+ * - 仅当 Promise 为 fulfilled/rejected 时有效
+ * - pending 状态返回 undefined
+ */
 JSValue JS_PromiseResult(JSContext *ctx, JSValue promise)
 {
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
@@ -60525,6 +60808,17 @@ static JSValue js_new_promise_capability(JSContext *ctx,
     return JS_EXCEPTION;
 }
 
+/**
+ * JS_NewPromiseCapability - 创建 Promise 能力对象
+ * @ctx: 上下文
+ * @resolving_funcs: 输出数组 [resolve, reject]
+ * 返回: 新的 Promise 对象
+ * 
+ * 说明：
+ * - 用于手动控制 Promise 状态
+ * - resolving_funcs 接收 resolve/reject 函数
+ * - 用于实现 Promise 包装和异步加载
+ */
 JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs)
 {
     return js_new_promise_capability(ctx, resolving_funcs, JS_UNDEFINED);
@@ -62890,6 +63184,16 @@ static const JSCFunctionListEntry js_date_proto_funcs[] = {
     JS_CFUNC_DEF("toJSON", 1, js_date_toJSON ),
 };
 
+/**
+ * JS_NewDate - 创建 Date 对象
+ * @ctx: 上下文
+ * @epoch_ms: 时间戳（毫秒，Unix 纪元）
+ * 返回: Date 对象
+ * 
+ * 说明：
+ * - 用于创建指定时间点的 Date 实例
+ * - 时间戳自动进行 time_clip 规范化
+ */
 JSValue JS_NewDate(JSContext *ctx, double epoch_ms)
 {
     JSValue obj = js_create_from_ctor(ctx, JS_UNDEFINED, JS_CLASS_DATE);
@@ -63582,6 +63886,20 @@ static JSValue js_array_buffer_constructor1(JSContext *ctx,
                                         JS_CLASS_ARRAY_BUFFER);
 }
 
+/**
+ * JS_NewArrayBuffer - 创建外部内存包装的 ArrayBuffer
+ * @ctx: 上下文
+ * @buf: 外部内存缓冲区指针
+ * @len: 缓冲区长度
+ * @free_func: 内存释放回调（NULL 表示不释放）
+ * @opaque: 传递给 free_func 的不透明指针
+ * @is_shared: 是否为 SharedArrayBuffer
+ * 返回: ArrayBuffer 或 SharedArrayBuffer 对象
+ * 
+ * 说明：
+ * - 用于包装外部已分配的内存
+ * - free_func 在 GC 时调用以释放内存
+ */
 JSValue JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
                           JSFreeArrayBufferDataFunc *free_func, void *opaque,
                           BOOL is_shared)
@@ -63592,7 +63910,18 @@ JSValue JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
                                         buf, free_func, opaque, FALSE);
 }
 
-/* create a new ArrayBuffer of length 'len' and copy 'buf' to it */
+/**
+ * JS_NewArrayBufferCopy - 创建带内存拷贝的 ArrayBuffer
+ * @ctx: 上下文
+ * @buf: 源数据缓冲区
+ * @len: 数据长度
+ * 返回: 新的 ArrayBuffer 对象
+ * 
+ * 说明：
+ * - 自动分配内存并拷贝数据
+ * - GC 时自动释放内存
+ * - 适用于一次性数据传递
+ */
 JSValue JS_NewArrayBufferCopy(JSContext *ctx, const uint8_t *buf, size_t len)
 {
     return js_array_buffer_constructor3(ctx, JS_UNDEFINED, len, NULL,

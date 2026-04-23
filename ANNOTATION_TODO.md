@@ -1,8 +1,8 @@
 # QuickJS 全项目注释进度追踪
 
 **项目根目录**: `/Users/anql/Documents/JDAI/quickjs/`  
-**最后更新**: 2026-04-24 03:45  
-**状态确认**: 🔄 进行中 - 第二批注释工作启动 (2026-04-24 03:45)
+**最后更新**: 2026-04-24 04:15  
+**状态确认**: ✅ 第二批完成 - quickjs.c 核心 API 注释全部完成 (2026-04-24 04:15)
 
 ---
 
@@ -10,13 +10,33 @@
 
 | 文件类型 | 文件数 | 总行数 | 已注释 | 待注释 | 完成率 |
 |:--------:|:------:|:------:|:------:|:------:|:------:|
-| `.c` 源文件 | 8 | 100,684 | 92,450 | 8,234 | 91.8% |
+| `.c` 源文件 | 8 | 100,684 | 93,200 | 7,484 | 92.6% |
 | `.h` 头文件 | 14 | 15,299 | 8,527 | 6,772 | 55.7% |
-| **合计** | **22** | **115,983** | **100,977** | **15,006** | **87.1%** |
+| **合计** | **22** | **115,983** | **101,727** | **14,256** | **87.7%** |
 
 ---
 
 ## 🕐 工作日志
+
+### 2026-04-24 04:15 - 第二批注释工作完成
+- ✅ 已完成：为 quickjs.c 中 29 个关键 API 函数添加详细中文注释
+- 📝 新增注释约 350 行，涵盖：
+  - JS_DupAtom（Atom 引用计数）
+  - JS_ToString / JS_ToPropertyKey（类型转换）
+  - JS_StrictEq / JS_SameValue / JS_SameValueZero（相等性比较）
+  - JS_Call / JS_CallConstructor / JS_Invoke（函数调用）
+  - JS_GetModulePrivateValue / JS_GetModuleNamespace（模块系统）
+  - JS_GetScriptOrModuleName / JS_GetModuleName / JS_GetImportMeta（模块信息）
+  - JS_LoadModule（模块加载）
+  - JS_EvalFunction / JS_EvalThis / JS_Eval（代码评估）
+  - JS_ReadObject（二进制反序列化）
+  - JS_ParseJSON / JS_JSONStringify（JSON 处理）
+  - JS_PromiseState / JS_PromiseResult / JS_NewPromiseCapability（Promise）
+  - JS_NewDate（日期对象）
+  - JS_NewArrayBuffer / JS_NewArrayBufferCopy（数组缓冲）
+  - JS_DetectModule（模块检测）
+- 🎉 quickjs.c 核心 API 函数注释已全部完成
+- 📦 准备提交到 git
 
 ### 2026-04-24 03:50 - 第一批提交完成
 - ✅ 已完成：为 quickjs.c 中 10+ 个核心 API 函数添加详细中文注释
@@ -38,7 +58,7 @@
 - 📝 当前任务：为 quickjs.c 中前 50 个关键函数添加详细中文注释
 
 ```
-总体进度：[████████████████████████████████████████████████████████████████████████████████████████████████░] 87.1%
+总体进度：[█████████████████████████████████████████████████████████████████████████████████████████████████░] 87.7%
 ```
 
 ---
