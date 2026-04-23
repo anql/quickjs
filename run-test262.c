@@ -1,5 +1,14 @@
 /*
  * ECMA Test 262 Runner for QuickJS
+ * 
+ * Test262 是 ECMAScript 官方测试套件，用于验证 JavaScript 引擎是否符合 ECMA-262 规范。
+ * 本文件实现了 Test262 测试运行器，支持：
+ * - 严格模式/非严格模式测试
+ * - 异步测试（async/await、Promise）
+ * - 模块测试（ES6 modules）
+ * - 多线程 Agent 测试（SharedArrayBuffer、Atomics）
+ * - 错误检测与报告
+ * - 内存使用统计
  *
  * Copyright (c) 2017-2021 Fabrice Bellard
  * Copyright (c) 2017-2021 Charlie Gordon
@@ -39,58 +48,75 @@
 #include "list.h"
 #include "quickjs-libc.h"
 
-/* enable test262 thread support to test SharedArrayBuffer and Atomics */
+/* 启用 Test262 多线程 Agent 支持，用于测试 SharedArrayBuffer 和 Atomics */
 #define CONFIG_AGENT
 
 #define CMD_NAME "run-test262"
 
+/**
+ * 名称列表数据结构 - 用于管理测试文件列表、排除列表等
+ * 支持动态扩容、排序、去重、二分查找
+ */
 typedef struct namelist_t {
-    char **array;
-    int count;
-    int size;
-    unsigned int sorted : 1;
+    char **array;     /* 字符串数组 */
+    int count;        /* 当前元素个数 */
+    int size;         /* 数组容量 */
+    unsigned int sorted : 1;  /* 是否已排序标记 */
 } namelist_t;
 
-namelist_t test_list;
-namelist_t exclude_list;
-namelist_t exclude_dir_list;
+/* 全局列表变量 */
+namelist_t test_list;         /* 测试文件列表 */
+namelist_t exclude_list;      /* 排除的测试文件列表 */
+namelist_t exclude_dir_list;  /* 排除的目录列表 */
 
-FILE *outfile;
+FILE *outfile;  /* 输出文件句柄（测试报告） */
+
+/**
+ * 测试模式枚举
+ * 控制测试在严格模式/非严格模式下运行
+ */
 enum test_mode_t {
-    TEST_DEFAULT_NOSTRICT, /* run tests as nostrict unless test is flagged as strictonly */
-    TEST_DEFAULT_STRICT,   /* run tests as strict unless test is flagged as nostrict */
-    TEST_NOSTRICT,         /* run tests as nostrict, skip strictonly tests */
-    TEST_STRICT,           /* run tests as strict, skip nostrict tests */
-    TEST_ALL,              /* run tests in both strict and nostrict, unless restricted by spec */
+    TEST_DEFAULT_NOSTRICT,  /* 默认非严格模式，除非测试标记为 strictonly */
+    TEST_DEFAULT_STRICT,    /* 默认严格模式，除非测试标记为 nostrict */
+    TEST_NOSTRICT,          /* 仅非严格模式，跳过 strictonly 测试 */
+    TEST_STRICT,            /* 仅严格模式，跳过 nostrict 测试 */
+    TEST_ALL,               /* 严格和非严格模式都运行（除非规范限制） */
 } test_mode = TEST_DEFAULT_NOSTRICT;
-int compact;
-int show_timings;
-int skip_async;
-int skip_module;
-int new_style;
-int dump_memory;
-int stats_count;
-JSMemoryUsage stats_all, stats_avg, stats_min, stats_max;
-char *stats_min_filename;
-char *stats_max_filename;
-int verbose;
-char *harness_dir;
-char *harness_exclude;
-char *harness_features;
-char *harness_skip_features;
-int *harness_skip_features_count;
-char *error_filename;
-char *error_file;
-FILE *error_out;
-char *report_filename;
-int update_errors;
-int test_count, test_failed, test_index, test_skipped, test_excluded;
-int new_errors, changed_errors, fixed_errors;
-int async_done;
 
+/* 全局配置选项 */
+int compact;                /* 紧凑输出模式（进度指示器） */
+int show_timings;           /* 显示测试耗时 */
+int skip_async;             /* 跳过异步测试 */
+int skip_module;            /* 跳过模块测试 */
+int new_style;              /* 使用新样式 harness（YAML frontmatter） */
+int dump_memory;            /* 输出内存使用统计 */
+int stats_count;            /* 测试计数（用于统计平均） */
+JSMemoryUsage stats_all, stats_avg, stats_min, stats_max;  /* 内存统计 */
+char *stats_min_filename;   /* 最小内存使用文件名 */
+char *stats_max_filename;   /* 最大内存使用文件名 */
+int verbose;                /* 详细模式（输出错误信息） */
+char *harness_dir;          /* harness 文件目录 */
+char *harness_exclude;      /* 排除的 harness 文件 */
+char *harness_features;     /* 启用的特性列表 */
+char *harness_skip_features;  /* 跳过的特性列表 */
+int *harness_skip_features_count;  /* 跳过特性计数数组 */
+char *error_filename;       /* 错误文件名 */
+char *error_file;           /* 错误文件内容 */
+FILE *error_out;            /* 错误输出文件句柄 */
+char *report_filename;      /* 报告文件名 */
+int update_errors;          /* 更新错误文件标记 */
+int test_count, test_failed, test_index, test_skipped, test_excluded;  /* 测试统计 */
+int new_errors, changed_errors, fixed_errors;  /* 错误变化统计 */
+int async_done;             /* 异步测试完成计数器（$DONE() 调用次数） */
+
+/* 函数声明（带 printf 格式检查属性） */
 void warning(const char *, ...) __attribute__((__format__(__printf__, 1, 2)));
 void fatal(int, const char *, ...) __attribute__((__format__(__printf__, 2, 3)));
 
+/**
+ * 警告输出函数
+ * 格式：run-test262: <消息>
+ */
 void warning(const char *fmt, ...)
 {
     va_list ap;
@@ -103,6 +129,11 @@ void warning(const char *fmt, ...)
     fputc('\n', stderr);
 }
 
+/**
+ * 致命错误输出函数 - 打印错误消息并退出程序
+ * @param errcode 退出码
+ * @param fmt 格式化字符串
+ */
 void fatal(int errcode, const char *fmt, ...)
 {
     va_list ap;
@@ -117,6 +148,10 @@ void fatal(int errcode, const char *fmt, ...)
     exit(errcode);
 }
 
+/**
+ * POSIX 错误输出并退出
+ * 用于处理 fopen/fread 等系统调用失败
+ */
 void perror_exit(int errcode, const char *s)
 {
     fflush(stdout);
@@ -125,6 +160,12 @@ void perror_exit(int errcode, const char *s)
     exit(errcode);
 }
 
+/**
+ * 复制指定长度的字符串
+ * @param str 源字符串
+ * @param len 复制长度
+ * @return 新分配的字符串（需手动 free）
+ */
 char *strdup_len(const char *str, int len)
 {
     char *p = malloc(len + 1);
@@ -133,10 +174,23 @@ char *strdup_len(const char *str, int len)
     return p;
 }
 
+/**
+ * 字符串比较（内部使用，避免重复包含 strcmp）
+ */
 static inline int str_equal(const char *a, const char *b) {
     return !strcmp(a, b);
 }
 
+/**
+ * 字符串追加函数 - 将字符串追加到现有字符串后，带分隔符
+ * @param pp 指向字符串指针的指针（会自动更新）
+ * @param sep 分隔符（如空格、逗号）
+ * @param str 要追加的字符串
+ * @return 新字符串指针
+ * 
+ * 示例：str_append(&features, " ", "async") => "async"
+ *       str_append(&features, " ", "module") => "async module"
+ */
 char *str_append(char **pp, const char *sep, const char *str) {
     char *res, *p;
     size_t len = 0;
@@ -154,6 +208,11 @@ char *str_append(char **pp, const char *sep, const char *str) {
     return *pp = res;
 }
 
+/**
+ * 去除字符串首尾空白字符（原地修改）
+ * @param p 输入字符串
+ * @return 去除空白后的字符串指针
+ */
 char *str_strip(char *p)
 {
     size_t len = strlen(p);
@@ -164,16 +223,25 @@ char *str_strip(char *p)
     return p;
 }
 
+/**
+ * 检查字符串是否以指定前缀开头
+ */
 int has_prefix(const char *str, const char *prefix)
 {
     return !strncmp(str, prefix, strlen(prefix));
 }
 
+/**
+ * 跳过字符串前缀（如果匹配）
+ * @param str 原字符串
+ * @param prefix 要跳过的前缀
+ * @return 跳过前缀后的指针（如果不匹配则返回原指针）
+ */
 char *skip_prefix(const char *str, const char *prefix)
 {
     int i;
     for (i = 0;; i++) {
-        if (prefix[i] == '\0') {  /* skip the prefix */
+        if (prefix[i] == '\0') {  /* 前缀匹配完成，跳过 */
             str += i;
             break;
         }
@@ -183,6 +251,10 @@ char *skip_prefix(const char *str, const char *prefix)
     return (char *)str;
 }
 
+/**
+ * 获取文件名的目录部分
+ * 示例：get_basename("/path/to/file.js") => "/path/to"
+ */
 char *get_basename(const char *filename)
 {
     char *p;
@@ -193,6 +265,15 @@ char *get_basename(const char *filename)
     return strdup_len(filename, p - filename);
 }
 
+/**
+ * 组合路径 - 将目录路径和文件名组合成完整路径
+ * @param path 目录路径
+ * @param name 文件名
+ * @return 完整路径（需手动 free）
+ * 
+ * 示例：compose_path("/test262", "test.js") => "/test262/test.js"
+ *       compose_path("", "/abs.js") => "/abs.js"  (绝对路径直接返回)
+ */
 char *compose_path(const char *path, const char *name)
 {
     int path_len, name_len;
@@ -216,13 +297,20 @@ char *compose_path(const char *path, const char *name)
     return d;
 }
 
+/**
+ * 名称列表比较函数 - 改进的字典序比较
+ * 特点：数字部分按数值大小比较（而非字符比较）
+ * 示例："test2.js" < "test10.js" （正确）
+ *      而非 "test10.js" < "test2.js" （错误，普通字典序）
+ */
 int namelist_cmp(const char *a, const char *b)
 {
-    /* compare strings in modified lexicographical order */
+    /* 按改进的字典序比较字符串 */
     for (;;) {
         int ca = (unsigned char)*a++;
         int cb = (unsigned char)*b++;
         if (isdigit(ca) && isdigit(cb)) {
+            /* 数字部分：解析完整数字后比较数值 */
             int na = ca - '0';
             int nb = cb - '0';
             while (isdigit(ca = (unsigned char)*a++))
@@ -243,20 +331,27 @@ int namelist_cmp(const char *a, const char *b)
     }
 }
 
+/**
+ * qsort 回调函数 - 间接比较（用于指针数组）
+ */
 int namelist_cmp_indirect(const void *a, const void *b)
 {
     return namelist_cmp(*(const char **)a, *(const char **)b);
 }
 
+/**
+ * 名称列表排序 - 使用改进字典序，排序后去重
+ * @param lp 要排序的列表
+ */
 void namelist_sort(namelist_t *lp)
 {
     int i, count;
     if (lp->count > 1) {
         qsort(lp->array, lp->count, sizeof(*lp->array), namelist_cmp_indirect);
-        /* remove duplicates */
+        /* 去重：删除重复项 */
         for (count = i = 1; i < lp->count; i++) {
             if (namelist_cmp(lp->array[count - 1], lp->array[i]) == 0) {
-                free(lp->array[i]);
+                free(lp->array[i]);  /* 释放重复项 */
             } else {
                 lp->array[count++] = lp->array[i];
             }
@@ -266,6 +361,12 @@ void namelist_sort(namelist_t *lp)
     lp->sorted = 1;
 }
 
+/**
+ * 名称列表查找 - 二分查找（自动排序如果未排序）
+ * @param lp 列表
+ * @param name 要查找的名称
+ * @return 找到返回索引，否则返回 -1
+ */
 int namelist_find(namelist_t *lp, const char *name)
 {
     int a, b, m, cmp;
@@ -273,6 +374,7 @@ int namelist_find(namelist_t *lp, const char *name)
     if (!lp->sorted) {
         namelist_sort(lp);
     }
+    /* 二分查找 */
     for (a = 0, b = lp->count; a < b;) {
         m = a + (b - a) / 2;
         cmp = namelist_cmp(lp->array[m], name);
@@ -281,11 +383,19 @@ int namelist_find(namelist_t *lp, const char *name)
         else if (cmp > 0)
             b = m;
         else
-            return m;
+            return m;  /* 找到 */
     }
     return -1;
 }
 
+/**
+ * 名称列表添加 - 添加文件路径到列表
+ * @param lp 目标列表
+ * @param base 基础路径（目录）
+ * @param name 文件名
+ * 
+ * 示例：namelist_add(lp, "/test262", "test.js") => 添加 "/test262/test.js"
+ */
 void namelist_add(namelist_t *lp, const char *base, const char *name)
 {
     char *s;
@@ -294,6 +404,7 @@ void namelist_add(namelist_t *lp, const char *base, const char *name)
     if (!s)
         goto fail;
     if (lp->count == lp->size) {
+        /* 扩容：1.5 倍 + 4 个余量 */
         size_t newsize = lp->size + (lp->size >> 1) + 4;
         char **a = realloc(lp->array, sizeof(lp->array[0]) * newsize);
         if (!a)
@@ -308,6 +419,12 @@ fail:
     fatal(1, "allocation failure\n");
 }
 
+/**
+ * 从文件加载名称列表
+ * 文件格式：每行一个路径，支持 # 和 ; 注释
+ * @param lp 目标列表
+ * @param filename 列表文件路径
+ */
 void namelist_load(namelist_t *lp, const char *filename)
 {
     char buf[1024];
@@ -323,7 +440,7 @@ void namelist_load(namelist_t *lp, const char *filename)
     while (fgets(buf, sizeof(buf), f) != NULL) {
         char *p = str_strip(buf);
         if (*p == '#' || *p == ';' || *p == '\0')
-            continue;  /* line comment */
+            continue;  /* 跳过注释行和空行 */
 
         namelist_add(lp, base_name, p);
     }
@@ -331,12 +448,20 @@ void namelist_load(namelist_t *lp, const char *filename)
     fclose(f);
 }
 
+/**
+ * 从错误文件中提取测试文件名
+ * 解析格式：filename.js:line: message
+ * @param lp 目标列表
+ * @param file 错误文件内容（整个文件读入内存）
+ */
 void namelist_add_from_error_file(namelist_t *lp, const char *file)
 {
     const char *p, *p0;
     char *pp;
 
+    /* 查找所有 ".js:" 模式，提取文件名 */
     for (p = file; (p = strstr(p, ".js:")) != NULL; p++) {
+        /* 向前找到行首 */
         for (p0 = p; p0 > file && p0[-1] != '\n'; p0--)
             continue;
         pp = strdup_len(p0, p + 3 - p0);
@@ -345,6 +470,9 @@ void namelist_add_from_error_file(namelist_t *lp, const char *file)
     }
 }
 
+/**
+ * 释放名称列表
+ */
 void namelist_free(namelist_t *lp)
 {
     while (lp->count > 0) {
@@ -355,6 +483,10 @@ void namelist_free(namelist_t *lp)
     lp->size = 0;
 }
 
+/**
+ * ftw 回调函数 - 添加测试文件到列表
+ * 过滤条件：.js 文件，排除 _FIXTURE.js
+ */
 static int add_test_file(const char *filename, const struct stat *ptr, int flag)
 {
     namelist_t *lp = &test_list;
@@ -363,22 +495,34 @@ static int add_test_file(const char *filename, const struct stat *ptr, int flag)
     return 0;
 }
 
-/* find js files from the directory tree and sort the list */
+/**
+ * 遍历目录树，查找所有测试文件并排序
+ * @param path 起始目录
+ */
 static void enumerate_tests(const char *path)
 {
     namelist_t *lp = &test_list;
     int start = lp->count;
-    ftw(path, add_test_file, 100);
+    ftw(path, add_test_file, 100);  /* 最多同时打开 100 个文件描述符 */
     qsort(lp->array + start, lp->count - start, sizeof(*lp->array),
           namelist_cmp_indirect);
 }
 
+/**
+ * JS_PrintValue 回调 - 写入文件
+ */
 static void js_print_value_write(void *opaque, const char *buf, size_t len)
 {
     FILE *fo = opaque;
     fwrite(buf, 1, len, fo);
 }
 
+/**
+ * JS print() 函数实现 - 用于测试输出
+ * 特殊处理 Test262 异步测试完成标记：
+ * - "Test262:AsyncTestComplete" => async_done++
+ * - "Test262:AsyncTestFailure*" => async_done=2（强制错误）
+ */
 static JSValue js_print(JSContext *ctx, JSValueConst this_val,
                         int argc, JSValueConst *argv)
 {
@@ -396,14 +540,16 @@ static JSValue js_print(JSContext *ctx, JSValueConst this_val,
                 str = JS_ToCStringLen(ctx, &len, v);
                 if (!str)
                     return JS_EXCEPTION;
+                /* 检测异步测试完成标记 */
                 if (!strcmp(str, "Test262:AsyncTestComplete")) {
                     async_done++;
                 } else if (strstart(str, "Test262:AsyncTestFailure", NULL)) {
-                    async_done = 2; /* force an error */
+                    async_done = 2; /* 强制标记为错误 */
                 }
                 fwrite(str, 1, len, outfile);
                 JS_FreeCString(ctx, str);
             } else {
+                /* 非字符串值：使用 JS_PrintValue 格式化输出 */
                 JS_PrintValue(ctx, js_print_value_write, outfile, v, NULL);
             }
         }
@@ -412,6 +558,10 @@ static JSValue js_print(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * $262.detachArrayBuffer() 实现 - 分离 ArrayBuffer
+ * 用于测试分离后的 ArrayBuffer 访问行为
+ */
 static JSValue js_detachArrayBuffer(JSContext *ctx, JSValue this_val,
                                     int argc, JSValue *argv)
 {
@@ -419,6 +569,10 @@ static JSValue js_detachArrayBuffer(JSContext *ctx, JSValue this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * $262.evalScript() 实现 - 执行脚本代码
+ * 用于测试动态代码执行
+ */
 static JSValue js_evalScript(JSContext *ctx, JSValue this_val,
                              int argc, JSValue *argv)
 {
@@ -435,37 +589,71 @@ static JSValue js_evalScript(JSContext *ctx, JSValue this_val,
 
 #ifdef CONFIG_AGENT
 
+/*
+ * Test262 Agent 多线程支持
+ * 
+ * 用于测试 ECMAScript SharedArrayBuffer 和 Atomics 特性。
+ * Test262 测试用例通过 $262.agent 对象创建和管理多个并发 Agent（线程），
+ * 每个 Agent 有自己的 JS 运行时和上下文，通过 SharedArrayBuffer 共享内存。
+ * 
+ * 核心 API:
+ * - $262.agent.start(script): 启动新 Agent
+ * - $262.agent.report(msg): 发送消息到主 Agent
+ * - $262.agent.getReport(): 接收消息
+ * - $262.agent.broadcast(sab, val): 广播消息到所有 Agent
+ * - $262.agent.receiveBroadcast(func): 设置广播回调
+ * - $262.agent.leaving(): Agent 退出通知
+ * - $262.agent.sleep(ms): 休眠
+ * - $262.agent.monotonicNow(): 单调时钟
+ */
+
 #include <pthread.h>
 
+/**
+ * Test262 Agent 结构体 - 表示一个测试线程
+ */
 typedef struct {
-    struct list_head link;
-    pthread_t tid;
-    char *script;
-    JSValue broadcast_func;
-    BOOL broadcast_pending;
-    JSValue broadcast_sab; /* in the main context */
-    uint8_t *broadcast_sab_buf;
-    size_t broadcast_sab_size;
-    int32_t broadcast_val;
+    struct list_head link;      /* 链表节点 */
+    pthread_t tid;              /* 线程 ID */
+    char *script;               /* 要执行的脚本 */
+    JSValue broadcast_func;     /* 广播回调函数 */
+    BOOL broadcast_pending;     /* 是否有待处理的广播 */
+    JSValue broadcast_sab;      /* 共享 ArrayBuffer（主上下文中） */
+    uint8_t *broadcast_sab_buf; /* 共享缓冲区指针 */
+    size_t broadcast_sab_size;  /* 缓冲区大小 */
+    int32_t broadcast_val;      /* 广播值 */
 } Test262Agent;
 
+/**
+ * Agent 报告结构体 - 用于 Agent 间通信
+ */
 typedef struct {
     struct list_head link;
-    char *str;
+    char *str;  /* 报告内容 */
 } AgentReport;
 
+/* 前向声明 */
 static JSValue add_helpers1(JSContext *ctx);
 static void add_helpers(JSContext *ctx);
 
-static pthread_mutex_t agent_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t agent_cond = PTHREAD_COND_INITIALIZER;
-/* list of Test262Agent.link */
-static struct list_head agent_list = LIST_HEAD_INIT(agent_list);
+/* 全局同步原语 */
+static pthread_mutex_t agent_mutex = PTHREAD_MUTEX_INITIALIZER;  /* Agent 列表锁 */
+static pthread_cond_t agent_cond = PTHREAD_COND_INITIALIZER;     /* Agent 条件变量 */
+static struct list_head agent_list = LIST_HEAD_INIT(agent_list); /* Agent 链表 */
 
-static pthread_mutex_t report_mutex = PTHREAD_MUTEX_INITIALIZER;
-/* list of AgentReport.link */
-static struct list_head report_list = LIST_HEAD_INIT(report_list);
+static pthread_mutex_t report_mutex = PTHREAD_MUTEX_INITIALIZER;  /* 报告列表锁 */
+static struct list_head report_list = LIST_HEAD_INIT(report_list); /* 报告链表 */
 
+/**
+ * Agent 线程入口函数
+ * 
+ * 每个 Agent 线程执行流程：
+ * 1. 创建独立的 JSRuntime 和 JSContext
+ * 2. 执行传入的脚本代码
+ * 3. 进入事件循环，等待广播消息
+ * 4. 收到广播后调用回调函数处理
+ * 5. 无更多任务时退出
+ */
 static void *agent_start(void *arg)
 {
     Test262Agent *agent = arg;
@@ -474,6 +662,7 @@ static void *agent_start(void *arg)
     JSValue ret_val;
     int ret;
 
+    /* 创建独立的运行时和上下文 */
     rt = JS_NewRuntime();
     if (rt == NULL) {
         fatal(1, "JS_NewRuntime failure");
@@ -483,11 +672,14 @@ static void *agent_start(void *arg)
         JS_FreeRuntime(rt);
         fatal(1, "JS_NewContext failure");
     }
-    JS_SetContextOpaque(ctx, agent);
+    JS_SetContextOpaque(ctx, agent);  /* 关联 Agent 结构体 */
     JS_SetRuntimeInfo(rt, "agent");
-    JS_SetCanBlock(rt, TRUE);
+    JS_SetCanBlock(rt, TRUE);  /* 允许阻塞操作（Atomics.wait 等） */
 
+    /* 注入辅助函数 */
     add_helpers(ctx);
+    
+    /* 执行脚本 */
     ret_val = JS_Eval(ctx, agent->script, strlen(agent->script),
                       "<evalScript>", JS_EVAL_TYPE_GLOBAL);
     free(agent->script);
@@ -496,27 +688,31 @@ static void *agent_start(void *arg)
         js_std_dump_error(ctx);
     JS_FreeValue(ctx, ret_val);
 
+    /* 事件循环 - 处理异步任务和广播 */
     for(;;) {
         ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), NULL);
         if (ret < 0) {
             js_std_dump_error(ctx);
             break;
         } else if (ret == 0) {
+            /* 无待处理任务 */
             if (JS_IsUndefined(agent->broadcast_func)) {
-                break;
+                break;  /* 无广播回调，退出 */
             } else {
                 JSValue args[2];
 
+                /* 等待广播 */
                 pthread_mutex_lock(&agent_mutex);
                 while (!agent->broadcast_pending) {
                     pthread_cond_wait(&agent_cond, &agent_mutex);
                 }
 
                 agent->broadcast_pending = FALSE;
-                pthread_cond_signal(&agent_cond);
+                pthread_cond_signal(&agent_cond);  /* 通知广播完成 */
 
                 pthread_mutex_unlock(&agent_mutex);
 
+                /* 调用广播回调：func(sharedArrayBuffer, value) */
                 args[0] = JS_NewArrayBuffer(ctx, agent->broadcast_sab_buf,
                                             agent->broadcast_sab_size,
                                             NULL, NULL, TRUE);
@@ -540,6 +736,12 @@ static void *agent_start(void *arg)
     return NULL;
 }
 
+/**
+ * $262.agent.start(script) - 启动新 Agent 线程
+ * 
+ * @param script 要执行的脚本代码
+ * @note 只能在主 Agent 中调用，不能在 Agent 内部调用
+ */
 static JSValue js_agent_start(JSContext *ctx, JSValue this_val,
                               int argc, JSValue *argv)
 {
@@ -547,28 +749,36 @@ static JSValue js_agent_start(JSContext *ctx, JSValue this_val,
     Test262Agent *agent;
     pthread_attr_t attr;
 
+    /* 检查是否已在 Agent 内部（不允许嵌套） */
     if (JS_GetContextOpaque(ctx) != NULL)
         return JS_ThrowTypeError(ctx, "cannot be called inside an agent");
 
     script = JS_ToCString(ctx, argv[0]);
     if (!script)
         return JS_EXCEPTION;
+    
     agent = malloc(sizeof(*agent));
     memset(agent, 0, sizeof(*agent));
     agent->broadcast_func = JS_UNDEFINED;
     agent->broadcast_sab = JS_UNDEFINED;
     agent->script = strdup(script);
     JS_FreeCString(ctx, script);
+    
     list_add_tail(&agent->link, &agent_list);
+    
+    /* 创建线程 - 设置 2MB 栈空间（musl libc 默认仅 80KB，不够用） */
     pthread_attr_init(&attr);
-    // musl libc gives threads 80 kb stacks, much smaller than
-    // JS_DEFAULT_STACK_SIZE (256 kb)
-    pthread_attr_setstacksize(&attr, 2 << 20); // 2 MB, glibc default
+    pthread_attr_setstacksize(&attr, 2 << 20);  /* 2 MB, glibc 默认值 */
     pthread_create(&agent->tid, &attr, agent_start, agent);
     pthread_attr_destroy(&attr);
+    
     return JS_UNDEFINED;
 }
 
+/**
+ * 清理所有 Agent 线程
+ * 等待所有线程结束并释放资源
+ */
 static void js_agent_free(JSContext *ctx)
 {
     struct list_head *el, *el1;
@@ -576,23 +786,30 @@ static void js_agent_free(JSContext *ctx)
 
     list_for_each_safe(el, el1, &agent_list) {
         agent = list_entry(el, Test262Agent, link);
-        pthread_join(agent->tid, NULL);
+        pthread_join(agent->tid, NULL);  /* 等待线程结束 */
         JS_FreeValue(ctx, agent->broadcast_sab);
         list_del(&agent->link);
         free(agent);
     }
 }
 
+/**
+ * $262.agent.leaving() - Agent 退出通知
+ * 空操作，仅用于测试规范兼容性
+ */
 static JSValue js_agent_leaving(JSContext *ctx, JSValue this_val,
                                 int argc, JSValue *argv)
 {
     Test262Agent *agent = JS_GetContextOpaque(ctx);
     if (!agent)
         return JS_ThrowTypeError(ctx, "must be called inside an agent");
-    /* nothing to do */
+    /* 无需实际操作 */
     return JS_UNDEFINED;
 }
 
+/**
+ * 检查是否有待处理的广播
+ */
 static BOOL is_broadcast_pending(void)
 {
     struct list_head *el;
@@ -605,6 +822,17 @@ static BOOL is_broadcast_pending(void)
     return FALSE;
 }
 
+/**
+ * $262.agent.broadcast(sab, val) - 向所有 Agent 广播消息
+ * 
+ * @param sab SharedArrayBuffer 对象
+ * @param val 要广播的整数值
+ * 
+ * 流程：
+ * 1. 设置所有 Agent 的 broadcast_pending 标志
+ * 2. 通知所有等待的 Agent
+ * 3. 等待所有 Agent 处理完成
+ */
 static JSValue js_agent_broadcast(JSContext *ctx, JSValue this_val,
                                   int argc, JSValue *argv)
 {
@@ -615,6 +843,7 @@ static JSValue js_agent_broadcast(JSContext *ctx, JSValue this_val,
     size_t buf_size;
     int32_t val;
 
+    /* 只能在主 Agent 中调用 */
     if (JS_GetContextOpaque(ctx) != NULL)
         return JS_ThrowTypeError(ctx, "cannot be called inside an agent");
 
@@ -624,21 +853,20 @@ static JSValue js_agent_broadcast(JSContext *ctx, JSValue this_val,
     if (JS_ToInt32(ctx, &val, argv[1]))
         return JS_EXCEPTION;
 
-    /* broadcast the values and wait until all agents have started
-       calling their callbacks */
+    /* 广播并等待所有 Agent 处理完成 */
     pthread_mutex_lock(&agent_mutex);
     list_for_each(el, &agent_list) {
         agent = list_entry(el, Test262Agent, link);
         agent->broadcast_pending = TRUE;
-        /* the shared array buffer is used by the thread, so increment
-           its refcount */
+        /* 增加共享 ArrayBuffer 引用计数（线程会持有引用） */
         agent->broadcast_sab = JS_DupValue(ctx, sab);
         agent->broadcast_sab_buf = buf;
         agent->broadcast_sab_size = buf_size;
         agent->broadcast_val = val;
     }
-    pthread_cond_broadcast(&agent_cond);
+    pthread_cond_broadcast(&agent_cond);  /* 唤醒所有等待的 Agent */
 
+    /* 等待所有 Agent 处理完成 */
     while (is_broadcast_pending()) {
         pthread_cond_wait(&agent_cond, &agent_mutex);
     }
@@ -646,6 +874,11 @@ static JSValue js_agent_broadcast(JSContext *ctx, JSValue this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * $262.agent.receiveBroadcast(func) - 设置广播回调函数
+ * 
+ * @param func 回调函数，签名：func(sharedArrayBuffer, value)
+ */
 static JSValue js_agent_receiveBroadcast(JSContext *ctx, JSValue this_val,
                                          int argc, JSValue *argv)
 {
@@ -659,6 +892,9 @@ static JSValue js_agent_receiveBroadcast(JSContext *ctx, JSValue this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * $262.agent.sleep(ms) - 休眠指定毫秒
+ */
 static JSValue js_agent_sleep(JSContext *ctx, JSValue this_val,
                               int argc, JSValue *argv)
 {
@@ -669,6 +905,10 @@ static JSValue js_agent_sleep(JSContext *ctx, JSValue this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * 获取单调时钟（毫秒）
+ * 用于 $262.agent.monotonicNow()
+ */
 static int64_t get_clock_ms(void)
 {
     struct timespec ts;
@@ -676,12 +916,19 @@ static int64_t get_clock_ms(void)
     return (uint64_t)ts.tv_sec * 1000 + (ts.tv_nsec / 1000000);
 }
 
+/**
+ * $262.agent.monotonicNow() - 返回单调时钟当前时间（毫秒）
+ */
 static JSValue js_agent_monotonicNow(JSContext *ctx, JSValue this_val,
                                      int argc, JSValue *argv)
 {
     return JS_NewInt64(ctx, get_clock_ms());
 }
 
+/**
+ * $262.agent.getReport() - 获取待处理报告
+ * @return 报告字符串或 null（无报告）
+ */
 static JSValue js_agent_getReport(JSContext *ctx, JSValue this_val,
                                   int argc, JSValue *argv)
 {
@@ -706,6 +953,11 @@ static JSValue js_agent_getReport(JSContext *ctx, JSValue this_val,
     return ret;
 }
 
+/**
+ * $262.agent.report(msg) - 发送报告到主 Agent
+ * 
+ * @param msg 报告消息
+ */
 static JSValue js_agent_report(JSContext *ctx, JSValue this_val,
                                int argc, JSValue *argv)
 {
@@ -725,20 +977,26 @@ static JSValue js_agent_report(JSContext *ctx, JSValue this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * $262.agent 对象函数列表
+ */
 static const JSCFunctionListEntry js_agent_funcs[] = {
-    /* only in main */
+    /* 仅在主 Agent 中可用 */
     JS_CFUNC_DEF("start", 1, js_agent_start ),
     JS_CFUNC_DEF("getReport", 0, js_agent_getReport ),
     JS_CFUNC_DEF("broadcast", 2, js_agent_broadcast ),
-    /* only in agent */
+    /* 仅在子 Agent 中可用 */
     JS_CFUNC_DEF("report", 1, js_agent_report ),
     JS_CFUNC_DEF("leaving", 0, js_agent_leaving ),
     JS_CFUNC_DEF("receiveBroadcast", 1, js_agent_receiveBroadcast ),
-    /* in both */
+    /* 两者都可用 */
     JS_CFUNC_DEF("sleep", 1, js_agent_sleep ),
     JS_CFUNC_DEF("monotonicNow", 0, js_agent_monotonicNow ),
 };
 
+/**
+ * 创建 $262.agent 对象
+ */
 static JSValue js_new_agent(JSContext *ctx)
 {
     JSValue agent;
@@ -747,29 +1005,48 @@ static JSValue js_new_agent(JSContext *ctx)
                                countof(js_agent_funcs));
     return agent;
 }
-#endif
+#endif  /* CONFIG_AGENT */
 
+/**
+ * $262.createRealm() - 创建新的 Realm（全局环境）
+ * 
+ * Realm 是 JavaScript 的全局环境，包含全局对象、内置对象等。
+ * 此函数用于测试跨 Realm 的对象交互。
+ * 
+ * @return 新 Realm 的 $262 对象
+ */
 static JSValue js_createRealm(JSContext *ctx, JSValue this_val,
                               int argc, JSValue *argv)
 {
     JSContext *ctx1;
     JSValue ret;
 
+    /* 创建新上下文（同一运行时内） */
     ctx1 = JS_NewContext(JS_GetRuntime(ctx));
     if (!ctx1)
         return JS_ThrowOutOfMemory(ctx);
+    
+    /* 注入辅助函数 */
     ret = add_helpers1(ctx1);
-    /* ctx1 has a refcount so it stays alive */
+    /* ctx1 有引用计数，不会立即释放 */
     JS_FreeContext(ctx1);
     return ret;
 }
 
+/**
+ * $262.IsHTMLDDA - 特殊对象，用于测试 typeof null 边界情况
+ * 返回 null，但 typeof 返回 "object"（历史遗留问题）
+ */
 static JSValue js_IsHTMLDDA(JSContext *ctx, JSValue this_val,
                             int argc, JSValue *argv)
 {
     return JS_NULL;
 }
 
+/**
+ * $262.gc() - 触发垃圾回收
+ * 用于测试内存管理和 FinalizationRegistry
+ */
 static JSValue js_gc(JSContext *ctx, JSValueConst this_val,
                      int argc, JSValueConst *argv)
 {
@@ -777,6 +1054,10 @@ static JSValue js_gc(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * 向上下文注入辅助函数（内部版本）
+ * 创建 $262 特殊对象并注入全局作用域
+ */
 static JSValue add_helpers1(JSContext *ctx)
 {
     JSValue global_obj;
@@ -784,10 +1065,11 @@ static JSValue add_helpers1(JSContext *ctx)
 
     global_obj = JS_GetGlobalObject(ctx);
 
+    /* 注入 print 函数 */
     JS_SetPropertyStr(ctx, global_obj, "print",
                       JS_NewCFunction(ctx, js_print, "print", 1));
 
-    /* $262 special object used by the tests */
+    /* 创建 $262 特殊对象 - Test262 测试使用的 API 集合 */
     obj262 = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj262, "detachArrayBuffer",
                       JS_NewCFunction(ctx, js_detachArrayBuffer,
@@ -799,31 +1081,46 @@ static JSValue add_helpers1(JSContext *ctx)
                       JS_NewCFunction(ctx, js_string_codePointRange,
                                       "codePointRange", 2));
 #ifdef CONFIG_AGENT
+    /* 注入 $262.agent 对象（多线程支持） */
     JS_SetPropertyStr(ctx, obj262, "agent", js_new_agent(ctx));
 #endif
 
+    /* $262.global - 全局对象引用 */
     JS_SetPropertyStr(ctx, obj262, "global",
                       JS_DupValue(ctx, global_obj));
+    /* $262.createRealm - 创建新 Realm */
     JS_SetPropertyStr(ctx, obj262, "createRealm",
                       JS_NewCFunction(ctx, js_createRealm,
                                       "createRealm", 0));
+    /* $262.IsHTMLDDA - 特殊对象（typeof 测试） */
     obj = JS_NewCFunction(ctx, js_IsHTMLDDA, "IsHTMLDDA", 0);
-    JS_SetIsHTMLDDA(ctx, obj);
+    JS_SetIsHTMLDDA(ctx, obj);  /* 标记为 IsHTMLDDA 类型 */
     JS_SetPropertyStr(ctx, obj262, "IsHTMLDDA", obj);
+    /* $262.gc - 垃圾回收 */
     JS_SetPropertyStr(ctx, obj262, "gc",
                       JS_NewCFunction(ctx, js_gc, "gc", 0));
 
+    /* 将 $262 对象注入全局作用域 */
     JS_SetPropertyStr(ctx, global_obj, "$262", JS_DupValue(ctx, obj262));
 
     JS_FreeValue(ctx, global_obj);
     return obj262;
 }
 
+/**
+ * 向上下文注入辅助函数（公共接口）
+ */
 static void add_helpers(JSContext *ctx)
 {
     JS_FreeValue(ctx, add_helpers1(ctx));
 }
 
+/**
+ * 加载文件到内存
+ * @param filename 文件路径
+ * @param lenp 输出参数：文件长度
+ * @return 文件内容（需手动 free）
+ */
 static char *load_file(const char *filename, size_t *lenp)
 {
     char *buf;
@@ -836,6 +1133,10 @@ static char *load_file(const char *filename, size_t *lenp)
     return buf;
 }
 
+/**
+ * JSON 模块初始化函数
+ * 将 JSON 对象设置为模块的 default 导出
+ */
 static int json_module_init_test(JSContext *ctx, JSModuleDef *m)
 {
     JSValue val;
@@ -844,6 +1145,17 @@ static int json_module_init_test(JSContext *ctx, JSModuleDef *m)
     return 0;
 }
 
+/**
+ * 测试用模块加载器
+ * 
+ * 支持：
+ * - ES6 模块（.js）
+ * - JSON 模块（通过 attributes 判断）
+ * 
+ * 特殊处理：相对路径解析
+ * - import("bar.js") from "path/to/foo.js" => "path/to/bar.js"
+ * - import("./bar.js") => 保持不变
+ */
 static JSModuleDef *js_module_loader_test(JSContext *ctx,
                                           const char *module_name, void *opaque,
                                           JSValueConst attributes)
@@ -853,10 +1165,10 @@ static JSModuleDef *js_module_loader_test(JSContext *ctx,
     JSModuleDef *m;
     char *filename, *slash, path[1024];
 
-    // interpret import("bar.js") from path/to/foo.js as
-    // import("path/to/bar.js") but leave import("./bar.js") untouched
+    /* 解析模块路径 */
     filename = opaque;
     if (!strchr(module_name, '/')) {
+        /* 非相对路径：添加父目录前缀 */
         slash = strrchr(filename, '/');
         if (slash) {
             snprintf(path, sizeof(path), "%.*s/%s",
@@ -872,8 +1184,9 @@ static JSModuleDef *js_module_loader_test(JSContext *ctx,
         return NULL;
     }
 
+    /* 检查是否为 JSON 模块 */
     if (js_module_test_json(ctx, attributes) == 1) {
-        /* compile as JSON */
+        /* 编译为 JSON 模块 */
         JSValue val;
         val = JS_ParseJSON(ctx, (char *)buf, buf_len, module_name);
         js_free(ctx, buf);
@@ -884,35 +1197,46 @@ static JSModuleDef *js_module_loader_test(JSContext *ctx,
             JS_FreeValue(ctx, val);
             return NULL;
         }
-        /* only export the "default" symbol which will contain the JSON object */
+        /* 仅导出 "default" 符号（包含 JSON 对象） */
         JS_AddModuleExport(ctx, m, "default");
         JS_SetModulePrivateValue(ctx, m, val);
     } else {
         JSValue func_val;
-        /* compile the module */
+        /* 编译为 ES6 模块 */
         func_val = JS_Eval(ctx, (char *)buf, buf_len, module_name,
                            JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
         js_free(ctx, buf);
         if (JS_IsException(func_val))
             return NULL;
-        /* the module is already referenced, so we must free it */
+        /* 模块已引用，释放临时值 */
         m = JS_VALUE_GET_PTR(func_val);
         JS_FreeValue(ctx, func_val);
     }
     return m;
 }
 
+/**
+ * 判断是否为行分隔符
+ */
 int is_line_sep(char c)
 {
     return (c == '\0' || c == '\n' || c == '\r');
 }
 
+/**
+ * 在字符串中查找独立行
+ * 用于查找错误文件中的特定文件名
+ * @param str 文本内容
+ * @param line 要查找的行
+ * @return 找到的位置或 NULL
+ */
 char *find_line(const char *str, const char *line)
 {
     if (str) {
         const char *p;
         int len = strlen(line);
         for (p = str; (p = strstr(p, line)) != NULL; p += len + 1) {
+            /* 检查是否为独立行（前后都是行分隔符） */
             if ((p == str || is_line_sep(p[-1])) && is_line_sep(p[len]))
                 return (char *)p;
         }
@@ -920,17 +1244,28 @@ char *find_line(const char *str, const char *line)
     return NULL;
 }
 
+/**
+ * 判断是否为单词分隔符
+ */
 int is_word_sep(char c)
 {
     return (c == '\0' || isspace((unsigned char)c) || c == ',');
 }
 
+/**
+ * 在字符串中查找独立单词
+ * 用于查找特性名称、排除列表等
+ * @param str 文本内容
+ * @param word 要查找的单词
+ * @return 找到的位置或 NULL
+ */
 char *find_word(const char *str, const char *word)
 {
     const char *p;
     int len = strlen(word);
     if (str && len) {
         for (p = str; (p = strstr(p, word)) != NULL; p += len) {
+            /* 检查是否为独立单词（前后都是分隔符） */
             if ((p == str || is_word_sep(p[-1])) && is_word_sep(p[len]))
                 return (char *)p;
         }
@@ -938,7 +1273,12 @@ char *find_word(const char *str, const char *word)
     return NULL;
 }
 
-/* handle exclude directories */
+/**
+ * 处理排除目录列表
+ * 
+ * 将 exclude_list 中的目录项（以/结尾）移到 exclude_dir_list，
+ * 然后从 test_list 中过滤掉这些目录下的测试文件。
+ */
 void update_exclude_dirs(void)
 {
     namelist_t *lp = &test_list;
@@ -947,7 +1287,7 @@ void update_exclude_dirs(void)
     char *name;
     int i, j, count;
 
-    /* split directpries from exclude_list */
+    /* 从 exclude_list 分离出目录项 */
     for (count = i = 0; i < ep->count; i++) {
         name = ep->array[i];
         if (has_suffix(name, "/")) {
@@ -961,7 +1301,7 @@ void update_exclude_dirs(void)
 
     namelist_sort(dp);
 
-    /* filter out excluded directories */
+    /* 从测试列表中过滤掉排除的目录 */
     for (count = i = 0; i < lp->count; i++) {
         name = lp->array[i];
         for (j = 0; j < dp->count; j++) {
@@ -979,6 +1319,26 @@ void update_exclude_dirs(void)
     lp->count = count;
 }
 
+/**
+ * 加载配置文件
+ * 
+ * 配置文件格式（INI 风格）:
+ * [config]
+ *   testdir=test262/test
+ *   harnessdir=test262/harness
+ *   mode=default-nostrict
+ *   features=async,module
+ * [exclude]
+ *   test262/test/annexB/
+ * [features]
+ *   async=yes
+ *   module=yes
+ * [tests]
+ *   test262/test/built-ins/Array
+ * 
+ * @param filename 配置文件路径
+ * @param ignore 忽略的配置项（逗号分隔）
+ */
 void load_config(const char *filename, const char *ignore)
 {
     char buf[1024];
@@ -986,10 +1346,10 @@ void load_config(const char *filename, const char *ignore)
     char *base_name;
     enum {
         SECTION_NONE = 0,
-        SECTION_CONFIG,
-        SECTION_EXCLUDE,
-        SECTION_FEATURES,
-        SECTION_TESTS,
+        SECTION_CONFIG,    /* [config] 节 */
+        SECTION_EXCLUDE,   /* [exclude] 节 */
+        SECTION_FEATURES,  /* [features] 节 */
+        SECTION_TESTS,     /* [tests] 节 */
     } section = SECTION_NONE;
     int lineno = 0;
 
@@ -1004,10 +1364,10 @@ void load_config(const char *filename, const char *ignore)
         lineno++;
         p = str_strip(buf);
         if (*p == '#' || *p == ';' || *p == '\0')
-            continue;  /* line comment */
+            continue;  /* 跳过注释和空行 */
 
         if (*p == "[]"[0]) {
-            /* new section */
+            /* 新的节 */
             p++;
             p[strcspn(p, "]")] = '\0';
             if (str_equal(p, "config"))
@@ -1024,7 +1384,7 @@ void load_config(const char *filename, const char *ignore)
         }
         q = strchr(p, '=');
         if (q) {
-            /* setting: name=value */
+            /* 配置项：name=value */
             *q++ = '\0';
             q = str_strip(q);
         }
@@ -1038,6 +1398,7 @@ void load_config(const char *filename, const char *ignore)
                 printf("%s:%d: ignoring %s=%s\n", filename, lineno, p, q);
                 continue;
             }
+            /* 解析配置项 */
             if (str_equal(p, "style")) {
                 new_style = str_equal(q, "new");
                 continue;
@@ -1065,6 +1426,7 @@ void load_config(const char *filename, const char *ignore)
                 continue;
             }
             if (str_equal(p, "mode")) {
+                /* 测试模式配置 */
                 if (str_equal(q, "default") || str_equal(q, "default-nostrict"))
                     test_mode = TEST_DEFAULT_NOSTRICT;
                 else if (str_equal(q, "default-strict"))
@@ -1116,19 +1478,22 @@ void load_config(const char *filename, const char *ignore)
                 continue;
             }
         case SECTION_EXCLUDE:
+            /* [exclude] 节：直接添加文件名 */
             namelist_add(&exclude_list, base_name, p);
             break;
         case SECTION_FEATURES:
+            /* [features] 节：启用/禁用特性 */
             if (!q || str_equal(q, "yes"))
                 str_append(&harness_features, " ", p);
             else
                 str_append(&harness_skip_features, " ", p);
             break;
         case SECTION_TESTS:
+            /* [tests] 节：指定测试文件 */
             namelist_add(&test_list, base_name, p);
             break;
         default:
-            /* ignore settings in other sections */
+            /* 忽略其他节的设置 */
             break;
         }
     }
@@ -1136,6 +1501,16 @@ void load_config(const char *filename, const char *ignore)
     free(base_name);
 }
 
+/**
+ * 在错误文件中查找指定文件的错误记录
+ * 
+ * 解析格式：filename.js:line: [strict mode: ] [unexpected error: ]message
+ * 
+ * @param filename 测试文件名
+ * @param pline 输出参数：错误行号
+ * @param is_strict 是否严格模式
+ * @return 错误消息（需手动 free），未找到返回 NULL
+ */
 char *find_error(const char *filename, int *pline, int is_strict)
 {
     if (error_file) {
@@ -1143,10 +1518,13 @@ char *find_error(const char *filename, int *pline, int is_strict)
         const char *p, *q, *r;
         int line;
 
+        /* 在错误文件中搜索文件名 */
         for (p = error_file; (p = strstr(p, filename)) != NULL; p += len) {
+            /* 检查是否为独立的文件名（前后是换行或开头） */
             if ((p == error_file || p[-1] == '\n' || p[-1] == '(') && p[len] == ':') {
                 q = p + len;
                 line = 1;
+                /* 解析行号 */
                 if (*q == ':') {
                     line = strtol(q + 1, (char**)&q, 10);
                     if (*q == ':')
@@ -1155,11 +1533,13 @@ char *find_error(const char *filename, int *pline, int is_strict)
                 while (*q == ' ') {
                     q++;
                 }
-                /* check strict mode indicator */
+                /* 检查严格模式标记是否匹配 */
                 if (!strstart(q, "strict mode: ", &q) != !is_strict)
                     continue;
+                /* 提取错误消息 */
                 r = q = skip_prefix(q, "unexpected error: ");
                 r += strcspn(r, "\n");
+                /* 跳过连续的错误消息行 */
                 while (r[0] == '\n' && r[1] && strncmp(r + 1, filename, 8)) {
                     r++;
                     r += strcspn(r, "\n");
