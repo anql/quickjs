@@ -1,5 +1,16 @@
 /*
- * Generation of Unicode tables
+ * Unicode 表生成工具
+ * 
+ * 本文件用于从 Unicode 官方数据文件生成压缩的 C 语言表，供 QuickJS 运行时使用。
+ * 主要功能包括：
+ * - 解析 UnicodeData.txt、SpecialCasing.txt、CaseFolding.txt 等官方数据
+ * - 生成大小写转换表（case conversion tables）
+ * - 生成 Unicode 属性表（general category, script, properties）
+ * - 生成组合类表（combining class table）
+ * - 生成字符分解/合成表（decomposition/composition tables）
+ * - 生成 Emoji 序列表
+ * 
+ * 使用游程编码（RLE）和索引技术压缩数据，减少内存占用。
  *
  * Copyright (c) 2017-2018 Fabrice Bellard
  * Copyright (c) 2017-2018 Charlie Gordon
@@ -31,45 +42,52 @@
 #include <ctype.h>
 #include <time.h>
 
-#include "cutils.h"
+#include "cutils.h"  // 通用工具函数（DynBuf, mallocz 等）
 
-uint32_t total_tables;
-uint32_t total_table_bytes;
-uint32_t total_index;
-uint32_t total_index_bytes;
+/* 统计表生成情况的全局计数器 */
+uint32_t total_tables;        // 生成的表数量
+uint32_t total_table_bytes;   // 表数据总字节数
+uint32_t total_index;         // 索引表数量
+uint32_t total_index_bytes;   // 索引表总字节数
 
+/* ========== 编译选项配置 ========== */
 /* define it to be able to test unicode.c */
-//#define USE_TEST
+//#define USE_TEST         // 启用测试代码（需要链接 libunicode.c）
 /* profile tests */
-//#define PROFILE
+//#define PROFILE          // 启用性能分析
 
-//#define DUMP_CASE_CONV_TABLE
-//#define DUMP_TABLE_SIZE
-//#define DUMP_CC_TABLE
-//#define DUMP_DECOMP_TABLE
-//#define DUMP_CASE_FOLDING_SPECIAL_CASES
+//#define DUMP_CASE_CONV_TABLE   // 转储大小写转换表
+//#define DUMP_TABLE_SIZE        // 打印表大小统计
+//#define DUMP_CC_TABLE          // 转储组合类表
+//#define DUMP_DECOMP_TABLE      // 转储分解表
+//#define DUMP_CASE_FOLDING_SPECIAL_CASES  // 转储特殊大小写折叠情况
 
-/* Ideas:
-   - Generalize run length encoding + index for all tables
-   - remove redundant tables for ID_start, ID_continue, Case_Ignorable, Cased
-
-   Case conversion:
-   - use a single entry for consecutive U/LF runs
-   - allow EXT runs of length > 1
-
-   Decomposition:
+/* 优化思路（TODO）:
+   - 对所有表通用化游程编码 + 索引
+   - 移除 ID_start, ID_continue, Case_Ignorable, Cased 的冗余表
+   
+   大小写转换优化:
+   - 对连续的 U/LF 运行使用单一条目
+   - 允许 EXT 运行长度 > 1
+   
+   分解优化:
    - Greek lower case (+1f10/1f10) ?
-   - allow holes in B runs
-   - suppress more upper / lower case redundancy
+   - 允许 B 运行中有空洞
+   - 消除更多大写/小写冗余
 */
 
 #ifdef USE_TEST
-#include "libunicode.c"
+#include "libunicode.c"  // 测试时包含 libunicode.c 以进行验证
 #endif
 
-#define CHARCODE_MAX 0x10ffff
-#define CC_LEN_MAX 3
+#define CHARCODE_MAX 0x10ffff  // Unicode 最大码点 (U+10FFFF)
+#define CC_LEN_MAX 3           // 大小写转换结果最大长度（字符数）
 
+/**
+ * 分配并清零内存
+ * @param size 请求的字节数
+ * @return 已清零的内存指针
+ */
 void *mallocz(size_t size)
 {
     void *ptr;
@@ -78,6 +96,13 @@ void *mallocz(size_t size)
     return ptr;
 }
 
+/**
+ * 获取第 n 个分号分隔的字段
+ * Unicode 数据文件使用分号分隔字段，此函数跳过前 n 个字段
+ * @param p 输入字符串指针
+ * @param n 要跳过的字段数（从 0 开始）
+ * @return 指向第 n 个字段的指针，失败返回 NULL
+ */
 const char *get_field(const char *p, int n)
 {
     int i;
@@ -91,6 +116,14 @@ const char *get_field(const char *p, int n)
     return p;
 }
 
+/**
+ * 获取第 n 个字段并复制到缓冲区
+ * @param buf 输出缓冲区
+ * @param buf_size 缓冲区大小
+ * @param p 输入字符串指针
+ * @param n 字段索引
+ * @return 指向缓冲区的指针
+ */
 const char *get_field_buf(char *buf, size_t buf_size, const char *p, int n)
 {
     char *q;
@@ -105,6 +138,13 @@ const char *get_field_buf(char *buf, size_t buf_size, const char *p, int n)
     return buf;
 }
 
+/**
+ * 向动态数组添加字符（自动扩容）
+ * @param pbuf 指向缓冲区指针的指针
+ * @param psize 指向当前容量的指针
+ * @param plen 指向当前长度的指针
+ * @param c 要添加的字符
+ */
 void add_char(int **pbuf, int *psize, int *plen, int c)
 {
     int len, size, *buf;
@@ -113,7 +153,7 @@ void add_char(int **pbuf, int *psize, int *plen, int c)
     len = *plen;
     if (len >= size) {
         size = *psize;
-        size = max_int(len + 1, size * 3 / 2);
+        size = max_int(len + 1, size * 3 / 2);  // 扩容 1.5 倍
         buf = realloc(buf, sizeof(buf[0]) * size);
         *pbuf = buf;
         *psize = size;
@@ -122,6 +162,14 @@ void add_char(int **pbuf, int *psize, int *plen, int c)
     *plen = len;
 }
 
+/**
+ * 解析字段中的十六进制字符串为整数数组
+ * 用于解析 Unicode 码点序列（如 "0041 0042 0043"）
+ * @param plen 输出长度
+ * @param str 输入字符串
+ * @param n 字段索引
+ * @return 动态分配的整数数组
+ */
 int *get_field_str(int *plen, const char *str, int n)
 {
     const char *p;
@@ -145,6 +193,13 @@ int *get_field_str(int *plen, const char *str, int n)
     return buf;
 }
 
+/**
+ * 从文件读取一行，去除末尾换行符
+ * @param buf 输出缓冲区
+ * @param buf_size 缓冲区大小
+ * @param f 文件指针
+ * @return buf 指针，EOF 返回 NULL
+ */
 char *get_line(char *buf, int buf_size, FILE *f)
 {
     int len;
@@ -156,31 +211,51 @@ char *get_line(char *buf, int buf_size, FILE *f)
     return buf;
 }
 
+/* ========== 正则表达式字符串哈希表（用于 Emoji ZWJ 序列去重） ========== */
+
+/**
+ * 哈希表中的字符串节点
+ * 用于存储唯一的字符串序列（如 Emoji ZWJ 序列）
+ */
 typedef struct REString {
-    struct REString *next;
-    uint32_t hash;
-    uint32_t len;
-    uint32_t flags;
-    uint32_t buf[];
+    struct REString *next;   // 哈希冲突链表的下一个节点
+    uint32_t hash;           // 预计算的哈希值
+    uint32_t len;            // 字符串长度（字符数）
+    uint32_t flags;          // 标志位（如是否已标记）
+    uint32_t buf[];          // 柔性数组成员，存储实际的字符数据
 } REString;
 
+/**
+ * 字符串哈希表
+ */
 typedef struct {
-    uint32_t n_strings;
-    uint32_t hash_size;
-    int hash_bits;
-    REString **hash_table;
+    uint32_t n_strings;      // 已存储的字符串数量
+    uint32_t hash_size;      // 哈希表大小（2 的幂）
+    int hash_bits;           // hash_size 的 log2
+    REString **hash_table;   // 哈希桶数组
 } REStringList;
 
+/**
+ * 计算字符串的哈希值
+ * 使用乘法哈希算法
+ * @param len 字符串长度
+ * @param buf 字符串数据
+ * @return 32 位哈希值
+ */
 static uint32_t re_string_hash(int len, const uint32_t *buf)
 {
     int i;
     uint32_t h;
     h = 1;
     for(i = 0; i < len; i++)
-        h = h * 263 + buf[i];
-    return h * 0x61C88647;
+        h = h * 263 + buf[i];  // 263 是质数
+    return h * 0x61C88647;     // 乘以一个大的质数常数进行混合
 }
 
+/**
+ * 初始化字符串哈希表
+ * @param s 要初始化的哈希表
+ */
 static void re_string_list_init(REStringList *s)
 {
     s->n_strings = 0;
@@ -189,6 +264,10 @@ static void re_string_list_init(REStringList *s)
     s->hash_table = NULL;
 }
 
+/**
+ * 释放字符串哈希表
+ * @param s 要释放的哈希表
+ */
 static  __maybe_unused void re_string_list_free(REStringList *s)
 {
     REString *p, *p_next;
@@ -234,17 +313,26 @@ static __maybe_unused void re_string_list_dump(const char *str, const REStringLi
     }
 }
 
+/**
+ * 在哈希表中查找或添加字符串
+ * @param s 哈希表
+ * @param len 字符串长度
+ * @param buf 字符串数据
+ * @param h0 预计算的哈希值
+ * @param add_flag 如果为 TRUE 且未找到则添加新条目
+ * @return 找到的条目或新添加的条目，失败返回 NULL
+ */
 static REString *re_string_find2(REStringList *s, int len, const uint32_t *buf,
                                  uint32_t h0, BOOL add_flag)
 {
     uint32_t h = 0; /* avoid warning */
     REString *p;
     if (s->n_strings != 0) {
-        h = h0 >> (32 - s->hash_bits);
+        h = h0 >> (32 - s->hash_bits);  // 取哈希值的高位作为桶索引
         for(p = s->hash_table[h]; p != NULL; p = p->next) {
             if (p->hash == h0 && p->len == len &&
                 !memcmp(p->buf, buf, len * sizeof(buf[0]))) {
-                return p;
+                return p;  // 找到匹配项
             }
         }
     }
@@ -253,15 +341,17 @@ static REString *re_string_find2(REStringList *s, int len, const uint32_t *buf,
         return NULL;
     /* increase the size of the hash table if needed */
     if (unlikely((s->n_strings + 1) > s->hash_size)) {
+        // 哈希表扩容：当负载因子 > 1 时，扩大为原来的 2 倍
         REString **new_hash_table, *p_next;
         int new_hash_bits, i;
         uint32_t new_hash_size;
-        new_hash_bits = max_int(s->hash_bits + 1, 4);
+        new_hash_bits = max_int(s->hash_bits + 1, 4);  // 最小 4 位（16 桶）
         new_hash_size = 1 << new_hash_bits;
         new_hash_table = malloc(sizeof(new_hash_table[0]) * new_hash_size);
         if (!new_hash_table)
             return NULL;
         memset(new_hash_table, 0, sizeof(new_hash_table[0]) * new_hash_size);
+        // 重新哈希所有现有条目
         for(i = 0; i < s->hash_size; i++) {
             for(p = s->hash_table[i]; p != NULL; p = p_next) {
                 p_next = p->next;
@@ -277,10 +367,11 @@ static REString *re_string_find2(REStringList *s, int len, const uint32_t *buf,
         h = h0 >> (32 - s->hash_bits);
     }
 
+    // 分配新节点
     p = malloc(sizeof(REString) + len * sizeof(buf[0]));
     if (!p)
         return NULL;
-    p->next = s->hash_table[h];
+    p->next = s->hash_table[h];  // 插入到链表头部
     s->hash_table[h] = p;
     s->n_strings++;
     p->hash = h0;
@@ -290,6 +381,14 @@ static REString *re_string_find2(REStringList *s, int len, const uint32_t *buf,
     return p;
 }
 
+/**
+ * 查找或添加字符串（自动计算哈希）
+ * @param s 哈希表
+ * @param len 字符串长度
+ * @param buf 字符串数据
+ * @param add_flag 是否添加新条目
+ * @return 找到的条目或新添加的条目
+ */
 static REString *re_string_find(REStringList *s, int len, const uint32_t *buf,
                                 BOOL add_flag)
 {
@@ -298,26 +397,37 @@ static REString *re_string_find(REStringList *s, int len, const uint32_t *buf,
     return re_string_find2(s, len, buf, h0, add_flag);
 }
 
+/**
+ * 向哈希表添加字符串
+ * @param s 哈希表
+ * @param len 字符串长度
+ * @param buf 字符串数据
+ */
 static void re_string_add(REStringList *s, int len, const uint32_t *buf)
 {
     re_string_find(s, len, buf, TRUE);
 }
 
+/* ========== Unicode 分类和属性定义（从 unicode_gen_def.h 导入） ========== */
+
+/* 定义 Unicode 一般分类（General Category）枚举和名称表 */
 #define UNICODE_GENERAL_CATEGORY
 
 typedef enum {
-#define DEF(id, str) GCAT_ ## id,
+#define DEF(id, str) GCAT_ ## id,  // 生成 GCAT_Lu, GCAT_Ll 等枚举值
 #include "unicode_gen_def.h"
 #undef DEF
-    GCAT_COUNT,
+    GCAT_COUNT,  // 分类总数
 } UnicodeGCEnum1;
 
+// Unicode 一般分类的全名表（如 "Lu", "Ll", "Nd" 等）
 static const char *unicode_gc_name[] = {
 #define DEF(id, str) #id,
 #include "unicode_gen_def.h"
 #undef DEF
 };
 
+// Unicode 一般分类的短名表
 static const char *unicode_gc_short_name[] = {
 #define DEF(id, str) str,
 #include "unicode_gen_def.h"
@@ -326,21 +436,24 @@ static const char *unicode_gc_short_name[] = {
 
 #undef UNICODE_GENERAL_CATEGORY
 
+/* 定义 Unicode 脚本（Script）枚举和名称表 */
 #define UNICODE_SCRIPT
 
 typedef enum {
-#define DEF(id, str) SCRIPT_ ## id,
+#define DEF(id, str) SCRIPT_ ## id,  // 生成 SCRIPT_Latin, SCRIPT_Han 等
 #include "unicode_gen_def.h"
 #undef DEF
-    SCRIPT_COUNT,
+    SCRIPT_COUNT,  // 脚本总数
 } UnicodeScriptEnum1;
 
+// Unicode 脚本全名表
 static const char *unicode_script_name[] = {
 #define DEF(id, str) #id,
 #include "unicode_gen_def.h"
 #undef DEF
 };
 
+// Unicode 脚本短名表（如 "Latn", "Hani" 等）
 const char *unicode_script_short_name[] = {
 #define DEF(id, str) str,
 #include "unicode_gen_def.h"
@@ -349,21 +462,24 @@ const char *unicode_script_short_name[] = {
 
 #undef UNICODE_SCRIPT
 
+/* 定义 Unicode 属性列表（Property List）枚举和名称表 */
 #define UNICODE_PROP_LIST
 
 typedef enum {
-#define DEF(id, str) PROP_ ## id,
+#define DEF(id, str) PROP_ ## id,  // 生成 PROP_White_Space, PROP_Dash 等
 #include "unicode_gen_def.h"
 #undef DEF
-    PROP_COUNT,
+    PROP_COUNT,  // 属性总数
 } UnicodePropEnum1;
 
+// Unicode 属性全名表
 static const char *unicode_prop_name[] = {
 #define DEF(id, str) #id,
 #include "unicode_gen_def.h"
 #undef DEF
 };
 
+// Unicode 属性短名表
 static const char *unicode_prop_short_name[] = {
 #define DEF(id, str) str,
 #include "unicode_gen_def.h"
@@ -372,15 +488,17 @@ static const char *unicode_prop_short_name[] = {
 
 #undef UNICODE_PROP_LIST
 
+/* 定义 Unicode 序列属性（Sequence Properties）枚举和名称表 */
 #define UNICODE_SEQUENCE_PROP_LIST
 
 typedef enum {
-#define DEF(id) SEQUENCE_PROP_ ## id,
+#define DEF(id) SEQUENCE_PROP_ ## id,  // 生成序列属性如 Basic_Emoji, RGI_Emoji_ZWJ_Sequence 等
 #include "unicode_gen_def.h"
 #undef DEF
     SEQUENCE_PROP_COUNT,
 } UnicodeSequencePropEnum1;
 
+// Unicode 序列属性名称表
 static const char *unicode_sequence_prop_name[] = {
 #define DEF(id) #id,
 #include "unicode_gen_def.h"
@@ -389,38 +507,58 @@ static const char *unicode_sequence_prop_name[] = {
 
 #undef UNICODE_SEQUENCE_PROP_LIST
 
-typedef struct {
-    /* case conv */
-    uint8_t u_len;
-    uint8_t l_len;
-    uint8_t f_len;
-    int u_data[CC_LEN_MAX]; /* to upper case */
-    int l_data[CC_LEN_MAX]; /* to lower case */
-    int f_data[CC_LEN_MAX]; /* to case folding */
+/* ========== 核心数据结构 ========== */
 
-    uint8_t combining_class;
-    uint8_t is_compat:1;
-    uint8_t is_excluded:1;
-    uint8_t general_category;
-    uint8_t script;
-    uint8_t script_ext_len;
-    uint8_t *script_ext;
-    uint32_t prop_bitmap_tab[3];
-    /* decomposition */
-    int decomp_len;
-    int *decomp_data;
+/**
+ * Unicode 字符信息结构体
+ * 存储每个 Unicode 码点的所有属性信息
+ */
+typedef struct {
+    /* 大小写转换信息 */
+    uint8_t u_len;                  // 大写转换结果长度
+    uint8_t l_len;                  // 小写转换结果长度
+    uint8_t f_len;                  // 大小写折叠结果长度
+    int u_data[CC_LEN_MAX];         // 大写转换结果（最多 3 个字符）
+    int l_data[CC_LEN_MAX];         // 小写转换结果
+    int f_data[CC_LEN_MAX];         // 大小写折叠结果（用于正则匹配）
+
+    /* Unicode 属性 */
+    uint8_t combining_class;        // 组合类（Canonical Combining Class）
+    uint8_t is_compat:1;            // 是否为兼容分解
+    uint8_t is_excluded:1;          // 是否被排除在合成之外
+    uint8_t general_category;       // 一般分类（General Category）
+    uint8_t script;                 // 脚本（Script）
+    uint8_t script_ext_len;         // 脚本扩展长度
+    uint8_t *script_ext;            // 脚本扩展数组
+    uint32_t prop_bitmap_tab[3];    // 属性位图（96 个布尔属性，32 位*3）
+    
+    /* 分解信息 */
+    int decomp_len;                 // 分解结果长度
+    int *decomp_data;               // 分解结果数组
 } CCInfo;
 
+/**
+ * Unicode 序列属性临时结构（未使用）
+ */
 typedef struct {
     int count;
     int size;
     int *tab;
 } UnicodeSequenceProperties;
 
-CCInfo *unicode_db;
-REStringList rgi_emoji_zwj_sequence;
-DynBuf rgi_emoji_tag_sequence;
+/* 全局数据 */
+CCInfo *unicode_db;                    // Unicode 字符数据库（数组，索引为码点）
+REStringList rgi_emoji_zwj_sequence;   // RGI Emoji ZWJ 序列哈希表
+DynBuf rgi_emoji_tag_sequence;         // RGI Emoji Tag 序列缓冲区
 
+/**
+ * 在名称表中查找名称的索引
+ * 每个表项可能包含多个逗号分隔的名称
+ * @param tab 名称表
+ * @param tab_len 表长度
+ * @param name 要查找的名称
+ * @return 索引，未找到返回 -1
+ */
 int find_name(const char **tab, int tab_len, const char *name)
 {
     int i, len, name_len;
@@ -445,21 +583,51 @@ int find_name(const char **tab, int tab_len, const char *name)
     return -1;
 }
 
+/**
+ * 获取字符的属性值（布尔值）
+ * @param c Unicode 码点
+ * @param prop_idx 属性索引
+ * @return 属性值（0 或 1）
+ */
 static BOOL get_prop(uint32_t c, int prop_idx)
 {
+    // 从位图中提取指定位：prop_idx >> 5 选择 32 位字，prop_idx & 0x1f 选择位
     return (unicode_db[c].prop_bitmap_tab[prop_idx >> 5] >> (prop_idx & 0x1f)) & 1;
 }
 
+/**
+ * 设置字符的属性值
+ * @param c Unicode 码点
+ * @param prop_idx 属性索引
+ * @param val 属性值（0 或 1）
+ */
 static void set_prop(uint32_t c, int prop_idx, int val)
 {
     uint32_t mask;
-    mask = 1U << (prop_idx & 0x1f);
+    mask = 1U << (prop_idx & 0x1f);  // 创建位掩码
     if (val)
-        unicode_db[c].prop_bitmap_tab[prop_idx >> 5] |= mask;
+        unicode_db[c].prop_bitmap_tab[prop_idx >> 5] |= mask;   // 设置位
     else
-        unicode_db[c].prop_bitmap_tab[prop_idx >> 5]  &= ~mask;
+        unicode_db[c].prop_bitmap_tab[prop_idx >> 5]  &= ~mask; // 清除位
 }
 
+/* ========== Unicode 数据文件解析函数 ========== */
+
+/**
+ * 解析 UnicodeData.txt 文件
+ * 
+ * UnicodeData.txt 格式（分号分隔）：
+ * 字段 0: 码点（十六进制）
+ * 字段 1: 名称
+ * 字段 2: 一般分类
+ * 字段 3: 组合类
+ * 字段 4: 双向类别
+ * 字段 5: 分解映射
+ * 字段 12: 大写映射
+ * 字段 13: 小写映射
+ * 
+ * @param filename UnicodeData.txt 文件路径
+ */
 void parse_unicode_data(const char *filename)
 {
     FILE *f;
@@ -482,22 +650,22 @@ void parse_unicode_data(const char *filename)
         p = line;
         while (isspace(*p))
             p++;
-        if (*p == '#')
+        if (*p == '#')  // 跳过注释行
             continue;
 
-        p = get_field(line, 0);
+        p = get_field(line, 0);  // 字段 0: 码点
         if (!p)
             continue;
         code = strtoul(p, NULL, 16);
         lc = 0;
         uc = 0;
 
-        p = get_field(line, 12);
+        p = get_field(line, 12);  // 字段 12: 大写映射
         if (p && *p != ';') {
             uc = strtoul(p, NULL, 16);
         }
 
-        p = get_field(line, 13);
+        p = get_field(line, 13);  // 字段 13: 小写映射
         if (p && *p != ';') {
             lc = strtoul(p, NULL, 16);
         }
@@ -516,6 +684,7 @@ void parse_unicode_data(const char *filename)
             }
         }
 
+        // 字段 2: 一般分类（General Category）
         {
             int i;
             get_field_buf(buf1, sizeof(buf1), line, 2);
@@ -528,6 +697,7 @@ void parse_unicode_data(const char *filename)
             ci->general_category = i;
         }
 
+        // 字段 3: 组合类（Combining Class）
         p = get_field(line, 3);
         if (p && *p != ';' && *p != '\0') {
             int cc;
@@ -539,12 +709,14 @@ void parse_unicode_data(const char *filename)
             }
         }
 
+        // 字段 5: 分解映射（Decomposition Mapping）
         p = get_field(line, 5);
         if (p && *p != ';' && *p != '\0') {
             int size;
             assert(code <= CHARCODE_MAX);
             ci->is_compat = 0;
             if (*p == '<') {
+                // 兼容分解（如 <compat>, <font>, <noBreak> 等）
                 while (*p != '\0' && *p != '>')
                     p++;
                 if (*p == '>')
@@ -575,18 +747,20 @@ void parse_unicode_data(const char *filename)
 #endif
         }
 
+        // 字段 9: 双向镜像（Bidi Mirrored）
         p = get_field(line, 9);
         if (p && *p == 'Y') {
             set_prop(code, PROP_Bidi_Mirrored, 1);
         }
 
-        /* handle ranges */
+        /* 处理范围（如 "<control, Last>" 表示范围结束） */
         get_field_buf(buf1, sizeof(buf1), line, 1);
         if (strstr(buf1, " Last>")) {
             int i;
             //            printf("range: 0x%x-%0x\n", last_code, code);
             assert(ci->decomp_len == 0);
             assert(ci->script_ext_len == 0);
+            // 将当前属性复制到范围内的所有码点
             for(i = last_code + 1; i < code; i++) {
                 unicode_db[i] = *ci;
             }
@@ -3660,12 +3834,32 @@ void normalization_test(const char *filename)
 }
 #endif
 
+/* ========== 主函数 ========== */
+
+/**
+ * 程序入口
+ * 
+ * 用法：unicode_gen PATH [OUTPUT]
+ * - PATH: Unicode 数据库目录（包含 UnicodeData.txt 等文件）
+ * - OUTPUT: 输出文件名（可选，不提供则运行自测）
+ * 
+ * 处理流程：
+ * 1. 解析所有 Unicode 数据文件
+ * 2. 构建大小写转换表
+ * 3. 构建各种 Unicode 属性表
+ * 4. 输出 C 语言格式的压缩表
+ * 
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 0 表示成功
+ */
 int main(int argc, char *argv[])
 {
     const char *unicode_db_path, *outfilename;
     char filename[1024];
     int arg = 1;
 
+    // 显示帮助信息
     if (arg >= argc || (!strcmp(argv[arg], "-h") || !strcmp(argv[arg], "--help"))) {
         printf("usage: %s PATH [OUTPUT]\n"
                "  PATH    path to the Unicode database directory\n"
@@ -3679,65 +3873,83 @@ int main(int argc, char *argv[])
     if (arg < argc)
         outfilename = argv[arg++];
 
-    unicode_db = mallocz(sizeof(unicode_db[0]) * (CHARCODE_MAX + 1));
-    re_string_list_init(&rgi_emoji_zwj_sequence);
-    dbuf_init(&rgi_emoji_tag_sequence);
+    // 初始化全局数据结构
+    unicode_db = mallocz(sizeof(unicode_db[0]) * (CHARCODE_MAX + 1));  // 分配 1M+ 个字符信息
+    re_string_list_init(&rgi_emoji_zwj_sequence);  // 初始化 ZWJ 序列哈希表
+    dbuf_init(&rgi_emoji_tag_sequence);            // 初始化 Tag 序列缓冲区
 
+    // ========== 阶段 1: 解析所有 Unicode 数据文件 ==========
+    
+    // 1. UnicodeData.txt - 基础字符数据（码点、名称、分类、大小写等）
     snprintf(filename, sizeof(filename), "%s/UnicodeData.txt", unicode_db_path);
-
     parse_unicode_data(filename);
 
+    // 2. SpecialCasing.txt - 特殊大小写规则（上下文相关）
     snprintf(filename, sizeof(filename), "%s/SpecialCasing.txt", unicode_db_path);
     parse_special_casing(unicode_db, filename);
 
+    // 3. CaseFolding.txt - 大小写折叠（用于正则匹配）
     snprintf(filename, sizeof(filename), "%s/CaseFolding.txt", unicode_db_path);
     parse_case_folding(unicode_db, filename);
 
+    // 4. CompositionExclusions.txt - 合成排除列表
     snprintf(filename, sizeof(filename), "%s/CompositionExclusions.txt", unicode_db_path);
     parse_composition_exclusions(filename);
 
+    // 5. DerivedCoreProperties.txt - 派生核心属性
     snprintf(filename, sizeof(filename), "%s/DerivedCoreProperties.txt", unicode_db_path);
     parse_derived_core_properties(filename);
 
+    // 6. DerivedNormalizationProps.txt - 派生规范化属性
     snprintf(filename, sizeof(filename), "%s/DerivedNormalizationProps.txt", unicode_db_path);
     parse_derived_norm_properties(filename);
 
+    // 7. PropList.txt - 属性列表
     snprintf(filename, sizeof(filename), "%s/PropList.txt", unicode_db_path);
     parse_prop_list(filename);
 
+    // 8. Scripts.txt - 脚本分配
     snprintf(filename, sizeof(filename), "%s/Scripts.txt", unicode_db_path);
     parse_scripts(filename);
 
+    // 9. ScriptExtensions.txt - 脚本扩展
     snprintf(filename, sizeof(filename), "%s/ScriptExtensions.txt",
              unicode_db_path);
     parse_script_extensions(filename);
 
+    // 10. emoji-data.txt - Emoji 属性
     snprintf(filename, sizeof(filename), "%s/emoji-data.txt",
              unicode_db_path);
     parse_prop_list(filename);
 
+    // 11. emoji-sequences.txt - Emoji 序列
     snprintf(filename, sizeof(filename), "%s/emoji-sequences.txt",
              unicode_db_path);
     parse_sequence_prop_list(filename);
 
+    // 12. emoji-zwj-sequences.txt - Emoji ZWJ 序列
     snprintf(filename, sizeof(filename), "%s/emoji-zwj-sequences.txt",
              unicode_db_path);
     parse_sequence_prop_list(filename);
 
-    //    dump_unicode_data(unicode_db);
-    build_conv_table(unicode_db);
+    // ========== 阶段 2: 构建各种表 ==========
+    
+    //    dump_unicode_data(unicode_db);  // 调试用
+    build_conv_table(unicode_db);  // 构建大小写转换表
 
 #ifdef DUMP_CASE_FOLDING_SPECIAL_CASES
     dump_case_folding_special_cases(unicode_db);
 #endif
 
+    // 如果没有指定输出文件，运行自测
     if (!outfilename) {
 #ifdef USE_TEST
-        check_case_conv();
-        check_flags();
-        check_decompose_table();
-        check_compose_table();
-        check_cc_table();
+        check_case_conv();           // 测试大小写转换
+        check_flags();               // 测试属性标志
+        check_decompose_table();     // 测试分解表
+        check_compose_table();       // 测试合成表
+        check_cc_table();            // 测试组合类表
+        // 运行 Unicode 规范化测试
         snprintf(filename, sizeof(filename), "%s/NormalizationTest.txt", unicode_db_path);
         normalization_test(filename);
 #else
@@ -3746,34 +3958,42 @@ int main(int argc, char *argv[])
 #endif
     } else
     {
+        // 生成输出文件
         FILE *fo = fopen(outfilename, "wb");
 
         if (!fo) {
             perror(outfilename);
             exit(1);
         }
+        // 输出文件头
         fprintf(fo,
                 "/* Compressed unicode tables */\n"
                 "/* Automatically generated file - do not edit */\n"
                 "\n"
                 "#include <stdint.h>\n"
                 "\n");
-        dump_case_conv_table(fo);
-        compute_internal_props();
-        build_flags_tables(fo);
+        
+        // ========== 输出所有生成的表 ==========
+        dump_case_conv_table(fo);        // 大小写转换表
+        compute_internal_props();        // 计算内部属性
+        build_flags_tables(fo);          // 标志表（Cased, Case_Ignorable, ID_Start, ID_Continue）
         fprintf(fo, "#ifdef CONFIG_ALL_UNICODE\n\n");
-        build_cc_table(fo);
-        build_decompose_table(fo);
-        build_general_category_table(fo);
-        build_script_table(fo);
-        build_script_ext_table(fo);
-        build_prop_list_table(fo);
-        build_sequence_prop_list_table(fo);
+        build_cc_table(fo);              // 组合类表
+        build_decompose_table(fo);       // 分解表
+        build_general_category_table(fo); // 一般分类表
+        build_script_table(fo);          // 脚本表
+        build_script_ext_table(fo);      // 脚本扩展表
+        build_prop_list_table(fo);       // 属性列表表
+        build_sequence_prop_list_table(fo); // 序列属性表
         fprintf(fo, "#endif /* CONFIG_ALL_UNICODE */\n");
+        
+        // 输出统计信息
         fprintf(fo, "/* %u tables / %u bytes, %u index / %u bytes */\n",
                 total_tables, total_table_bytes, total_index, total_index_bytes);
         fclose(fo);
     }
+    
+    // 清理资源
     re_string_list_free(&rgi_emoji_zwj_sequence);
     return 0;
 }
