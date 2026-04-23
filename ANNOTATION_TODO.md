@@ -18,6 +18,18 @@
 
 ## 🕐 工作日志
 
+### 2026-04-24 07:45 - libregexp.c 部分静态函数注释完成
+- ✅ 已完成：为 libregexp.c 中 5 个基础静态函数添加中文文档注释
+- 📝 新增注释约 50 行，涵盖：
+  - reopcode_info：正则操作码信息表（名称 + 字节长度）
+  - is_digit：数字字符判断辅助函数
+  - dbuf_insert：动态缓冲区指定位置插入数据
+  - re_string_hash：字符串哈希计算（多项式滚动哈希）
+  - re_string_list_init/re_string_list_free：字符串列表初始化/释放
+- 📦 已提交并推送：e5abe82 docs: 为 libregexp.c 部分静态函数添加中文文档注释
+- 📊 当前进度：libregexp.c 注释覆盖率从 17% 提升至约 20%
+- 💡 奴才建议：libregexp.c 还有约 50 个静态函数待注释，包括解析函数、字节码生成函数、执行引擎等核心功能
+
 ### 2026-04-24 07:39 - 定时任务巡检
 - 🔍 巡检结果：工作区干净，所有注释成果已提交并推送
 - ✅ Git 状态：nothing to commit, working tree clean
