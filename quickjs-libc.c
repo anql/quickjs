@@ -1296,6 +1296,17 @@ static JSValue js_std_file_puts(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * @brief 关闭文件流
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 成功返回 0，失败返回错误码
+ * 
+ * 关闭文件流，如果是由 popen 打开的管道则调用 pclose，
+ * 否则调用 fclose。关闭后将文件指针置为 NULL。
+ */
 static JSValue js_std_file_close(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
@@ -1313,6 +1324,16 @@ static JSValue js_std_file_close(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, err);
 }
 
+/**
+ * @brief 格式化输出到文件
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 格式化输出结果
+ * 
+ * 将格式化的字符串写入文件流，支持 printf 风格的格式说明符。
+ */
 static JSValue js_std_file_printf(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv)
 {
@@ -1335,6 +1356,16 @@ static JSValue js_std_file_printObject(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * @brief 刷新文件流缓冲区
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return JS_UNDEFINED
+ * 
+ * 强制将缓冲区中的数据写入底层文件描述符，确保数据落盘。
+ */
 static JSValue js_std_file_flush(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
@@ -1345,6 +1376,18 @@ static JSValue js_std_file_flush(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * @brief 获取文件当前位置
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @param is_bigint 是否返回 BigInt 类型
+ * @return 文件偏移量 (字节)
+ * 
+ * 返回文件流当前的读写位置。在 Linux/GLIBC 系统上使用 ftello，
+ * 其他系统使用 ftell。支持 BigInt 返回值以处理大文件。
+ */
 static JSValue js_std_file_tell(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv, int is_bigint)
 {
@@ -1363,6 +1406,19 @@ static JSValue js_std_file_tell(JSContext *ctx, JSValueConst this_val,
         return JS_NewInt64(ctx, pos);
 }
 
+/**
+ * @brief 移动文件读写位置
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=偏移量，[1]=起始位置 (SEEK_SET/SEEK_CUR/SEEK_END)
+ * @return 成功返回 0，失败返回 -1
+ * 
+ * 将文件流的读写位置移动到指定位置。支持三种寻址方式：
+ * - SEEK_SET: 从文件开头开始计算
+ * - SEEK_CUR: 从当前位置开始计算
+ * - SEEK_END: 从文件末尾开始计算
+ */
 static JSValue js_std_file_seek(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
@@ -1385,6 +1441,14 @@ static JSValue js_std_file_seek(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, ret);
 }
 
+/**
+ * @brief 检查是否到达文件末尾 (EOF)
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 到达文件末尾返回 true，否则返回 false
+ */
 static JSValue js_std_file_eof(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
@@ -1394,6 +1458,14 @@ static JSValue js_std_file_eof(JSContext *ctx, JSValueConst this_val,
     return JS_NewBool(ctx, feof(f));
 }
 
+/**
+ * @brief 检查文件流是否发生错误
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 发生错误返回 true，否则返回 false
+ */
 static JSValue js_std_file_error(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
@@ -1403,6 +1475,16 @@ static JSValue js_std_file_error(JSContext *ctx, JSValueConst this_val,
     return JS_NewBool(ctx, ferror(f));
 }
 
+/**
+ * @brief 清除文件流错误标志
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return JS_UNDEFINED
+ * 
+ * 清除文件流的错误指示器和 EOF 标志，使文件流可以继续使用。
+ */
 static JSValue js_std_file_clearerr(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
@@ -1413,6 +1495,16 @@ static JSValue js_std_file_clearerr(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * @brief 获取文件描述符
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 底层文件描述符 (整数)
+ * 
+ * 返回与 FILE 流关联的底层文件描述符，可用于底层 I/O 操作。
+ */
 static JSValue js_std_file_fileno(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv)
 {
@@ -1422,6 +1514,19 @@ static JSValue js_std_file_fileno(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, fileno(f));
 }
 
+/**
+ * @brief 文件读写操作
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=ArrayBuffer, [1]=起始位置，[2]=长度
+ * @param magic 0=读，1=写
+ * @return 实际读写的字节数
+ * 
+ * 从/向文件读写 ArrayBuffer 数据。magic 参数决定操作类型：
+ * - magic=0: 从文件读取数据到 ArrayBuffer
+ * - magic=1: 将 ArrayBuffer 数据写入文件
+ */
 static JSValue js_std_file_read_write(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv, int magic)
 {
@@ -1448,6 +1553,17 @@ static JSValue js_std_file_read_write(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt64(ctx, ret);
 }
 
+/**
+ * @brief 从文件读取一行
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 读取的行 (不含换行符)，EOF 且无数据时返回 null
+ * 
+ * 逐字符读取文件直到遇到换行符或 EOF。使用 DynBuf 动态缓冲区
+ * 存储结果，自动处理内存分配。返回的字符串不包含末尾的换行符。
+ */
 /* XXX: could use less memory and go faster */
 static JSValue js_std_file_getline(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
@@ -1484,6 +1600,17 @@ static JSValue js_std_file_getline(JSContext *ctx, JSValueConst this_val,
     return obj;
 }
 
+/**
+ * @brief 将文件内容读取为字符串
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=可选的最大读取字节数
+ * @return 读取的字符串
+ * 
+ * 从文件读取内容直到 EOF 或达到指定的最大字节数。
+ * 使用 DynBuf 动态缓冲区累积字符，最后转换为 JS 字符串返回。
+ */
 /* XXX: could use less memory and go faster */
 static JSValue js_std_file_readAsString(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv)
@@ -1527,6 +1654,14 @@ static JSValue js_std_file_readAsString(JSContext *ctx, JSValueConst this_val,
     return obj;
 }
 
+/**
+ * @brief 从文件读取一个字节
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 读取的字节值 (0-255)，EOF 返回 -1
+ */
 static JSValue js_std_file_getByte(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
@@ -1536,6 +1671,14 @@ static JSValue js_std_file_getByte(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, fgetc(f));
 }
 
+/**
+ * @brief 向文件写入一个字节
+ * @param ctx JS 上下文
+ * @param this_val this 对象 (FILE 实例)
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=要写入的字节值
+ * @return 写入的字节值，错误返回 -1
+ */
 static JSValue js_std_file_putByte(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
@@ -1554,6 +1697,17 @@ static JSValue js_std_file_putByte(JSContext *ctx, JSValueConst this_val,
 #define URL_GET_PROGRAM "curl -s -i --"
 #define URL_GET_BUF_SIZE 4096
 
+/**
+ * @brief 读取 HTTP 响应头的一行
+ * @param f 文件流
+ * @param buf 缓冲区
+ * @param buf_size 缓冲区大小
+ * @param dbuf 可选的动态缓冲区用于累积数据
+ * @return 成功返回 0，失败返回 -1
+ * 
+ * 从文件流读取一行 HTTP 响应头，直到遇到换行符。
+ * 如果提供了 dbuf 参数，则同时将数据累积到动态缓冲区中。
+ */
 static int http_get_header_line(FILE *f, char *buf, size_t buf_size,
                                 DynBuf *dbuf)
 {
@@ -1576,6 +1730,13 @@ static int http_get_header_line(FILE *f, char *buf, size_t buf_size,
     return 0;
 }
 
+/**
+ * @brief 解析 HTTP 状态码
+ * @param buf HTTP 状态行 (如 "HTTP/1.1 200 OK")
+ * @return HTTP 状态码 (如 200, 404 等)
+ * 
+ * 从 HTTP 状态行中提取状态码数字。格式：HTTP/x.x STATUS REASON
+ */
 static int http_get_status(const char *buf)
 {
     const char *p = buf;
@@ -1588,6 +1749,25 @@ static int http_get_status(const char *buf)
     return atoi(p);
 }
 
+/**
+ * @brief 通过 curl 下载 URL 内容
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=URL, [1]=可选选项对象 {binary, full}
+ * @return 下载的内容 (字符串或 ArrayBuffer)，full 模式下返回响应对象
+ * 
+ * 使用 curl 命令行工具下载 HTTP/HTTPS URL 内容。支持以下选项：
+ * - binary: true 返回 ArrayBuffer，false 返回字符串 (默认)
+ * - full: true 返回完整响应对象 {response, responseHeaders, status}
+ * 
+ * 实现细节：
+ * 1. 构造 curl 命令，对 URL 进行 shell 转义
+ * 2. 使用 popen 执行 curl，捕获输出
+ * 3. 解析 HTTP 状态行和响应头
+ * 4. 读取响应体数据到动态缓冲区
+ * 5. 根据选项返回字符串、ArrayBuffer 或完整响应对象
+ */
 static JSValue js_std_urlGet(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -1623,17 +1803,18 @@ static JSValue js_std_urlGet(JSContext *ctx, JSValueConst this_val,
         }
     }
 
+    /* 构造 curl 命令，对 URL 进行 shell 转义 */
     js_std_dbuf_init(ctx, &cmd_buf);
     dbuf_printf(&cmd_buf, "%s '", URL_GET_PROGRAM);
     for(i = 0; url[i] != '\0'; i++) {
         unsigned char c = url[i];
         switch (c) {
         case '\'':
-            /* shell single quoted string does not support \' */
+            /* shell 单引号字符串不支持 \' 转义，使用'\\'' 技巧 */
             dbuf_putstr(&cmd_buf, "'\\''");
             break;
         case '[': case ']': case '{': case '}': case '\\':
-            /* prevent interpretation by curl as range or set specification */
+            /* 防止 curl 将字符解释为范围或集合指定 */
             dbuf_putc(&cmd_buf, '\\');
             /* FALLTHROUGH */
         default:
@@ -1662,7 +1843,7 @@ static JSValue js_std_urlGet(JSContext *ctx, JSValueConst this_val,
     if (!buf)
         goto fail;
 
-    /* get the HTTP status */
+    /* 获取 HTTP 状态码 */
     if (http_get_header_line(f, buf, URL_GET_BUF_SIZE, NULL) < 0) {
         status = 0;
         goto bad_header;
@@ -1672,7 +1853,7 @@ static JSValue js_std_urlGet(JSContext *ctx, JSValueConst this_val,
         goto bad_header;
     }
 
-    /* wait until there is an empty line */
+    /* 等待空行 (响应头结束) */
     for(;;) {
         if (http_get_header_line(f, buf, URL_GET_BUF_SIZE, header_buf) < 0) {
         bad_header:
@@ -1684,9 +1865,9 @@ static JSValue js_std_urlGet(JSContext *ctx, JSValueConst this_val,
     }
     if (dbuf_error(header_buf))
         goto fail;
-    header_buf->size -= 2; /* remove the trailing CRLF */
+    header_buf->size -= 2; /* 移除末尾的 CRLF */
 
-    /* download the data */
+    /* 下载响应体数据 */
     for(;;) {
         len = fread(buf, 1, URL_GET_BUF_SIZE, f);
         if (len == 0)
@@ -1712,6 +1893,7 @@ static JSValue js_std_urlGet(JSContext *ctx, JSValueConst this_val,
     data_buf = NULL;
 
     if (full_flag) {
+        /* 返回完整响应对象 */
         ret_obj = JS_NewObject(ctx);
         if (JS_IsException(ret_obj))
             goto fail;
@@ -1744,28 +1926,52 @@ static JSValue js_std_urlGet(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+/**
+ * @brief FILE 类定义
+ * 
+ * 定义 JS 文件对象的类结构，包含类名和析构函数。
+ * 用于将 C 的 FILE* 封装为 JS 对象。
+ */
 static JSClassDef js_std_file_class = {
     "FILE",
     .finalizer = js_std_file_finalizer,
 };
 
+/**
+ * @brief 标准库错误码常量
+ * 
+ * 将常见的 errno 值导出为 JS 常量，便于错误处理。
+ */
 static const JSCFunctionListEntry js_std_error_props[] = {
     /* various errno values */
 #define DEF(x) JS_PROP_INT32_DEF(#x, x, JS_PROP_CONFIGURABLE )
-    DEF(EINVAL),
-    DEF(EIO),
-    DEF(EACCES),
-    DEF(EEXIST),
-    DEF(ENOSPC),
-    DEF(ENOSYS),
-    DEF(EBUSY),
-    DEF(ENOENT),
-    DEF(EPERM),
-    DEF(EPIPE),
-    DEF(EBADF),
+    DEF(EINVAL),      /* 无效参数 */
+    DEF(EIO),         /* I/O 错误 */
+    DEF(EACCES),      /* 权限拒绝 */
+    DEF(EEXIST),      /* 文件已存在 */
+    DEF(ENOSPC),      /* 空间不足 */
+    DEF(ENOSYS),      /* 功能未实现 */
+    DEF(EBUSY),       /* 资源忙 */
+    DEF(ENOENT),      /* 文件或目录不存在 */
+    DEF(EPERM),       /* 操作不允许 */
+    DEF(EPIPE),       /* 管道破裂 */
+    DEF(EBADF),       /* 无效的文件描述符 */
 #undef DEF
 };
 
+/**
+ * @brief std 模块导出函数列表
+ * 
+ * 定义 std 模块导出的所有函数和常量：
+ * - 进程控制：exit, gc
+ * - 脚本执行：evalScript, loadScript
+ * - 环境变量：getenv, setenv, unsetenv, getenviron
+ * - 网络请求：urlGet
+ * - 文件操作：loadFile, open, popen, fdopen, tmpfile
+ * - 工具函数：strerror, parseExtJSON
+ * - 文件常量：SEEK_SET, SEEK_CUR, SEEK_END
+ * - 错误码：Error 对象包含各种 errno 值
+ */
 static const JSCFunctionListEntry js_std_funcs[] = {
     JS_CFUNC_DEF("exit", 1, js_std_exit ),
     JS_CFUNC_DEF("gc", 0, js_std_gc ),
@@ -1795,6 +2001,16 @@ static const JSCFunctionListEntry js_std_funcs[] = {
     JS_CFUNC_DEF("__printObject", 1, js_std_file_printObject ),
 };
 
+/**
+ * @brief FILE 原型对象方法列表
+ * 
+ * 定义 FILE 对象原型上的所有方法：
+ * - 基本操作：close, flush, fileno
+ * - 读写操作：read, write, getByte, putByte
+ * - 字符串操作：puts, printf, getline, readAsString
+ * - 定位操作：tell, tello, seek
+ * - 状态查询：eof, error, clearerr
+ */
 static const JSCFunctionListEntry js_std_file_proto_funcs[] = {
     JS_CFUNC_DEF("close", 0, js_std_file_close ),
     JS_CFUNC_MAGIC_DEF("puts", 1, js_std_file_puts, 1 ),
@@ -1816,14 +2032,26 @@ static const JSCFunctionListEntry js_std_file_proto_funcs[] = {
     /* setvbuf, ...  */
 };
 
+/**
+ * @brief std 模块初始化函数
+ * @param ctx JS 上下文
+ * @param m 模块对象
+ * @return 成功返回 0，失败返回 -1
+ * 
+ * 初始化 std 模块，包括：
+ * 1. 创建 FILE 类 ID 和类结构
+ * 2. 创建 FILE 原型对象并绑定方法
+ * 3. 导出所有 std 函数和常量
+ * 4. 创建标准文件流对象 (in/out/err)
+ */
 static int js_std_init(JSContext *ctx, JSModuleDef *m)
 {
     JSValue proto;
 
-    /* FILE class */
-    /* the class ID is created once */
+    /* FILE 类 */
+    /* 类 ID 只创建一次 */
     JS_NewClassID(&js_std_file_class_id);
-    /* the class is created once per runtime */
+    /* 类结构每个 runtime 创建一次 */
     JS_NewClass(JS_GetRuntime(ctx), js_std_file_class_id, &js_std_file_class);
     proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, proto, js_std_file_proto_funcs,
@@ -1838,6 +2066,14 @@ static int js_std_init(JSContext *ctx, JSModuleDef *m)
     return 0;
 }
 
+/**
+ * @brief 初始化 std 模块入口
+ * @param ctx JS 上下文
+ * @param module_name 模块名称
+ * @return 模块对象指针
+ * 
+ * 创建 C 模块并注册导出项，供 JS 代码 import 使用。
+ */
 JSModuleDef *js_init_module_std(JSContext *ctx, const char *module_name)
 {
     JSModuleDef *m;
@@ -1854,6 +2090,17 @@ JSModuleDef *js_init_module_std(JSContext *ctx, const char *module_name)
 /**********************************************************/
 /* 'os' object */
 
+/**
+ * @brief 打开文件 (os.open)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=文件名，[1]=标志，[2]=可选权限 (默认 0666)
+ * @return 文件描述符 (整数)，错误返回负数错误码
+ * 
+ * 打开文件并返回文件描述符。支持 O_RDONLY, O_WRONLY, O_RDWR 等标志。
+ * Windows 上默认强制使用二进制模式。
+ */
 static JSValue js_os_open(JSContext *ctx, JSValueConst this_val,
                           int argc, JSValueConst *argv)
 {
@@ -1875,7 +2122,7 @@ static JSValue js_os_open(JSContext *ctx, JSValueConst this_val,
         mode = 0666;
     }
 #if defined(_WIN32)
-    /* force binary mode by default */
+    /* 强制使用二进制模式 */
     if (!(flags & O_TEXT))
         flags |= O_BINARY;
 #endif
@@ -1884,6 +2131,14 @@ static JSValue js_os_open(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, ret);
 }
 
+/**
+ * @brief 关闭文件描述符 (os.close)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=文件描述符
+ * @return 成功返回 0，失败返回负数错误码
+ */
 static JSValue js_os_close(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
 {
@@ -1894,6 +2149,17 @@ static JSValue js_os_close(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, ret);
 }
 
+/**
+ * @brief 移动文件读写位置 (os.seek)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=文件描述符，[1]=偏移量，[2]=起始位置
+ * @return 新的位置，错误返回负数错误码
+ * 
+ * 使用 lseek 系统调用移动文件描述符的读写位置。
+ * 支持 BigInt 类型的偏移量和返回值。
+ */
 static JSValue js_os_seek(JSContext *ctx, JSValueConst this_val,
                           int argc, JSValueConst *argv)
 {
@@ -1917,6 +2183,18 @@ static JSValue js_os_seek(JSContext *ctx, JSValueConst this_val,
         return JS_NewInt64(ctx, ret);
 }
 
+/**
+ * @brief 文件描述符读写 (os.read/os.write)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=fd, [1]=ArrayBuffer, [2]=起始位置，[3]=长度
+ * @param magic 0=读，1=写
+ * @return 实际读写的字节数，错误返回负数错误码
+ * 
+ * 使用底层 read/write 系统调用对文件描述符进行 I/O 操作。
+ * 数据在 ArrayBuffer 和文件描述符之间传输。
+ */
 static JSValue js_os_read_write(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv, int magic)
 {
@@ -1944,6 +2222,14 @@ static JSValue js_os_read_write(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt64(ctx, ret);
 }
 
+/**
+ * @brief 检查文件描述符是否为终端 (os.isatty)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=文件描述符
+ * @return 是终端返回 true，否则返回 false
+ */
 static JSValue js_os_isatty(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv)
 {
@@ -2058,6 +2344,17 @@ static JSValue js_os_ttySetRaw(JSContext *ctx, JSValueConst this_val,
 
 #endif /* !_WIN32 */
 
+/**
+ * @brief 删除文件或目录 (os.remove)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=文件路径
+ * @return 成功返回 0，失败返回负数错误码
+ * 
+ * Windows 上根据文件类型自动选择 rmdir 或 unlink，
+ * POSIX 系统直接使用 remove 系统调用。
+ */
 static JSValue js_os_remove(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv)
 {
@@ -2084,6 +2381,14 @@ static JSValue js_os_remove(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, ret);
 }
 
+/**
+ * @brief 重命名文件或目录 (os.rename)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=旧路径，[1]=新路径
+ * @return 成功返回 0，失败返回负数错误码
+ */
 static JSValue js_os_rename(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv)
 {
@@ -2104,12 +2409,27 @@ static JSValue js_os_rename(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, ret);
 }
 
+/**
+ * @brief 检查当前是否为主线程
+ * @param rt JS 运行时
+ * @return 主线程返回 TRUE，否则返回 FALSE
+ * 
+ * 通过检查 recv_pipe 是否存在来判断：
+ * - 主线程：recv_pipe 为 NULL
+ * - Worker 线程：recv_pipe 指向消息接收管道
+ */
 static BOOL is_main_thread(JSRuntime *rt)
 {
     JSThreadState *ts = JS_GetRuntimeOpaque(rt);
     return !ts->recv_pipe;
 }
 
+/**
+ * @brief 查找文件描述符对应的读写处理器
+ * @param ts 线程状态
+ * @param fd 文件描述符
+ * @return 找到返回处理器指针，否则返回 NULL
+ */
 static JSOSRWHandler *find_rh(JSThreadState *ts, int fd)
 {
     JSOSRWHandler *rh;
@@ -2123,6 +2443,14 @@ static JSOSRWHandler *find_rh(JSThreadState *ts, int fd)
     return NULL;
 }
 
+/**
+ * @brief 释放读写处理器资源
+ * @param rt JS 运行时
+ * @param rh 读写处理器指针
+ * 
+ * 从链表中移除处理器，释放读/写回调函数的引用，
+ * 最后释放处理器本身占用的内存。
+ */
 static void free_rw_handler(JSRuntime *rt, JSOSRWHandler *rh)
 {
     int i;
@@ -2133,6 +2461,19 @@ static void free_rw_handler(JSRuntime *rt, JSOSRWHandler *rh)
     js_free_rt(rt, rh);
 }
 
+/**
+ * @brief 设置文件描述符的读/写回调处理器 (os.setReadHandler/os.setWriteHandler)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=文件描述符，[1]=回调函数或 null
+ * @param magic 0=读处理器，1=写处理器
+ * @return 成功返回 undefined
+ * 
+ * 为指定的文件描述符注册读写事件回调函数。
+ * 当 fd 可读/可写时，事件循环会自动调用对应的回调函数。
+ * 传入 null 则移除对应的处理器，当读写处理器都为 null 时彻底删除该处理器。
+ */
 static JSValue js_os_setReadHandler(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv, int magic)
 {
@@ -2175,6 +2516,12 @@ static JSValue js_os_setReadHandler(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * @brief 查找信号处理器
+ * @param ts 线程状态
+ * @param sig_num 信号编号
+ * @return 找到返回处理器指针，否则返回 NULL
+ */
 static JSOSSignalHandler *find_sh(JSThreadState *ts, int sig_num)
 {
     JSOSSignalHandler *sh;
@@ -2187,6 +2534,13 @@ static JSOSSignalHandler *find_sh(JSThreadState *ts, int sig_num)
     return NULL;
 }
 
+/**
+ * @brief 释放信号处理器资源
+ * @param rt JS 运行时
+ * @param sh 信号处理器指针
+ * 
+ * 从链表中移除处理器，释放回调函数引用，释放处理器内存。
+ */
 static void free_sh(JSRuntime *rt, JSOSSignalHandler *sh)
 {
     list_del(&sh->link);
@@ -2194,6 +2548,14 @@ static void free_sh(JSRuntime *rt, JSOSSignalHandler *sh)
     js_free_rt(rt, sh);
 }
 
+/**
+ * @brief 信号处理回调函数
+ * @param sig_num 信号编号
+ * 
+ * 将收到的信号标记到 os_pending_signals 位图中，
+ * 真正的事件处理会在 js_os_poll 中执行。
+ * 使用位图可以支持最多 64 种信号。
+ */
 static void os_signal_handler(int sig_num)
 {
     os_pending_signals |= ((uint64_t)1 << sig_num);
@@ -2203,6 +2565,22 @@ static void os_signal_handler(int sig_num)
 typedef void (*sighandler_t)(int sig_num);
 #endif
 
+/**
+ * @brief 注册信号处理器 (os.signal)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=信号编号，[1]=回调函数/null/undefined
+ * @return 成功返回 undefined
+ * 
+ * 为指定的信号注册处理函数：
+ * - func = null: 恢复默认处理 (SIG_DFL)
+ * - func = undefined: 忽略信号 (SIG_IGN)
+ * - func = 函数：注册自定义处理函数
+ * 
+ * 只能在主线程中调用，Worker 线程不支持信号处理。
+ * 信号编号范围为 0-63，使用 64 位位图存储待处理信号。
+ */
 static JSValue js_os_signal(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv)
 {
@@ -2250,6 +2628,14 @@ static JSValue js_os_signal(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * @brief 获取单调递增的时间戳（毫秒/纳秒）
+ * @return 从某个固定起点开始的毫秒/纳秒数
+ * 
+ * Linux/macOS 使用 clock_gettime(CLOCK_MONOTONIC)，
+ * 其他系统使用 gettimeofday（可能受系统时间调整影响）。
+ * CLOCK_MONOTONIC 不受系统时间修改影响，适合计时。
+ */
 #if defined(__linux__) || defined(__APPLE__)
 static int64_t get_time_ms(void)
 {
@@ -2281,12 +2667,26 @@ static int64_t get_time_ns(void)
 }
 #endif
 
+/**
+ * @brief 获取当前时间戳（毫秒）(os.now)
+ * @param ctx JS 上下文
+ * @return 从固定起点开始的毫秒数（浮点数）
+ * 
+ * 基于单调时钟返回当前时间戳，用于性能测量和定时。
+ */
 static JSValue js_os_now(JSContext *ctx, JSValue this_val,
                          int argc, JSValue *argv)
 {
     return JS_NewFloat64(ctx, (double)get_time_ns() / 1e6);
 }
 
+/**
+ * @brief 释放定时器资源
+ * @param rt JS 运行时
+ * @param th 定时器指针
+ * 
+ * 从定时器链表中移除，释放回调函数引用，释放定时器内存。
+ */
 static void free_timer(JSRuntime *rt, JSOSTimer *th)
 {
     list_del(&th->link);
@@ -2294,6 +2694,18 @@ static void free_timer(JSRuntime *rt, JSOSTimer *th)
     js_free_rt(rt, th);
 }
 
+/**
+ * @brief 设置一次性定时器 (os.setTimeout)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=回调函数，[1]=延迟时间（毫秒）
+ * @return 定时器 ID，用于取消定时器
+ * 
+ * 创建一个一次性定时器，在指定的延迟后调用回调函数。
+ * 定时器 ID 从 1 开始递增，达到 INT32_MAX 后回绕到 1。
+ * 定时器到期时会在 js_os_poll 中被触发执行。
+ */
 static JSValue js_os_setTimeout(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
@@ -2322,6 +2734,12 @@ static JSValue js_os_setTimeout(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, th->timer_id);
 }
 
+/**
+ * @brief 根据 ID 查找定时器
+ * @param ts 线程状态
+ * @param timer_id 定时器 ID
+ * @return 找到返回定时器指针，否则返回 NULL
+ */
 static JSOSTimer *find_timer_by_id(JSThreadState *ts, int timer_id)
 {
     struct list_head *el;
@@ -2335,6 +2753,17 @@ static JSOSTimer *find_timer_by_id(JSThreadState *ts, int timer_id)
     return NULL;
 }
 
+/**
+ * @brief 取消定时器 (os.clearTimeout)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=定时器 ID
+ * @return 成功返回 undefined，定时器不存在也返回 undefined
+ * 
+ * 根据定时器 ID 查找并删除定时器，释放相关资源。
+ * 如果定时器 ID 不存在或无效，静默返回 undefined。
+ */
 static JSValue js_os_clearTimeout(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv)
 {
@@ -2352,6 +2781,18 @@ static JSValue js_os_clearTimeout(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/**
+ * @brief 异步睡眠（返回 Promise）(os.sleepAsync)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=延迟时间（毫秒）
+ * @return Promise 对象，到期后 resolve
+ * 
+ * 创建一个基于 Promise 的异步睡眠，适合 async/await 使用。
+ * 定时器到期时会调用 Promise 的 resolve 函数。
+ * 定时器 ID 设为 -1 表示这是内部定时器，不暴露给用户。
+ */
 /* return a promise */
 static JSValue js_os_sleepAsync(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
@@ -2384,6 +2825,15 @@ static JSValue js_os_sleepAsync(JSContext *ctx, JSValueConst this_val,
     return promise;
 }
 
+/**
+ * @brief 调用事件处理函数
+ * @param ctx JS 上下文
+ * @param func 要调用的函数
+ * 
+ * 安全地调用事件处理回调函数。
+ * 先增加引用计数再调用，防止回调函数释放自身导致悬空指针。
+ * 如果调用抛出异常，输出错误信息但不中断程序。
+ */
 static void call_handler(JSContext *ctx, JSValueConst func)
 {
     JSValue ret, func1;
@@ -3015,6 +3465,18 @@ static JSValue js_os_utimes(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, ret);
 }
 
+/**
+ * @brief 同步睡眠（阻塞）(os.sleep)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=延迟时间（毫秒）
+ * @return 成功返回 0，失败返回负数错误码
+ * 
+ * 阻塞当前线程指定的毫秒数。
+ * Windows 使用 Sleep()，POSIX 系统使用 nanosleep()。
+ * 负延迟会被截断为 0，Windows 上最大延迟限制为 INT32_MAX 毫秒。
+ */
 /* sleep(delay_ms) */
 static JSValue js_os_sleep(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
@@ -3057,6 +3519,18 @@ static char *realpath(const char *path, char *buf)
 }
 #endif
 
+/**
+ * @brief 获取文件绝对路径 (os.realpath)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=文件路径
+ * @return 返回 [绝对路径，错误码] 数组
+ * 
+ * 将相对路径转换为绝对路径，解析符号链接。
+ * Windows 上使用 _fullpath 实现，POSIX 使用 realpath。
+ * 失败时返回空字符串和错误码。
+ */
 /* return [path, errorcode] */
 static JSValue js_os_realpath(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
@@ -3080,6 +3554,17 @@ static JSValue js_os_realpath(JSContext *ctx, JSValueConst this_val,
 }
 
 #if !defined(_WIN32)
+/**
+ * @brief 创建符号链接 (os.symlink)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=目标路径，[1]=链接路径
+ * @return 成功返回 0，失败返回负数错误码
+ * 
+ * 创建一个指向目标文件的符号链接。
+ * 仅在 POSIX 系统上可用，Windows 不支持。
+ */
 static JSValue js_os_symlink(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -3100,6 +3585,17 @@ static JSValue js_os_symlink(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, err);
 }
 
+/**
+ * @brief 读取符号链接目标 (os.readlink)
+ * @param ctx JS 上下文
+ * @param this_val this 对象
+ * @param argc 参数个数
+ * @param argv 参数数组 [0]=符号链接路径
+ * @return 返回 [目标路径，错误码] 数组
+ * 
+ * 获取符号链接指向的目标文件路径。
+ * 仅在 POSIX 系统上可用，返回路径不包含末尾的 null 终止符。
+ */
 /* return [path, errorcode] */
 static JSValue js_os_readlink(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
@@ -3124,6 +3620,16 @@ static JSValue js_os_readlink(JSContext *ctx, JSValueConst this_val,
     return make_string_error(ctx, buf, err);
 }
 
+/**
+ * @brief 从 JS 对象构建环境变量数组
+ * @param ctx JS 上下文
+ * @param obj JS 对象，属性名为环境变量名，属性值为环境变量值
+ * @return 环境变量数组（NULL 结尾），失败返回 NULL
+ * 
+ * 将 JS 对象转换为 execve 可用的 char** 环境变量数组。
+ * 每个环境变量格式为 "KEY=VALUE"，数组末尾为 NULL 指针。
+ * 调用者负责使用 js_free 释放返回的数组和每个字符串。
+ */
 static char **build_envp(JSContext *ctx, JSValueConst obj)
 {
     uint32_t len, i;
@@ -3181,6 +3687,19 @@ static char **build_envp(JSContext *ctx, JSValueConst obj)
     goto done;
 }
 
+/**
+ * @brief 模拟 execvpe 函数（在 PATH 中搜索可执行文件）
+ * @param filename 可执行文件名
+ * @param argv 参数数组
+ * @param envp 环境变量数组
+ * @return 成功不返回，失败返回 -1
+ * 
+ * 在非 GNU 系统上模拟 execvpe 的行为：
+ * - 如果 filename 包含 '/'，直接 execve
+ * - 否则在 PATH 环境变量的各个目录中搜索
+ * - 找到第一个可执行的文件并 execve
+ * - 如果所有路径都失败，返回最后一个错误（EACCES 优先）
+ */
 /* execvpe is not available on non GNU systems */
 static int my_execvpe(const char *filename, char **argv, char **envp)
 {
