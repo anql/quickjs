@@ -18,17 +18,25 @@
 
 ## 🕐 工作日志
 
-### 2026-04-24 07:45 - libregexp.c 部分静态函数注释完成
-- ✅ 已完成：为 libregexp.c 中 5 个基础静态函数添加中文文档注释
-- 📝 新增注释约 50 行，涵盖：
-  - reopcode_info：正则操作码信息表（名称 + 字节长度）
-  - is_digit：数字字符判断辅助函数
-  - dbuf_insert：动态缓冲区指定位置插入数据
-  - re_string_hash：字符串哈希计算（多项式滚动哈希）
-  - re_string_list_init/re_string_list_free：字符串列表初始化/释放
-- 📦 已提交并推送：e5abe82 docs: 为 libregexp.c 部分静态函数添加中文文档注释
-- 📊 当前进度：libregexp.c 注释覆盖率从 17% 提升至约 20%
-- 💡 奴才建议：libregexp.c 还有约 50 个静态函数待注释，包括解析函数、字节码生成函数、执行引擎等核心功能
+### 2026-04-24 07:55 - libregexp.c 第二批静态函数注释完成
+- ✅ 已完成：为 libregexp.c 中 15+ 个基础静态函数添加中文文档注释
+- 📝 新增注释约 220 行，涵盖：
+  - lre_print_char：字符转义打印调试函数
+  - re_string_list_dump：字符串列表调试输出（字符范围 + 哈希表）
+  - re_string_find2：哈希表查找/添加核心实现（含动态扩容策略）
+  - re_string_find/re_string_add：字符串查找/添加包装函数（单字符优化）
+  - re_string_list_op：字符串列表集合运算（并集/交集/差集）
+  - char_range_d/s/w：预定义字符范围常量（\d=\[0-9], \s=空白，\w=单词字符）
+  - cr_init_char_range：字符范围类初始化（支持取反操作）
+  - lre_dump_bytecode：字节码调试转储（DUMP_REOP 模式，支持所有指令格式）
+  - re_emit_op/u32/u8/u16：字节码发射函数族
+  - re_emit_goto 系列：跳转指令发射（自动计算相对偏移）
+  - re_parse_error：格式化解析错误信息（printf 风格）
+  - re_parse_out_of_memory：内存不足错误报告
+  - parse_digits：十进制数字序列解析（含溢出处理策略）
+- 📦 已提交并推送：dc98be9 docs: 为 libregexp.c 基础静态函数添加中文文档注释（第二批）
+- 📊 当前进度：libregexp.c 注释覆盖率从 20% 提升至约 35%
+- 💡 奴才建议：libregexp.c 还有约 45 个静态函数待注释，包括 re_parse_term、re_parse_disjunction 等核心解析函数，以及执行引擎相关函数
 
 ### 2026-04-24 07:39 - 定时任务巡检
 - 🔍 巡检结果：工作区干净，所有注释成果已提交并推送
