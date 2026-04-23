@@ -1553,6 +1553,19 @@ char *find_error(const char *filename, int *pline, int is_strict)
     return NULL;
 }
 
+/**
+ * 跳过源代码中的注释和空白字符
+ * 
+ * 用于定位代码中的第一个有效 token，帮助错误定位。
+ * 支持两种注释格式：
+ * - 单行注释：// ...
+ * - 多行注释：/* ... * /
+ * 
+ * @param str 源代码字符串
+ * @param line 起始行号（用于跟踪当前位置）
+ * @param pline 输出参数：返回第一个非注释字符的行号
+ * @return 跳过注释后剩余字符串的偏移量
+ */
 int skip_comments(const char *str, int line, int *pline)
 {
     const char *p;
@@ -1566,11 +1579,13 @@ int skip_comments(const char *str, int line, int *pline)
             continue;
         }
         if (c == '/' && *p == '/') {
+            /* 单行注释：跳过到行尾 */
             while (*++p && *p != '\n')
                 continue;
             continue;
         }
         if (c == '/' && *p == '*') {
+            /* 多行注释：跳过到 * / */
             for (p += 1; *p; p++) {
                 if (*p == '\n') {
                     line++;
@@ -1591,6 +1606,22 @@ int skip_comments(const char *str, int line, int *pline)
     return p - str;
 }
 
+/**
+ * 在字符串中查找最长匹配
+ * 
+ * 用于错误定位：当测试失败时，在源代码中查找与错误消息最匹配的文本片段，
+ * 帮助定位出错的具体位置。
+ * 
+ * 算法：从 pos 位置开始扫描，找到与 find 字符串匹配最长的位置。
+ * 
+ * @param str 源代码字符串
+ * @param find 要查找的错误消息/文本
+ * @param pos 起始搜索位置
+ * @param ppos 输出参数：最佳匹配位置
+ * @param line 起始行号
+ * @param pline 输出参数：最佳匹配的行号
+ * @return 最长匹配的长度
+ */
 int longest_match(const char *str, const char *find, int pos, int *ppos, int line, int *pline)
 {
     int len, maxlen;
@@ -1601,6 +1632,7 @@ int longest_match(const char *str, const char *find, int pos, int *ppos, int lin
         const char *p;
         for (p = str + pos; *p; p++) {
             if (*p == *find) {
+                /* 尝试匹配更长的字符串 */
                 for (len = 1; p[len] && p[len] == find[len]; len++)
                     continue;
                 if (len > maxlen) {
@@ -1609,6 +1641,7 @@ int longest_match(const char *str, const char *find, int pos, int *ppos, int lin
                         *ppos = p - str;
                     if (pline)
                         *pline = line;
+                    /* 完全匹配，提前退出 */
                     if (!find[len])
                         break;
                 }
@@ -1620,6 +1653,28 @@ int longest_match(const char *str, const char *find, int pos, int *ppos, int lin
     return maxlen;
 }
 
+/**
+ * 执行 JavaScript 代码并评估结果
+ * 
+ * 这是测试执行的核心函数，负责：
+ * 1. 执行给定的 JavaScript 代码
+ * 2. 处理异步测试（Promise/async-await）
+ * 3. 捕获并分析异常
+ * 4. 验证是否符合预期（正常执行或预期错误）
+ * 5. 在 verbose 模式下对比错误文件，更新错误报告
+ * 
+ * @param ctx JavaScript 上下文
+ * @param buf 源代码缓冲区
+ * @param buf_len 代码长度
+ * @param filename 文件名（用于错误报告）
+ * @param is_test 是否为测试模式（影响 verbose 输出）
+ * @param is_negative 是否预期会出错（@negative 标记）
+ * @param error_type 预期的错误类型（如 TypeError、SyntaxError）
+ * @param outfile 输出文件（用于报告）
+ * @param eval_flags 编译标志（严格模式/模块等）
+ * @param is_async 是否为异步测试
+ * @return 0=通过，-1=失败
+ */
 static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
                     const char *filename, int is_test, int is_negative,
                     const char *error_type, FILE *outfile, int eval_flags,
@@ -1636,12 +1691,13 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
     exception_val = JS_UNDEFINED;
     error_name = NULL;
 
-    /* a module evaluation returns a promise */
+    /* 模块评估返回 Promise */
     ret_promise = ((eval_flags & JS_EVAL_TYPE_MODULE) != 0);
-    async_done = 0; /* counter of "Test262:AsyncTestComplete" messages */
+    async_done = 0; /* "Test262:AsyncTestComplete" 消息计数器 */
 
     res_val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);
 
+    /* 处理异步测试：等待 Promise 完成 */
     if ((is_async || ret_promise) && !JS_IsException(res_val)) {
         JSValue promise = JS_UNDEFINED;
         if (ret_promise) {
@@ -1649,21 +1705,24 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
         } else {
             JS_FreeValue(ctx, res_val);
         }
+        /* 事件循环：执行所有待处理的 Job */
         for(;;) {
             ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), NULL);
             if (ret < 0) {
+                /* Job 执行出错 */
                 res_val = JS_EXCEPTION;
                 break;
             } else if (ret == 0) {
+                /* 没有更多 Job 待执行 */
                 if (is_async) {
-                    /* test if the test called $DONE() once */
+                    /* 异步测试：检查是否调用了 $DONE() */
                     if (async_done != 1) {
                         res_val = JS_ThrowTypeError(ctx, "$DONE() not called");
                     } else {
                         res_val = JS_UNDEFINED;
                     }
                 } else {
-                    /* check that the returned promise is fulfilled */
+                    /* 模块测试：检查 Promise 状态 */
                     JSPromiseStateEnum state = JS_PromiseState(ctx, promise);
                     if (state == JS_PROMISE_FULFILLED)
                         res_val = JS_UNDEFINED;
@@ -1678,10 +1737,11 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
         JS_FreeValue(ctx, promise);
     }
 
+    /* 处理执行异常 */
     if (JS_IsException(res_val)) {
         exception_val = JS_GetException(ctx);
         is_error = JS_IsError(ctx, exception_val);
-        /* XXX: should get the filename and line number */
+        /* 输出异常信息 */
         if (outfile) {
             if (!is_error)
                 fprintf(outfile, "%sThrow: ", (eval_flags & JS_EVAL_FLAG_STRICT) ?
@@ -1692,6 +1752,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
             JSValue name, stack;
             const char *stack_str;
 
+            /* 提取错误名称和堆栈 */
             name = JS_GetPropertyStr(ctx, exception_val, "name");
             error_name = JS_ToCString(ctx, name);
             stack = JS_GetPropertyStr(ctx, exception_val, "stack");
@@ -1704,6 +1765,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
                     if (outfile)
                         fprintf(outfile, "%s", stack_str);
 
+                    /* 从堆栈中提取错误行号 */
                     len = strlen(filename);
                     p = strstr(stack_str, filename);
                     if (p != NULL && p[len] == ':') {
@@ -1716,9 +1778,11 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
             JS_FreeValue(ctx, stack);
             JS_FreeValue(ctx, name);
         }
+        /* 判断是否符合预期错误 */
         if (is_negative) {
             ret = 0;
             if (error_type) {
+                /* 验证错误类型是否匹配 */
                 char *error_class;
                 const char *msg;
 
@@ -1730,15 +1794,18 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
                 JS_FreeCString(ctx, msg);
             }
         } else {
+            /* 非预期错误：测试失败 */
             ret = -1;
         }
     } else {
+        /* 执行成功 */
         if (is_negative)
-            ret = -1;
+            ret = -1;  /* 预期错误但没有错误：失败 */
         else
-            ret = 0;
+            ret = 0;   /* 正常通过 */
     }
 
+    /* verbose 模式：对比错误文件，更新错误报告 */
     if (verbose && is_test) {
         JSValue msg_val = JS_UNDEFINED;
         const char *msg = NULL;
@@ -1750,12 +1817,13 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
             msg_val = JS_ToString(ctx, exception_val);
             msg = JS_ToCString(ctx, msg_val);
         }
-        if (is_negative) {  // expect error
+        if (is_negative) {  /* 预期会出错 */
             if (ret == 0) {
+                /* 确实出错了，检查是否是之前记录的错误 */
                 if (msg && s &&
                     (str_equal(s, "expected error") ||
                      strstart(s, "unexpected error type:", NULL) ||
-                     str_equal(s, msg))) {     // did not have error yet
+                     str_equal(s, msg))) {     /* 尚未记录此错误 */
                     if (!has_error_line) {
                         longest_match(buf, msg, pos, &pos, pos_line, &error_line);
                     }
@@ -1764,7 +1832,8 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
                     fixed_errors++;
                 }
             } else {
-                if (!s) {   // not yet reported
+                /* 预期错误但类型不匹配 */
+                if (!s) {   /* 尚未报告 */
                     if (msg) {
                         fprintf(error_out, "%s:%d: %sunexpected error type: %s\n",
                                 filename, error_line, strict_mode, msg);
@@ -1775,8 +1844,9 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
                     new_errors++;
                 }
             }
-        } else {            // should not have error
+        } else {            /* 不应出错 */
             if (msg) {
+                /* 出现了意外错误 */
                 if (!s || !str_equal(s, msg)) {
                     if (!has_error_line) {
                         char *p = skip_prefix(msg, "Test262 Error: ");
@@ -1797,6 +1867,7 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
                     }
                 }
             } else {
+                /* 之前有错误记录，现在修复了 */
                 if (s) {
                     printf("%s:%d: %sOK, fixed error: %s\n", filename, s_line, strict_mode, s);
                     fixed_errors++;
@@ -1813,6 +1884,18 @@ static int eval_buf(JSContext *ctx, const char *buf, size_t buf_len,
     return ret;
 }
 
+/**
+ * 执行 JavaScript 文件
+ * 
+ * 加载文件内容并调用 eval_buf 执行。
+ * 用于加载 harness 文件和测试文件。
+ * 
+ * @param ctx JavaScript 上下文
+ * @param base 基础路径
+ * @param p 相对路径
+ * @param eval_flags 编译标志
+ * @return 0=成功，1=失败
+ */
 static int eval_file(JSContext *ctx, const char *base, const char *p,
                      int eval_flags)
 {
@@ -1840,6 +1923,17 @@ fail:
     return 1;
 }
 
+/**
+ * 提取测试描述注释
+ * 
+ * Test262 测试文件在开头包含描述性注释，用于指定测试元数据：
+ * - 旧格式：/* * @noStrict @onlyStrict @negative * /
+ * - 新格式：/* - YAML frontmatter - * /
+ * 
+ * @param buf 源代码缓冲区
+ * @param style 描述标记字符：'-'=新格式，'*'=旧格式
+ * @return 提取的描述文本（需手动 free），未找到返回 NULL
+ */
 char *extract_desc(const char *buf, char style)
 {
     const char *p, *desc_start;
@@ -1848,9 +1942,11 @@ char *extract_desc(const char *buf, char style)
 
     p = buf;
     while (*p != '\0') {
+        /* 查找 /*X 格式的注释（X=style 字符） */
         if (p[0] == '/' && p[1] == '*' && p[2] == style && p[3] != '/') {
             p += 3;
             desc_start = p;
+            /* 找到注释结束位置 * / */
             while (*p != '\0' && (p[0] != '*' || p[1] != '/'))
                 p++;
             if (*p == '\0') {
@@ -1869,6 +1965,16 @@ char *extract_desc(const char *buf, char style)
     return NULL;
 }
 
+/**
+ * 在描述文本中查找标签
+ * 
+ * 用于解析 YAML frontmatter 中的字段，如 "includes:"、"features:"、"negative:" 等。
+ * 
+ * @param desc 描述文本
+ * @param tag 要查找的标签（如 "includes:"）
+ * @param state 输出参数：解析状态（用于嵌套括号跟踪）
+ * @return 标签后的位置，未找到返回 NULL
+ */
 static char *find_tag(char *desc, const char *tag, int *state)
 {
     char *p;
@@ -1880,6 +1986,18 @@ static char *find_tag(char *desc, const char *tag, int *state)
     return p;
 }
 
+/**
+ * 从描述文本中提取选项
+ * 
+ * 解析 YAML 列表项，支持：
+ * - 简单列表：feature1, feature2, feature3
+ * - 嵌套列表：[item1, item2]
+ * - 自动跳过空白和分隔符
+ * 
+ * @param pp 输入/输出：当前解析位置
+ * @param state 输入/输出：嵌套括号深度
+ * @return 提取的选项（需手动 free），无更多选项返回 NULL
+ */
 static char *get_option(char **pp, int *state)
 {
     char *p, *p0, *option = NULL;
@@ -1887,9 +2005,11 @@ static char *get_option(char **pp, int *state)
         for (p = *pp;; p++) {
             switch (*p) {
             case '[':
+                /* 嵌套列表开始 */
                 *state += 1;
                 continue;
             case ']':
+                /* 嵌套列表结束 */
                 *state -= 1;
                 if (*state > 0)
                     continue;
@@ -1900,16 +2020,20 @@ static char *get_option(char **pp, int *state)
             case '\r':
             case ',':
             case '-':
+                /* 跳过分隔符 */
                 continue;
             case '\n':
+                /* 换行：如果不在嵌套中且下一行不是续行，则结束 */
                 if (*state > 0 || p[1] == ' ')
                     continue;
                 p = NULL;
                 break;
             case '\0':
+                /* 字符串结束 */
                 p = NULL;
                 break;
             default:
+                /* 提取选项名称 */
                 p0 = p;
                 p += strcspn(p0, " \t\r\n,]");
                 option = strdup_len(p0, p - p0);
@@ -1922,14 +2046,29 @@ static char *get_option(char **pp, int *state)
     return option;
 }
 
+/**
+ * 更新内存使用统计
+ * 
+ * 收集每个测试的内存使用情况，计算：
+ * - 平均值：所有测试的平均内存使用
+ * - 最小值：内存使用最少的测试
+ * - 最大值：内存使用最多的测试
+ * 
+ * 用于性能分析和内存泄漏检测。
+ * 
+ * @param rt JavaScript 运行时
+ * @param filename 当前测试文件名
+ */
 void update_stats(JSRuntime *rt, const char *filename) {
     JSMemoryUsage stats;
     JS_ComputeMemoryUsage(rt, &stats);
     if (stats_count++ == 0) {
+        /* 第一个测试：初始化所有统计 */
         stats_avg = stats_all = stats_min = stats_max = stats;
         stats_min_filename = strdup(filename);
         stats_max_filename = strdup(filename);
     } else {
+        /* 更新最大值和最小值 */
         if (stats_max.malloc_size < stats.malloc_size) {
             stats_max = stats;
             free(stats_max_filename);
@@ -1941,6 +2080,7 @@ void update_stats(JSRuntime *rt, const char *filename) {
             stats_min_filename = strdup(filename);
         }
 
+        /* 累加并计算平均值 */
 #define update(f)  stats_avg.f = (stats_all.f += stats.f) / stats_count
         update(malloc_count);
         update(malloc_size);
@@ -1969,6 +2109,27 @@ void update_stats(JSRuntime *rt, const char *filename) {
 #undef update
 }
 
+/**
+ * 运行单个测试文件
+ * 
+ * 这是测试执行的核心流程：
+ * 1. 创建独立的 JS 运行时和上下文（隔离测试环境）
+ * 2. 加载 harness 文件（测试辅助代码）
+ * 3. 执行测试代码
+ * 4. 收集结果并清理资源
+ * 
+ * @param filename 测试文件名
+ * @param harness harness 目录路径
+ * @param ip 包含文件列表
+ * @param buf 测试代码缓冲区
+ * @param buf_len 代码长度
+ * @param error_type 预期错误类型
+ * @param eval_flags 编译标志
+ * @param is_negative 是否预期出错
+ * @param is_async 是否异步测试
+ * @param can_block 是否允许阻塞（Agent 特性）
+ * @return 0=通过，1=失败
+ */
 int run_test_buf(const char *filename, const char *harness, namelist_t *ip,
                  char *buf, size_t buf_len, const char* error_type,
                  int eval_flags, BOOL is_negative, BOOL is_async,
@@ -1978,6 +2139,7 @@ int run_test_buf(const char *filename, const char *harness, namelist_t *ip,
     JSContext *ctx;
     int i, ret;
 
+    /* 创建独立的运行时和上下文 */
     rt = JS_NewRuntime();
     if (rt == NULL) {
         fatal(1, "JS_NewRuntime failure");
@@ -1991,11 +2153,13 @@ int run_test_buf(const char *filename, const char *harness, namelist_t *ip,
 
     JS_SetCanBlock(rt, can_block);
 
-    /* loader for ES6 modules */
+    /* 设置 ES6 模块加载器 */
     JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader_test, NULL, (void *)filename);
 
+    /* 添加 Test262 辅助函数（$262 对象等） */
     add_helpers(ctx);
 
+    /* 加载 harness 文件 */
     for (i = 0; i < ip->count; i++) {
         if (eval_file(ctx, harness, ip->array[i],
                       JS_EVAL_TYPE_GLOBAL)) {
@@ -2003,10 +2167,12 @@ int run_test_buf(const char *filename, const char *harness, namelist_t *ip,
         }
     }
 
+    /* 执行测试代码 */
     ret = eval_buf(ctx, buf, buf_len, filename, TRUE, is_negative,
                    error_type, outfile, eval_flags, is_async);
     ret = (ret != 0);
 
+    /* 记录内存统计 */
     if (dump_memory) {
         update_stats(rt, filename);
     }
@@ -2016,17 +2182,33 @@ int run_test_buf(const char *filename, const char *harness, namelist_t *ip,
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 
+    /* 更新测试结果统计 */
     test_count++;
     if (ret) {
         test_failed++;
         if (outfile) {
-            /* do not output a failure number to minimize diff */
+            /* 不输出失败编号以减少 diff */
             fprintf(outfile, "  FAILED\n");
         }
     }
     return ret;
 }
 
+/**
+ * 运行单个测试文件的主函数
+ * 
+ * 完整流程：
+ * 1. 加载测试文件
+ * 2. 解析测试元数据（YAML frontmatter 或旧格式注释）
+ * 3. 确定测试模式（严格模式/非严格模式/模块/异步）
+ * 4. 加载 harness 文件
+ * 5. 执行测试（可能运行两次：严格 + 非严格）
+ * 6. 记录结果和统计信息
+ * 
+ * @param filename 测试文件路径
+ * @param index 测试索引（用于进度报告）
+ * @return 0=通过，1=失败，-2=跳过
+ */
 int run_test(const char *filename, int index)
 {
     char harnessbuf[1024];
@@ -2048,6 +2230,7 @@ int run_test(const char *filename, int index)
     harness = harness_dir;
 
     if (new_style) {
+        /* 新格式：使用 YAML frontmatter */
         if (!harness) {
             p = strstr(filename, "test/");
             if (p) {
@@ -2060,15 +2243,16 @@ int run_test(const char *filename, int index)
         }
         namelist_add(ip, NULL, "sta.js");
         namelist_add(ip, NULL, "assert.js");
-        /* extract the YAML frontmatter */
+        /* 提取 YAML frontmatter */
         desc = extract_desc(buf, '-');
         if (desc) {
             char *ifile, *option;
             int state;
+            /* 解析 includes 列表 */
             p = find_tag(desc, "includes:", &state);
             if (p) {
                 while ((ifile = get_option(&p, &state)) != NULL) {
-                    // skip unsupported harness files
+                    /* 跳过不支持的 harness 文件 */
                     if (find_word(harness_exclude, ifile)) {
                         skip |= 1;
                     } else {
@@ -2077,6 +2261,7 @@ int run_test(const char *filename, int index)
                     free(ifile);
                 }
             }
+            /* 解析 flags */
             p = find_tag(desc, "flags:", &state);
             if (p) {
                 while ((option = get_option(&p, &state)) != NULL) {
@@ -2103,9 +2288,10 @@ int run_test(const char *filename, int index)
                     free(option);
                 }
             }
+            /* 解析 negative（预期错误） */
             p = find_tag(desc, "negative:", &state);
             if (p) {
-                /* XXX: should extract the phase */
+                /* TODO: 应该提取 phase 信息 */
                 char *q = find_tag(p, "type:", &state);
                 if (q) {
                     while (isspace((unsigned char)*q))
@@ -2114,19 +2300,20 @@ int run_test(const char *filename, int index)
                 }
                 is_negative = TRUE;
             }
+            /* 解析 features */
             p = find_tag(desc, "features:", &state);
             if (p) {
                 while ((option = get_option(&p, &state)) != NULL) {
                     char *p1;
                     if (find_word(harness_features, option)) {
-                        /* feature is enabled */
+                        /* 特性已启用 */
                     } else if ((p1 = find_word(harness_skip_features, option)) != NULL) {
-                        /* skip disabled feature */
+                        /* 跳过禁用的特性 */
                         if (harness_skip_features_count)
                             harness_skip_features_count[p1 - harness_skip_features]++;
                         skip |= 1;
                     } else {
-                        /* feature is not listed: skip and warn */
+                        /* 特性未列出：跳过并警告 */
                         printf("%s:%d: unknown feature: %s\n", filename, 1, option);
                         skip |= 1;
                     }
@@ -2138,6 +2325,7 @@ int run_test(const char *filename, int index)
         if (is_async)
             namelist_add(ip, NULL, "doneprintHandle.js");
     } else {
+        /* 旧格式：使用 @ 标记注释 */
         char *ifile;
 
         if (!harness) {
@@ -2153,11 +2341,11 @@ int run_test(const char *filename, int index)
 
         namelist_add(ip, NULL, "sta.js");
 
-        /* include extra harness files */
+        /* 包含额外的 harness 文件（$INCLUDE 指令） */
         for (p = buf; (p = strstr(p, "$INCLUDE(\"")) != NULL; p++) {
             p += 10;
             ifile = strdup_len(p, strcspn(p, "\""));
-            // skip unsupported harness files
+            /* 跳过不支持的 harness 文件 */
             if (find_word(harness_exclude, ifile)) {
                 skip |= 1;
             } else {
@@ -2166,7 +2354,7 @@ int run_test(const char *filename, int index)
             free(ifile);
         }
 
-        /* locate the old style configuration comment */
+        /* 定位旧格式配置注释 */
         desc = extract_desc(buf, '*');
         if (desc) {
             if (strstr(desc, "@noStrict")) {
@@ -2178,13 +2366,14 @@ int run_test(const char *filename, int index)
                 skip |= (test_mode == TEST_NOSTRICT);
             }
             if (strstr(desc, "@negative")) {
-                /* XXX: should extract the regex to check error type */
+                /* TODO: 应该提取错误类型的正则表达式 */
                 is_negative = TRUE;
             }
             free(desc);
         }
     }
 
+    /* 输出测试信息 */
     if (outfile && index >= 0) {
         fprintf(outfile, "%d: %s%s%s%s%s%s%s\n", index, filename,
                 is_nostrict ? "  @noStrict" : "",
@@ -2197,8 +2386,7 @@ int run_test(const char *filename, int index)
     }
 
     use_strict = use_nostrict = 0;
-    /* XXX: should remove 'test_mode' or simplify it just to force
-       strict or non strict mode for single file tests */
+    /* 根据测试模式决定是否运行严格/非严格版本 */
     switch (test_mode) {
     case TEST_DEFAULT_NOSTRICT:
         if (is_onlystrict)
@@ -2232,7 +2420,9 @@ int run_test(const char *filename, int index)
         break;
     }
 
+    /* 执行测试 */
     if (skip || use_strict + use_nostrict == 0) {
+        /* 跳过测试 */
         test_skipped++;
         ret = -2;
     } else {
@@ -2257,7 +2447,7 @@ int run_test(const char *filename, int index)
         }
         clocks = clock() - clocks;
         if (outfile && index >= 0 && clocks >= CLOCKS_PER_SEC / 10) {
-            /* output timings for tests that take more than 100 ms */
+            /* 输出耗时超过 100ms 的测试 */
             fprintf(outfile, " time: %d ms\n", (int)(clocks * 1000LL / CLOCKS_PER_SEC));
         }
     }
@@ -2268,7 +2458,18 @@ int run_test(const char *filename, int index)
     return ret;
 }
 
-/* run a test when called by test262-harness+eshost */
+/**
+ * 为 test262-harness+eshost 运行单个测试
+ * 
+ * 这是外部测试工具调用的入口函数，简化版本：
+ * - 只运行单个文件
+ * - 不支持严格/非严格双模式
+ * - 直接输出错误到 stdout
+ * 
+ * @param filename 测试文件路径
+ * @param is_module 是否为模块测试
+ * @return 0=成功，1=失败
+ */
 int run_test262_harness_test(const char *filename, BOOL is_module)
 {
     JSRuntime *rt;
@@ -2295,7 +2496,7 @@ int run_test262_harness_test(const char *filename, BOOL is_module)
     can_block = TRUE;
     JS_SetCanBlock(rt, can_block);
 
-    /* loader for ES6 modules */
+    /* 设置 ES6 模块加载器 */
     JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader_test, NULL, (void *)filename);
 
     add_helpers(ctx);
@@ -2319,6 +2520,7 @@ int run_test262_harness_test(const char *filename, BOOL is_module)
         } else {
             JS_FreeValue(ctx, res_val);
         }
+        /* 执行所有待处理的 Job */
         for(;;) {
             ret = JS_ExecutePendingJob(JS_GetRuntime(ctx), NULL);
             if (ret < 0) {
@@ -2328,7 +2530,7 @@ int run_test262_harness_test(const char *filename, BOOL is_module)
                 break;
             }
         }
-        /* dump the error if the module returned an error. */
+        /* 如果模块返回错误，输出错误信息 */
         if (is_module) {
             JSPromiseStateEnum state = JS_PromiseState(ctx, promise);
             if (state == JS_PROMISE_REJECTED) {
@@ -2350,6 +2552,17 @@ int run_test262_harness_test(const char *filename, BOOL is_module)
 
 clock_t last_clock;
 
+/**
+ * 显示测试进度
+ * 
+ * 两种显示模式：
+ * - compact 模式：使用符号（. = 正常，- = 跳过，! = 失败），每 60 个显示汇总
+ * - 正常模式：原地刷新显示 失败数/总数/跳过数
+ * 
+ * 使用节流避免频繁输出（每 50ms 最多一次）
+ * 
+ * @param force 是否强制输出
+ */
 void show_progress(int force) {
     clock_t t = clock();
     if (force || !last_clock || (t - last_clock) > CLOCKS_PER_SEC / 20) {
@@ -2371,7 +2584,7 @@ void show_progress(int force) {
                         test_failed, test_count, test_skipped);
             }
         } else {
-            /* output progress indicator: erase end of line and return to col 0 */
+            /* 正常模式：原地刷新进度 */
             fprintf(stderr, "%d/%d/%d\033[K\r",
                     test_failed, test_count, test_skipped);
         }
@@ -2381,6 +2594,19 @@ void show_progress(int force) {
 
 static int slow_test_threshold;
 
+/**
+ * 运行测试目录列表
+ * 
+ * 遍历测试列表，执行每个测试文件：
+ * - 跳过排除列表中的文件
+ * - 支持索引范围过滤（start_index 到 stop_index）
+ * - 可选显示慢测试（超过阈值的测试）
+ * - 实时显示进度
+ * 
+ * @param lp 测试文件列表
+ * @param start_index 起始索引（-1=从头开始）
+ * @param stop_index 结束索引（-1=到末尾）
+ */
 void run_test_dir_list(namelist_t *lp, int start_index, int stop_index)
 {
     int i;
@@ -2414,6 +2640,11 @@ void run_test_dir_list(namelist_t *lp, int start_index, int stop_index)
     show_progress(TRUE);
 }
 
+/**
+ * 显示帮助信息
+ * 
+ * 输出所有命令行选项的说明，然后退出。
+ */
 void help(void)
 {
     printf("run-test262 version " CONFIG_VERSION "\n"
@@ -2439,6 +2670,15 @@ void help(void)
     exit(1);
 }
 
+/**
+ * 获取选项参数
+ * 
+ * 检查选项是否有参数，没有则报错退出。
+ * 
+ * @param option 选项名称（用于错误消息）
+ * @param arg 选项参数值
+ * @return 参数值
+ */
 char *get_opt_arg(const char *option, char *arg)
 {
     if (!arg) {
@@ -2447,6 +2687,33 @@ char *get_opt_arg(const char *option, char *arg)
     return arg;
 }
 
+/**
+ * 主函数：Test262 测试运行器入口
+ * 
+ * 完整流程：
+ * 1. 解析命令行选项
+ * 2. 加载配置文件（如果有）
+ * 3. 加载错误文件（用于对比）
+ * 4. 枚举测试文件
+ * 5. 执行测试
+ * 6. 输出统计报告
+ * 
+ * 命令行选项：
+ * - -c: 配置文件
+ * - -d: 测试目录
+ * - -e: 错误文件
+ * - -f: 单个测试文件
+ * - -n: 使用新格式 harness
+ * - -s/-a: 严格模式/全模式
+ * - -v: 详细输出
+ * - -u: 更新错误文件
+ * - -m: 内存统计
+ * - -T: 慢测试阈值
+ * 
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 0=全部通过，非 0=有错误/失败
+ */
 int main(int argc, char **argv)
 {
     int optind, start_index, stop_index;
@@ -2460,11 +2727,13 @@ int main(int argc, char **argv)
     clock_t clocks;
 
 #if !defined(_WIN32)
+    /* 非 TTY 时使用紧凑模式 */
     compact = !isatty(STDERR_FILENO);
-    /* Date tests assume California local time */
+    /* Date 测试假设使用加州当地时间 */
     setenv("TZ", "America/Los_Angeles", 1);
 #endif
 
+    /* 第一次扫描：确定是否忽略 testdir 配置 */
     optind = 1;
     while (optind < argc) {
         char *arg = argv[optind];
@@ -2474,11 +2743,11 @@ int main(int argc, char **argv)
         if (strstr("-c -d -e -x -f -r -E -T", arg))
             optind++;
         if (strstr("-d -f", arg))
-            ignore = "testdir"; // run only the tests from -d or -f
+            ignore = "testdir"; /* 只运行 -d 或 -f 指定的测试 */
     }
 
-    /* cannot use getopt because we want to pass the command line to
-       the script */
+    /* 第二次扫描：解析所有选项 */
+    /* 不能使用 getopt，因为需要将命令行传递给脚本 */
     optind = 1;
     is_dir_list = TRUE;
     while (optind < argc) {
@@ -2535,18 +2804,22 @@ int main(int argc, char **argv)
     if (optind >= argc && !test_list.count)
         help();
 
+    /* harness 模式：直接运行单个测试 */
     if (is_test262_harness) {
         return run_test262_harness_test(argv[optind], is_module);
     }
 
     error_out = stdout;
     if (error_filename) {
+        /* 加载已知错误文件 */
         error_file = load_file(error_filename, NULL);
         if (only_check_errors && error_file) {
+            /* 只运行错误文件中列出的测试 */
             namelist_free(&test_list);
             namelist_add_from_error_file(&test_list, error_file);
         }
         if (update_errors) {
+            /* 更新错误文件模式：清空旧内容，准备写入新错误 */
             free(error_file);
             error_file = NULL;
             error_out = fopen(error_filename, "w");
@@ -2556,19 +2829,22 @@ int main(int argc, char **argv)
         }
     }
 
+    /* 更新排除目录列表 */
     update_exclude_dirs();
 
     clocks = clock();
 
     if (count_skipped_features) {
-        /* not storage efficient but it is simple */
+        /* 统计被跳过的特性（内存效率不高但简单） */
         size_t size;
         size = sizeof(harness_skip_features_count[0]) * strlen(harness_skip_features);
         harness_skip_features_count = malloc(size);
         memset(harness_skip_features_count, 0, size);
     }
     
+    /* 执行测试 */
     if (is_dir_list) {
+        /* 目录列表模式 */
         if (optind < argc && !isdigit((unsigned char)argv[optind][0])) {
             filename = argv[optind++];
             namelist_load(&test_list, filename);
@@ -2581,6 +2857,7 @@ int main(int argc, char **argv)
                 stop_index = atoi(argv[optind++]);
             }
         }
+        /* 设置输出文件 */
         if (!report_filename || str_equal(report_filename, "none")) {
             outfile = NULL;
         } else if (str_equal(report_filename, "-")) {
@@ -2598,6 +2875,7 @@ int main(int argc, char **argv)
             outfile = NULL;
         }
     } else {
+        /* 单文件模式 */
         outfile = stdout;
         while (optind < argc) {
             run_test(argv[optind++], -1);
@@ -2606,6 +2884,7 @@ int main(int argc, char **argv)
 
     clocks = clock() - clocks;
 
+    /* 输出内存统计 */
     if (dump_memory) {
         if (dump_memory > 1 && stats_count > 1) {
             printf("\nMininum memory statistics for %s:\n\n", stats_min_filename);
@@ -2618,6 +2897,7 @@ int main(int argc, char **argv)
         printf("\n");
     }
 
+    /* 输出被跳过的特性统计 */
     if (count_skipped_features) {
         size_t i, n, len = strlen(harness_skip_features);
         BOOL disp = FALSE;
@@ -2642,6 +2922,7 @@ int main(int argc, char **argv)
         printf("\n");
     }
     
+    /* 输出测试结果汇总 */
     if (is_dir_list) {
         fprintf(stderr, "Result: %d/%d error%s",
                 test_failed, test_count, test_count != 1 ? "s" : "");
@@ -2667,6 +2948,7 @@ int main(int argc, char **argv)
         error_out = NULL;
     }
 
+    /* 清理资源 */
     namelist_free(&test_list);
     namelist_free(&exclude_list);
     namelist_free(&exclude_dir_list);
@@ -2677,6 +2959,6 @@ int main(int argc, char **argv)
     free(harness_exclude);
     free(error_file);
 
-    /* Signal that the error file is out of date. */
+    /* 返回值表示错误文件是否过期（有新错误/变更/修复） */
     return new_errors || changed_errors || fixed_errors;
 }
