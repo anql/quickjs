@@ -1792,6 +1792,13 @@ void parse_script_extensions(const char *filename)
     fclose(f);
 }
 
+/* ========== 调试输出函数 ========== */
+
+/**
+ * 打印单个字符的大小写转换信息（调试用）
+ * @param ci 字符信息结构
+ * @param i 码点
+ */
 void dump_cc_info(CCInfo *ci, int i)
 {
     int j;
@@ -1814,6 +1821,10 @@ void dump_cc_info(CCInfo *ci, int i)
     printf("\n");
 }
 
+/**
+ * 打印所有有大小写转换的字符信息（调试用）
+ * @param tab Unicode 字符数据库
+ */
 void dump_unicode_data(CCInfo *tab)
 {
     int i;
@@ -1826,33 +1837,92 @@ void dump_unicode_data(CCInfo *tab)
     }
 }
 
+/* ========== 大小写转换表压缩算法 ========== */
+/*
+ * 背景：
+ * Unicode 有 1,114,112 个码点，如果为每个字符存储完整的大小写转换信息，
+ * 需要大量内存。但实际上：
+ * 1. 大部分字符（如汉字、标点）没有大小写转换
+ * 2. 许多字符的转换遵循简单规律（如 A→a, B→c, C→c 是连续的）
+ * 
+ * 压缩策略：
+ * 1. 游程编码（RLE）：将连续相同模式的字符合并为一个"运行"（run）
+ * 2. 类型编码：定义 14 种运行类型（RUN_TYPE_*），每种用最紧凑的方式编码
+ * 3. 索引表：使用二级索引（表 1+ 表 2）进一步压缩
+ * 
+ * 运行类型示例：
+ * - RUN_TYPE_U: 大写字母连续运行（A→a, B→b, C→c...）
+ * - RUN_TYPE_L: 小写字母连续运行
+ * - RUN_TYPE_UL: 交替运行（a→A, B→b, c→C, D→d...）
+ * - RUN_TYPE_LSU: 特殊三字符运行（希腊语最终 sigma）
+ * - RUN_TYPE_UF_EXT2: 带 2 个扩展字符的大写 + 折叠
+ */
+
+/**
+ * 判断是否为"复杂"大小写情况
+ * 
+ * 简单情况：
+ * - 单字符映射到单字符
+ * - 大写和小写映射相同（f_data == l_data）
+ * 
+ * 复杂情况（需要特殊处理）：
+ * - 多字符映射：如 ß → SS
+ * - 大写和小写不同：如 Σ → σ (小写) 但 Σ 本身不是小写
+ * - 折叠和小写不同：某些语言特定规则
+ * 
+ * @param ci 字符信息结构
+ * @return TRUE 如果是复杂情况
+ */
 BOOL is_complicated_case(const CCInfo *ci)
 {
-    return (ci->u_len > 1 || ci->l_len > 1 ||
-            (ci->u_len > 0 && ci->l_len > 0) ||
-            (ci->f_len != ci->l_len) ||
-            (memcmp(ci->f_data, ci->l_data, ci->f_len * sizeof(ci->f_data[0])) != 0));
+    return (ci->u_len > 1 || ci->l_len > 1 ||  // 多字符映射
+            (ci->u_len > 0 && ci->l_len > 0) ||  // 同时有大写和小写
+            (ci->f_len != ci->l_len) ||  // 折叠和小写长度不同
+            (memcmp(ci->f_data, ci->l_data, ci->f_len * sizeof(ci->f_data[0])) != 0));  // 折叠和小写内容不同
 }
 
 #ifndef USE_TEST
+/**
+ * 大小写转换运行类型枚举（14 种）
+ * 
+ * 这些类型用于压缩编码连续的大小写转换模式。
+ * 每个类型的编码格式不同，以最小化存储空间。
+ * 
+ * 类型说明：
+ * - U: 大写字母运行（code→code+1, code+1→code+2, ...）
+ * - L: 小写字母运行
+ * - UF: 大写 + 折叠相同（大多数拉丁字母）
+ * - LF: 小写 + 折叠相同
+ * - UL: 交替运行（小写→大写，大写→小写，如希腊语）
+ * - LSU: 特殊三字符运行（希腊语最终 sigma：Σ→σ, σ→ς, ς→Σ）
+ * - U2L_399_EXT2: 大写→小写 + 2 扩展字符（特殊希腊字母）
+ * - UF_D20: 大写 + 折叠，差值为 0x20（ASCII 大小写）
+ * - UF_D1_EXT: 大写 + 折叠，差值为 1 + 扩展
+ * - U_EXT/LF_EXT: 带扩展数据的 U/LF 类型
+ * - UF_EXT2/UF_EXT3: 带 2/3 个扩展字符的 UF 类型
+ * - LF_EXT2: 带 2 个扩展字符的 LF 类型
+ */
 enum {
-    RUN_TYPE_U,
-    RUN_TYPE_L,
-    RUN_TYPE_UF,
-    RUN_TYPE_LF,
-    RUN_TYPE_UL,
-    RUN_TYPE_LSU,
-    RUN_TYPE_U2L_399_EXT2,
-    RUN_TYPE_UF_D20,
-    RUN_TYPE_UF_D1_EXT,
-    RUN_TYPE_U_EXT,
-    RUN_TYPE_LF_EXT,
-    RUN_TYPE_UF_EXT2,
-    RUN_TYPE_LF_EXT2,
-    RUN_TYPE_UF_EXT3,
+    RUN_TYPE_U,           // 0: 大写字母运行
+    RUN_TYPE_L,           // 1: 小写字母运行
+    RUN_TYPE_UF,          // 2: 大写 + 折叠相同
+    RUN_TYPE_LF,          // 3: 小写 + 折叠相同
+    RUN_TYPE_UL,          // 4: 交替运行（小写↔大写）
+    RUN_TYPE_LSU,         // 5: 希腊语最终 sigma 特殊三字符
+    RUN_TYPE_U2L_399_EXT2, // 6: 大写→小写 + 2 扩展（0x0399）
+    RUN_TYPE_UF_D20,      // 7: 大写 + 折叠，差值 0x20
+    RUN_TYPE_UF_D1_EXT,   // 8: 大写 + 折叠，差值 1 + 扩展
+    RUN_TYPE_U_EXT,       // 9: 带扩展的 U
+    RUN_TYPE_LF_EXT,      // 10: 带扩展的 LF
+    RUN_TYPE_UF_EXT2,     // 11: 带 2 扩展的 UF
+    RUN_TYPE_LF_EXT2,     // 12: 带 2 扩展的 LF
+    RUN_TYPE_UF_EXT3,     // 13: 带 3 扩展的 UF
 };
 #endif
 
+/**
+ * 运行类型名称表（调试用）
+ */
 const char *run_type_str[] = {
     "U",
     "L",
@@ -1870,16 +1940,48 @@ const char *run_type_str[] = {
     "UF_EXT3",
 };
 
+/**
+ * 大小写转换表条目结构
+ * 
+ * 这个结构体在 build_conv_table() 中用于临时存储
+ * 分析结果，最终会被压缩编码到 case_conv_table1/2 中。
+ * 
+ * 字段说明：
+ * - code: 运行起始码点（17 位，0x000000-0x10FFFF）
+ * - len: 运行长度（7 位，1-127 个字符）
+ * - type: 运行类型（4 位，0-13）
+ * - data: 目标码点或索引（取决于类型）
+ * - ext_len: 扩展数据长度（0-3）
+ * - ext_data: 扩展数据数组（用于复杂映射）
+ * - data_index: 压缩后的数据索引（用于间接引用）
+ * 
+ * 压缩后格式（32 位）：
+ *   [31:15] code (17 位)
+ *   [14:8]  len (7 位)
+ *   [7:4]   type (4 位)
+ *   [3:0]   data_index 高位 (4 位)
+ *   data_index 低 8 位在 case_conv_table2 中
+ */
 typedef struct {
-    int code;
-    int len;
-    int type;
-    int data;
-    int ext_len;
-    int ext_data[3];
-    int data_index; /* 'data' coming from the table */
+    int code;           // 运行起始码点
+    int len;            // 运行长度（字符数）
+    int type;           // 运行类型（RUN_TYPE_*）
+    int data;           // 目标码点或临时数据
+    int ext_len;        // 扩展数据长度
+    int ext_data[3];    // 扩展数据（最多 3 个码点）
+    int data_index;     // 压缩后的数据索引
 } TableEntry;
 
+/**
+ * 获取简单小写形式
+ * 
+ * 用于某些运行类型判断。如果字符的小写映射是单字符，
+ * 返回该码点；否则返回自身（表示无简单小写）。
+ * 
+ * @param tab Unicode 字符数据库
+ * @param c 码点
+ * @return 小写码点或自身
+ */
 static int simple_to_lower(CCInfo *tab, int c)
 {
     if (tab[c].l_len != 1)
@@ -1887,7 +1989,7 @@ static int simple_to_lower(CCInfo *tab, int c)
     return tab[c].l_data[0];
 }
 
-/* code (17), len (7), type (4) */
+/* code (17), len (7), type (4) - 位域布局注释 */
 
 void find_run_type(TableEntry *te, CCInfo *tab, int code)
 {
