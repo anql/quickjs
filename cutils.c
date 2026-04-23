@@ -102,7 +102,20 @@ int has_suffix(const char *str, const char *suffix)
 
 /* ==================== 动态缓冲区（DynBuf）实现 ==================== */
 
-/* 默认重分配函数：直接使用标准库 realloc */
+/**
+ * dbuf_default_realloc - 默认 DynBuf 内存重分配函数
+ * 
+ * 使用系统 realloc 进行内存分配，作为 DynBuf 的默认分配器。
+ * 
+ * @param opaque - 用户数据（未使用，保留用于未来扩展）
+ * @param ptr - 原指针（NULL 时等同于 malloc）
+ * @param size - 新大小（字节）
+ * @return 新分配的指针；失败返回 NULL
+ * 
+ * 注意：
+ * - size=0 时行为取决于 realloc 实现（可能返回 NULL 或可 free 的指针）
+ * - 失败时原指针保持不变，需要调用者处理错误
+ */
 static void *dbuf_default_realloc(void *opaque, void *ptr, size_t size)
 {
     return realloc(ptr, size);
@@ -390,11 +403,28 @@ int unicode_from_utf8(const uint8_t *p, int max_len, const uint8_t **pp)
 
 #if defined(EMSCRIPTEN) || defined(__ANDROID__)
 
-/* 全局变量存储比较函数参数（不可重入） */
+/**
+ * rqsort_arg - 全局比较函数参数（仅用于简单版本）
+ * 注意：此方法不可重入，已被优化版本废弃
+ */
 static void *rqsort_arg;
+
+/**
+ * rqsort_cmp - 全局比较函数指针（仅用于简单版本）
+ * 注意：此方法不可重入，已被优化版本废弃
+ */
 static int (*rqsort_cmp)(const void *, const void *, void *);
 
-/* 适配函数：将标准 qsort 的比较函数签名转换为带用户数据的版本 */
+/**
+ * rqsort_cmp2 - 比较函数适配器
+ * 
+ * 将标准 qsort 的比较函数签名（两参数）转换为带用户数据的版本（三参数）。
+ * 由于 rqsort_arg 是全局变量，此函数不可重入。
+ * 
+ * @param p1 - 第一个比较元素
+ * @param p2 - 第二个比较元素
+ * @return 比较结果：负数-p1<p2；0-p1==p2；正数-p1>p2
+ */
 static int rqsort_cmp2(const void *p1, const void *p2)
 {
     return rqsort_cmp(p1, p2, rqsort_arg);
@@ -422,7 +452,15 @@ typedef int (*cmp_f)(const void *, const void *, void *opaque);  /* 比较函数
  * 优化策略：按类型大小批量交换，减少循环次数
  */
 
-/* 字节交换：逐字节复制（通用但慢） */
+/**
+ * exchange_bytes - 逐字节交换（通用但最慢）
+ * 
+ * 当数据未对齐时使用此函数，逐字节复制交换。
+ * 
+ * @param a - 第一个内存区域
+ * @param b - 第二个内存区域
+ * @param size - 交换字节数
+ */
 static void exchange_bytes(void *a, void *b, size_t size) {
     uint8_t *ap = (uint8_t *)a;
     uint8_t *bp = (uint8_t *)b;
@@ -434,7 +472,15 @@ static void exchange_bytes(void *a, void *b, size_t size) {
     }
 }
 
-/* 单字节交换：仅交换 1 字节 */
+/**
+ * exchange_one_byte - 单字节交换（优化版本）
+ * 
+ * 专门用于交换单个字节的特化版本，避免循环开销。
+ * 
+ * @param a - 第一个字节地址
+ * @param b - 第二个字节地址
+ * @param size - 固定为 1（未使用）
+ */
 static void exchange_one_byte(void *a, void *b, size_t size) {
     uint8_t *ap = (uint8_t *)a;
     uint8_t *bp = (uint8_t *)b;
@@ -443,7 +489,15 @@ static void exchange_one_byte(void *a, void *b, size_t size) {
     *bp = t;
 }
 
-/* 16 位整数批量交换 */
+/**
+ * exchange_int16s - 16 位整数批量交换
+ * 
+ * 按 uint16_t 为单位批量交换，适用于 2 字节对齐的数据。
+ * 
+ * @param a - 第一个内存区域
+ * @param b - 第二个内存区域
+ * @param size - 交换总字节数（必须是 2 的倍数）
+ */
 static void exchange_int16s(void *a, void *b, size_t size) {
     uint16_t *ap = (uint16_t *)a;
     uint16_t *bp = (uint16_t *)b;
@@ -455,7 +509,15 @@ static void exchange_int16s(void *a, void *b, size_t size) {
     }
 }
 
-/* 单 16 位整数交换 */
+/**
+ * exchange_one_int16 - 单 16 位整数交换（优化版本）
+ * 
+ * 专门用于交换单个 uint16_t 的特化版本。
+ * 
+ * @param a - 第一个 16 位整数地址
+ * @param b - 第二个 16 位整数地址
+ * @param size - 固定为 2（未使用）
+ */
 static void exchange_one_int16(void *a, void *b, size_t size) {
     uint16_t *ap = (uint16_t *)a;
     uint16_t *bp = (uint16_t *)b;
@@ -464,7 +526,15 @@ static void exchange_one_int16(void *a, void *b, size_t size) {
     *bp = t;
 }
 
-/* 32 位整数批量交换 */
+/**
+ * exchange_int32s - 32 位整数批量交换
+ * 
+ * 按 uint32_t 为单位批量交换，适用于 4 字节对齐的数据。
+ * 
+ * @param a - 第一个内存区域
+ * @param b - 第二个内存区域
+ * @param size - 交换总字节数（必须是 4 的倍数）
+ */
 static void exchange_int32s(void *a, void *b, size_t size) {
     uint32_t *ap = (uint32_t *)a;
     uint32_t *bp = (uint32_t *)b;
@@ -476,7 +546,15 @@ static void exchange_int32s(void *a, void *b, size_t size) {
     }
 }
 
-/* 单 32 位整数交换 */
+/**
+ * exchange_one_int32 - 单 32 位整数交换（优化版本）
+ * 
+ * 专门用于交换单个 uint32_t 的特化版本。
+ * 
+ * @param a - 第一个 32 位整数地址
+ * @param b - 第二个 32 位整数地址
+ * @param size - 固定为 4（未使用）
+ */
 static void exchange_one_int32(void *a, void *b, size_t size) {
     uint32_t *ap = (uint32_t *)a;
     uint32_t *bp = (uint32_t *)b;
@@ -485,7 +563,15 @@ static void exchange_one_int32(void *a, void *b, size_t size) {
     *bp = t;
 }
 
-/* 64 位整数批量交换 */
+/**
+ * exchange_int64s - 64 位整数批量交换
+ * 
+ * 按 uint64_t 为单位批量交换，适用于 8 字节对齐的数据。
+ * 
+ * @param a - 第一个内存区域
+ * @param b - 第二个内存区域
+ * @param size - 交换总字节数（必须是 8 的倍数）
+ */
 static void exchange_int64s(void *a, void *b, size_t size) {
     uint64_t *ap = (uint64_t *)a;
     uint64_t *bp = (uint64_t *)b;
@@ -497,7 +583,15 @@ static void exchange_int64s(void *a, void *b, size_t size) {
     }
 }
 
-/* 单 64 位整数交换 */
+/**
+ * exchange_one_int64 - 单 64 位整数交换（优化版本）
+ * 
+ * 专门用于交换单个 uint64_t 的特化版本。
+ * 
+ * @param a - 第一个 64 位整数地址
+ * @param b - 第二个 64 位整数地址
+ * @param size - 固定为 8（未使用）
+ */
 static void exchange_one_int64(void *a, void *b, size_t size) {
     uint64_t *ap = (uint64_t *)a;
     uint64_t *bp = (uint64_t *)b;
@@ -506,7 +600,15 @@ static void exchange_one_int64(void *a, void *b, size_t size) {
     *bp = t;
 }
 
-/* 128 位整数批量交换（两个 64 位） */
+/**
+ * exchange_int128s - 128 位整数批量交换
+ * 
+ * 按两个 uint64_t 为单位批量交换 128 位数据，适用于 16 字节对齐。
+ * 
+ * @param a - 第一个内存区域
+ * @param b - 第二个内存区域
+ * @param size - 交换总字节数（必须是 16 的倍数）
+ */
 static void exchange_int128s(void *a, void *b, size_t size) {
     uint64_t *ap = (uint64_t *)a;
     uint64_t *bp = (uint64_t *)b;
@@ -521,7 +623,15 @@ static void exchange_int128s(void *a, void *b, size_t size) {
     }
 }
 
-/* 单 128 位整数交换 */
+/**
+ * exchange_one_int128 - 单 128 位整数交换（优化版本）
+ * 
+ * 专门用于交换单个 128 位数据（两个 uint64_t）的特化版本。
+ * 
+ * @param a - 第一个 128 位数据地址
+ * @param b - 第二个 128 位数据地址
+ * @param size - 固定为 16（未使用）
+ */
 static void exchange_one_int128(void *a, void *b, size_t size) {
     uint64_t *ap = (uint64_t *)a;
     uint64_t *bp = (uint64_t *)b;
@@ -533,9 +643,23 @@ static void exchange_one_int128(void *a, void *b, size_t size) {
     bp[1] = u;
 }
 
-/* 根据地址和大小对齐情况选择最优交换函数
- * 优化：利用对齐信息选择按字节/16 位/32 位/64 位/128 位交换
- * 原理：对齐的地址和大小可以使用更大粒度的交换，提高效率
+/**
+ * exchange_func - 根据对齐情况选择最优交换函数
+ * 
+ * 通过分析地址和大小的低 4 位，判断数据的对齐情况，选择最高效的交换策略。
+ * 这是 rqsort 性能优化的关键：对齐数据可以使用更大粒度的交换（如 128 位），
+ * 显著减少循环次数和内存访问次数。
+ * 
+ * @param base - 数组基址
+ * @param size - 元素大小（字节）
+ * @return 最优的交换函数指针
+ * 
+ * 对齐策略：
+ * - 16 字节对齐：使用 128 位交换（一次交换 16 字节）
+ * - 8 字节对齐：使用 64 位交换（一次交换 8 字节）
+ * - 4 字节对齐：使用 32 位交换（一次交换 4 字节）
+ * - 2 字节对齐：使用 16 位交换（一次交换 2 字节）
+ * - 未对齐：使用字节交换（通用但最慢）
  */
 static inline exchange_f exchange_func(const void *base, size_t size) {
     /* 使用低 4 位判断对齐情况 */
@@ -572,9 +696,26 @@ static inline exchange_f exchange_func(const void *base, size_t size) {
     }
 }
 
-/* 堆排序：作为 rqsort 的后备算法（当递归深度过大时使用）
- * 保证最坏情况 O(n log n) 时间复杂度
- * 参数：base-数组基址；nmemb-元素个数；size-元素大小；cmp-比较函数；opaque-用户数据
+/**
+ * heapsortx - 堆排序（rqsort 的后备算法）
+ * 
+ * 当快速排序递归深度过大（>50 层）时切换到此算法，保证最坏情况仍为 O(n log n)。
+ * 使用最大堆：堆顶始终是最大元素，依次与末尾交换并重新调整堆。
+ * 
+ * @param base - 数组基址
+ * @param nmemb - 元素个数
+ * @param size - 元素大小（字节）
+ * @param cmp - 比较函数（带用户数据）
+ * @param opaque - 用户数据（传递给比较函数）
+ * 
+ * 算法步骤：
+ * 1. 构建最大堆：从最后一个非叶子节点开始，向下调整
+ * 2. 排序：将堆顶（最大值）与末尾交换，缩小堆范围，重新调整
+ * 3. 重复步骤 2 直到堆大小为 1
+ * 
+ * 时间复杂度：
+ * - 最好/最坏/平均：均为 O(n log n)
+ * - 空间复杂度：O(1)，原地排序
  */
 static void heapsortx(void *base, size_t nmemb, size_t size, cmp_f cmp, void *opaque)
 {
@@ -613,8 +754,22 @@ static void heapsortx(void *base, size_t nmemb, size_t size, cmp_f cmp, void *op
     }
 }
 
-/* 三数取中：返回 a、b、c 三个元素的中位数
- * 用于快速排序选择枢轴（pivot），提高分区平衡性
+/**
+ * med3 - 三数取中（选择枢轴）
+ * 
+ * 从三个元素中选择中位数，用于快速排序的枢轴选择策略。
+ * 相比随机选择，三数取中可以显著提高分区平衡性，避免最坏情况。
+ * 
+ * @param a - 第一个元素
+ * @param b - 第二个元素
+ * @param c - 第三个元素
+ * @param cmp - 比较函数
+ * @param opaque - 用户数据
+ * @return 指向中位数元素的指针
+ * 
+ * 逻辑说明：
+ * - 如果 a < b：中位数在 b 和 c 之间（取较小者），或 a 和 c 之间（取较大者）
+ * - 如果 a >= b：中位数在 b 和 c 之间（取较大者），或 a 和 c 之间（取较小者）
  */
 static inline void *med3(void *a, void *b, void *c, cmp_f cmp, void *opaque)
 {
