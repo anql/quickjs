@@ -758,35 +758,189 @@ static inline JS_BOOL JS_IsObject(JSValueConst v)
 
 /* ============================================================================
  * 异常处理 API
+ * QuickJS 使用 JSValue 返回异常（JS_EXCEPTION），异常对象本身也是 JSValue
  * ============================================================================ */
-JSValue JS_Throw(JSContext *ctx, JSValue obj);  // 抛出异常
-void JS_SetUncatchableException(JSContext *ctx, JS_BOOL flag);  // 设置不可捕获的异常
-JSValue JS_GetException(JSContext *ctx);  // 获取当前异常
-JS_BOOL JS_HasException(JSContext *ctx);  // 检查是否有异常
-JS_BOOL JS_IsError(JSContext *ctx, JSValueConst val);  // 检查是否是 Error 对象
-JSValue JS_NewError(JSContext *ctx);  // 创建新的 Error 对象
-JSValue __js_printf_like(2, 3) JS_ThrowSyntaxError(JSContext *ctx, const char *fmt, ...);  // 抛出语法错误
-JSValue __js_printf_like(2, 3) JS_ThrowTypeError(JSContext *ctx, const char *fmt, ...);  // 抛出类型错误
-JSValue __js_printf_like(2, 3) JS_ThrowReferenceError(JSContext *ctx, const char *fmt, ...);  // 抛出引用错误
-JSValue __js_printf_like(2, 3) JS_ThrowRangeError(JSContext *ctx, const char *fmt, ...);  // 抛出范围错误
-JSValue __js_printf_like(2, 3) JS_ThrowInternalError(JSContext *ctx, const char *fmt, ...);  // 抛出内部错误
-JSValue JS_ThrowOutOfMemory(JSContext *ctx);  // 抛出内存不足错误
+
+/**
+ * JS_Throw - 抛出指定的异常对象
+ * @ctx: 上下文
+ * @obj: 异常对象（通常是 Error 对象）
+ * @return: 始终返回 JS_EXCEPTION
+ * 
+ * 将 obj 设置为当前上下文的异常，并返回 JS_EXCEPTION。
+ * 调用后，当前上下文进入异常状态，直到异常被捕获或清除。
+ */
+JSValue JS_Throw(JSContext *ctx, JSValue obj);
+
+/**
+ * JS_SetUncatchableException - 设置不可捕获的异常标志
+ * @ctx: 上下文
+ * @flag: TRUE 表示异常不可捕获，FALSE 表示可捕获
+ * 
+ * 用于标记某些异常（如内部错误）不应被 try-catch 捕获。
+ * 通常在抛出严重错误时使用。
+ */
+void JS_SetUncatchableException(JSContext *ctx, JS_BOOL flag);
+
+/**
+ * JS_GetException - 获取并清除当前异常
+ * @ctx: 上下文
+ * @return: 异常对象（JSValue），调用者负责释放
+ * 
+ * 获取当前上下文的异常对象，并清除异常状态。
+ * 如果没有异常，返回 JS_UNDEFINED。
+ */
+JSValue JS_GetException(JSContext *ctx);
+
+/**
+ * JS_HasException - 检查上下文是否有未处理的异常
+ * @ctx: 上下文
+ * @return: TRUE 表示有异常，FALSE 表示无异常
+ */
+JS_BOOL JS_HasException(JSContext *ctx);
+
+/**
+ * JS_IsError - 检查值是否是 Error 对象
+ * @ctx: 上下文
+ * @val: 要检查的值
+ * @return: TRUE 表示是 Error 对象，FALSE 表示不是
+ * 
+ * 不仅检查 tag，还检查是否是 Error 类的实例。
+ */
+JS_BOOL JS_IsError(JSContext *ctx, JSValueConst val);
+
+/**
+ * JS_NewError - 创建新的 Error 对象
+ * @ctx: 上下文
+ * @return: 新创建的 Error 对象
+ * 
+ * 创建一个基础的 Error 对象，不包含具体错误信息。
+ * 通常配合 JS_Throw 使用。
+ */
+JSValue JS_NewError(JSContext *ctx);
+
+/**
+ * JS_ThrowSyntaxError - 抛出语法错误
+ * @ctx: 上下文
+ * @fmt: printf 风格的格式化字符串
+ * @return: 始终返回 JS_EXCEPTION
+ * 
+ * 创建 SyntaxError 对象并抛出，支持格式化错误信息。
+ */
+JSValue __js_printf_like(2, 3) JS_ThrowSyntaxError(JSContext *ctx, const char *fmt, ...);
+
+/**
+ * JS_ThrowTypeError - 抛出类型错误
+ * @ctx: 上下文
+ * @fmt: printf 风格的格式化字符串
+ * @return: 始终返回 JS_EXCEPTION
+ * 
+ * 创建 TypeError 对象并抛出，支持格式化错误信息。
+ */
+JSValue __js_printf_like(2, 3) JS_ThrowTypeError(JSContext *ctx, const char *fmt, ...);
+
+/**
+ * JS_ThrowReferenceError - 抛出引用错误
+ * @ctx: 上下文
+ * @fmt: printf 风格的格式化字符串
+ * @return: 始终返回 JS_EXCEPTION
+ * 
+ * 创建 ReferenceError 对象并抛出，支持格式化错误信息。
+ */
+JSValue __js_printf_like(2, 3) JS_ThrowReferenceError(JSContext *ctx, const char *fmt, ...);
+
+/**
+ * JS_ThrowRangeError - 抛出范围错误
+ * @ctx: 上下文
+ * @fmt: printf 风格的格式化字符串
+ * @return: 始终返回 JS_EXCEPTION
+ * 
+ * 创建 RangeError 对象并抛出，支持格式化错误信息。
+ */
+JSValue __js_printf_like(2, 3) JS_ThrowRangeError(JSContext *ctx, const char *fmt, ...);
+
+/**
+ * JS_ThrowInternalError - 抛出内部错误
+ * @ctx: 上下文
+ * @fmt: printf 风格的格式化字符串
+ * @return: 始终返回 JS_EXCEPTION
+ * 
+ * 创建 InternalError 对象并抛出，支持格式化错误信息。
+ * 通常用于引擎内部错误。
+ */
+JSValue __js_printf_like(2, 3) JS_ThrowInternalError(JSContext *ctx, const char *fmt, ...);
+
+/**
+ * JS_ThrowOutOfMemory - 抛出内存不足错误
+ * @ctx: 上下文
+ * @return: 始终返回 JS_EXCEPTION
+ * 
+ * 创建并抛出 OutOfMemory 错误。
+ * 当内存分配失败时调用此函数。
+ */
+JSValue JS_ThrowOutOfMemory(JSContext *ctx);
 
 /* ============================================================================
  * 引用计数管理 API
  * QuickJS 使用手动引用计数来管理内存
+ * JSValue 分为两类：带引用计数的（对象、字符串等）和不带的（小整数、布尔值等）
+ * 只有带引用计数的值才需要调用 Free/Dup
  * ============================================================================ */
-void __JS_FreeValue(JSContext *ctx, JSValue v);  // 实际释放值的函数
+
+/**
+ * __JS_FreeValue - 内部函数：实际释放 JSValue
+ * @ctx: 上下文
+ * @v: 要释放的值
+ * 
+ * 这是 JS_FreeValue 的内部实现，通常不直接调用。
+ * 释放值关联的内存（对象、字符串、数组等）。
+ */
+void __JS_FreeValue(JSContext *ctx, JSValue v);
+
+/**
+ * JS_FreeValue - 释放 JSValue 的引用
+ * @ctx: 上下文
+ * @v: 要释放的值
+ * 
+ * 减少值的引用计数，如果计数归零则释放相关内存。
+ * 对于不带引用计数的值（小整数、布尔值、null、undefined），此函数无操作。
+ * 
+ * 使用场景：
+ * - 当你不再需要某个 JSValue 时调用
+ * - 通常在函数返回前释放局部 JSValue 变量
+ * 
+ * 示例：
+ *   JSValue str = JS_NewString(ctx, "hello");
+ *   // ... 使用 str
+ *   JS_FreeValue(ctx, str);  // 释放
+ */
 static inline void JS_FreeValue(JSContext *ctx, JSValue v)
 {
-    if (JS_VALUE_HAS_REF_COUNT(v)) {  // 只有带引用计数的值才需要释放
+    if (JS_VALUE_HAS_REF_COUNT(v)) {
         JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
-        if (--p->ref_count <= 0) {  // 引用计数减一，如果为零则释放
+        if (--p->ref_count <= 0) {
             __JS_FreeValue(ctx, v);
         }
     }
 }
-void __JS_FreeValueRT(JSRuntime *rt, JSValue v);  // 运行时级别释放
+
+/**
+ * __JS_FreeValueRT - 运行时级别释放 JSValue
+ * @rt: 运行时
+ * @v: 要释放的值
+ * 
+ * 在没有上下文的情况下释放值（用于运行时级别的清理）。
+ */
+void __JS_FreeValueRT(JSRuntime *rt, JSValue v);
+
+/**
+ * JS_FreeValueRT - 运行时级别释放 JSValue 的引用
+ * @rt: 运行时
+ * @v: 要释放的值
+ * 
+ * 与 JS_FreeValue 类似，但在运行时级别操作。
+ * 用于没有上下文可用的场景（如 GC 标记阶段）。
+ */
 static inline void JS_FreeValueRT(JSRuntime *rt, JSValue v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
@@ -797,15 +951,44 @@ static inline void JS_FreeValueRT(JSRuntime *rt, JSValue v)
     }
 }
 
+/**
+ * JS_DupValue - 增加 JSValue 的引用计数
+ * @ctx: 上下文
+ * @v: 要复制引用的值
+ * @return: 原值（便于链式调用）
+ * 
+ * 增加值的引用计数，用于创建新的引用。
+ * 对于不带引用计数的值，直接返回原值。
+ * 
+ * 使用场景：
+ * - 将 JSValue 存储到结构体或全局变量时
+ * - 作为函数返回值传递给调用者
+ * - 需要保留值的多个引用时
+ * 
+ * 示例：
+ *   JSValue global_str;
+ *   JSValue local = JS_NewString(ctx, "hello");
+ *   global_str = JS_DupValue(ctx, local);  // 增加引用，存储到全局
+ *   JS_FreeValue(ctx, local);  // 释放局部引用
+ *   // global_str 仍然有效
+ */
 static inline JSValue JS_DupValue(JSContext *ctx, JSValueConst v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
-        p->ref_count++;  // 引用计数加一
+        p->ref_count++;
     }
     return (JSValue)v;
 }
 
+/**
+ * JS_DupValueRT - 运行时级别增加 JSValue 的引用计数
+ * @rt: 运行时
+ * @v: 要复制引用的值
+ * @return: 原值
+ * 
+ * 与 JS_DupValue 类似，但在运行时级别操作。
+ */
 static inline JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
@@ -817,67 +1000,389 @@ static inline JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
 
 /* ============================================================================
  * 相等性比较 API
+ * 实现 JavaScript 的三种相等性比较算法
  * ============================================================================ */
-JS_BOOL JS_StrictEq(JSContext *ctx, JSValueConst op1, JSValueConst op2);  // 严格相等 (===)
-JS_BOOL JS_SameValue(JSContext *ctx, JSValueConst op1, JSValueConst op2);  // SameValue 算法（用于 Object.is）
-JS_BOOL JS_SameValueZero(JSContext *ctx, JSValueConst op1, JSValueConst op2);  // SameValueZero（用于 Map/Set 键比较）
+
+/**
+ * JS_StrictEq - 严格相等比较 (===)
+ * @ctx: 上下文
+ * @op1: 第一个操作数
+ * @op2: 第二个操作数
+ * @return: TRUE 表示相等，FALSE 表示不等
+ * 
+ * 实现 JavaScript 的严格相等算法（=== 运算符）。
+ * 与 === 相同：类型不同则不相等，NaN !== NaN。
+ */
+JS_BOOL JS_StrictEq(JSContext *ctx, JSValueConst op1, JSValueConst op2);
+
+/**
+ * JS_SameValue - SameValue 比较算法
+ * @ctx: 上下文
+ * @op1: 第一个操作数
+ * @op2: 第二个操作数
+ * @return: TRUE 表示相等，FALSE 表示不等
+ * 
+ * 实现 ECMAScript 的 SameValue 算法（用于 Object.is）。
+ * 与 === 的区别：
+ * - NaN === NaN（而 === 返回 false）
+ * - +0 !== -0（而 === 返回 true）
+ */
+JS_BOOL JS_SameValue(JSContext *ctx, JSValueConst op1, JSValueConst op2);
+
+/**
+ * JS_SameValueZero - SameValueZero 比较算法
+ * @ctx: 上下文
+ * @op1: 第一个操作数
+ * @op2: 第二个操作数
+ * @return: TRUE 表示相等，FALSE 表示不等
+ * 
+ * 实现 SameValueZero 算法（用于 Map/Set 的键比较、Array.prototype.includes）。
+ * 与 SameValue 的区别：+0 === -0。
+ */
+JS_BOOL JS_SameValueZero(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 
 /* ============================================================================
  * 类型转换 API
  * 将 JSValue 转换为 C 类型
+ * 所有转换函数返回 0 表示成功，-1 表示异常（转换失败）
  * ============================================================================ */
-int JS_ToBool(JSContext *ctx, JSValueConst val); /* 返回 -1 表示 JS_EXCEPTION */
+
+/**
+ * JS_ToBool - 转换为布尔值
+ * @ctx: 上下文
+ * @val: 要转换的值
+ * @return: 0 表示 false，1 表示 true，-1 表示异常
+ * 
+ * 按照 JavaScript 的 ToBoolean 抽象操作转换：
+ * - false, 0, -0, 0n, "", null, undefined, NaN → false
+ * - 其他所有值 → true
+ */
+int JS_ToBool(JSContext *ctx, JSValueConst val);
+
+/**
+ * JS_ToInt32 - 转换为 32 位有符号整数
+ * @ctx: 上下文
+ * @pres: 输出参数，存储结果
+ * @val: 要转换的值
+ * @return: 0 表示成功，-1 表示异常
+ * 
+ * 按照 JavaScript 的 ToInt32 抽象操作转换。
+ * 超出范围的数字会被截断（模 2^32）。
+ */
 int JS_ToInt32(JSContext *ctx, int32_t *pres, JSValueConst val);
+
+/**
+ * JS_ToUint32 - 转换为 32 位无符号整数
+ * @ctx: 上下文
+ * @pres: 输出参数，存储结果
+ * @val: 要转换的值
+ * @return: 0 表示成功，-1 表示异常
+ * 
+ * 按照 JavaScript 的 ToUint32 抽象操作转换。
+ * 内部调用 JS_ToInt32，因为位表示相同。
+ */
 static inline int JS_ToUint32(JSContext *ctx, uint32_t *pres, JSValueConst val)
 {
     return JS_ToInt32(ctx, (int32_t*)pres, val);
 }
+
+/**
+ * JS_ToInt64 - 转换为 64 位有符号整数
+ * @ctx: 上下文
+ * @pres: 输出参数，存储结果
+ * @val: 要转换的值
+ * @return: 0 表示成功，-1 表示异常
+ * 
+ * 将值转换为 64 位整数。
+ * BigInt 会被转换（如果适合），数字会被截断。
+ */
 int JS_ToInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
-int JS_ToIndex(JSContext *ctx, uint64_t *plen, JSValueConst val);  // 转换为数组索引
+
+/**
+ * JS_ToIndex - 转换为数组索引
+ * @ctx: 上下文
+ * @plen: 输出参数，存储结果
+ * @val: 要转换的值
+ * @return: 0 表示成功，-1 表示异常
+ * 
+ * 将值转换为非负整数，用于数组索引。
+ * 如果值为负数或超出范围，会抛出 RangeError。
+ */
+int JS_ToIndex(JSContext *ctx, uint64_t *plen, JSValueConst val);
+
+/**
+ * JS_ToFloat64 - 转换为双精度浮点数
+ * @ctx: 上下文
+ * @pres: 输出参数，存储结果
+ * @val: 要转换的值
+ * @return: 0 表示成功，-1 表示异常
+ * 
+ * 按照 JavaScript 的 ToNumber 抽象操作转换。
+ * BigInt 会被转换（可能丢失精度）。
+ */
 int JS_ToFloat64(JSContext *ctx, double *pres, JSValueConst val);
-/* 如果 'val' 是数字则抛出异常 */
+
+/**
+ * JS_ToBigInt64 - 转换为 64 位 BigInt
+ * @ctx: 上下文
+ * @pres: 输出参数，存储结果
+ * @val: 要转换的值
+ * @return: 0 表示成功，-1 表示异常
+ * 
+ * 将值转换为 64 位 BigInt。
+ * 如果 val 已经是 BigInt 且超出范围，会抛出异常。
+ */
 int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
-/* 与 JS_ToInt64() 相同但允许 BigInt */
+
+/**
+ * JS_ToInt64Ext - 扩展的 64 位整数转换
+ * @ctx: 上下文
+ * @pres: 输出参数，存储结果
+ * @val: 要转换的值
+ * @return: 0 表示成功，-1 表示异常
+ * 
+ * 与 JS_ToInt64 类似，但允许 BigInt 作为输入。
+ * 如果 val 是 BigInt，会尝试转换（不抛出类型错误）。
+ */
 int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val);
 
 /* ============================================================================
  * 字符串 API
+ * QuickJS 内部使用 CESU-8 编码（类似 UTF-8，但对代理对的处理不同）
  * ============================================================================ */
-JSValue JS_NewStringLen(JSContext *ctx, const char *str1, size_t len1);  // 创建字符串（指定长度）
+
+/**
+ * JS_NewStringLen - 创建指定长度的字符串
+ * @ctx: 上下文
+ * @str1: 字符串内容（不需要 null 终止）
+ * @len1: 字符串长度（字节数）
+ * @return: 新创建的字符串 JSValue，失败返回 JS_EXCEPTION
+ * 
+ * 从字节序列创建 JavaScript 字符串。
+ * 字符串内容会被复制，调用者可以安全释放原始缓冲区。
+ */
+JSValue JS_NewStringLen(JSContext *ctx, const char *str1, size_t len1);
+
+/**
+ * JS_NewString - 创建 null 终止的字符串
+ * @ctx: 上下文
+ * @str: null 终止的 C 字符串
+ * @return: 新创建的字符串 JSValue
+ * 
+ * 便捷函数，自动计算字符串长度。
+ */
 static inline JSValue JS_NewString(JSContext *ctx, const char *str)
 {
     return JS_NewStringLen(ctx, str, strlen(str));
 }
-JSValue JS_NewAtomString(JSContext *ctx, const char *str);  // 创建原子字符串
-JSValue JS_ToString(JSContext *ctx, JSValueConst val);  // 转换为字符串
-JSValue JS_ToPropertyKey(JSContext *ctx, JSValueConst val);  // 转换为属性键（字符串或 Symbol）
-const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1, JS_BOOL cesu8);  // 转换为 C 字符串
+
+/**
+ * JS_NewAtomString - 创建原子字符串
+ * @ctx: 上下文
+ * @str: null 终止的 C 字符串
+ * @return: 字符串 JSValue（原子化），失败返回 JS_EXCEPTION
+ * 
+ * 创建字符串并确保其内部表示为原子（interned）。
+ * 相同内容的字符串会共享同一个内部表示，节省内存。
+ * 适用于频繁使用的标识符和属性名。
+ */
+JSValue JS_NewAtomString(JSContext *ctx, const char *str);
+
+/**
+ * JS_ToString - 转换为字符串
+ * @ctx: 上下文
+ * @val: 要转换的值
+ * @return: 字符串 JSValue，失败返回 JS_EXCEPTION
+ * 
+ * 按照 JavaScript 的 ToString 抽象操作转换。
+ * 如果 val 已经是字符串，会增加引用计数后返回。
+ */
+JSValue JS_ToString(JSContext *ctx, JSValueConst val);
+
+/**
+ * JS_ToPropertyKey - 转换为属性键
+ * @ctx: 上下文
+ * @val: 要转换的值
+ * @return: 属性键 JSValue（字符串或 Symbol），失败返回 JS_EXCEPTION
+ * 
+ * 按照 JavaScript 的 ToPropertyKey 抽象操作转换。
+ * 用于对象属性访问，结果可以是字符串或 Symbol。
+ */
+JSValue JS_ToPropertyKey(JSContext *ctx, JSValueConst val);
+
+/**
+ * JS_ToCStringLen2 - 转换为 C 字符串（带长度和编码选项）
+ * @ctx: 上下文
+ * @plen: 输出参数，存储字符串长度（可为 NULL）
+ * @val1: 要转换的字符串值
+ * @cesu8: TRUE 表示返回 CESU-8 编码，FALSE 表示返回 UTF-8
+ * @return: C 字符串指针（由 QuickJS 管理），失败返回 NULL
+ * 
+ * 将 JavaScript 字符串转换为 C 字符串。
+ * 返回的指针在 JS_FreeCString 调用前或上下文销毁前有效。
+ * 
+ * 注意：
+ * - 返回的字符串以 null 终止
+ * - 需要调用 JS_FreeCString 释放
+ */
+const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1, JS_BOOL cesu8);
+
+/**
+ * JS_ToCStringLen - 转换为 C 字符串（带长度，UTF-8 编码）
+ * @ctx: 上下文
+ * @plen: 输出参数，存储字符串长度
+ * @val1: 要转换的字符串值
+ * @return: C 字符串指针
+ * 
+ * JS_ToCStringLen2 的便捷版本，使用 UTF-8 编码。
+ */
 static inline const char *JS_ToCStringLen(JSContext *ctx, size_t *plen, JSValueConst val1)
 {
     return JS_ToCStringLen2(ctx, plen, val1, 0);
 }
+
+/**
+ * JS_ToCString - 转换为 null 终止的 C 字符串（UTF-8）
+ * @ctx: 上下文
+ * @val1: 要转换的字符串值
+ * @return: C 字符串指针
+ * 
+ * 最常用的字符串转换函数，返回 null 终止的 UTF-8 字符串。
+ * 
+ * 示例：
+ *   const char *str = JS_ToCString(ctx, jsValue);
+ *   if (str) {
+ *       printf("%s\n", str);
+ *       JS_FreeCString(ctx, str);
+ *   }
+ */
 static inline const char *JS_ToCString(JSContext *ctx, JSValueConst val1)
 {
     return JS_ToCStringLen2(ctx, NULL, val1, 0);
 }
-void JS_FreeCString(JSContext *ctx, const char *ptr);  // 释放 C 字符串
+
+/**
+ * JS_FreeCString - 释放 C 字符串
+ * @ctx: 上下文
+ * @ptr: JS_ToCString* 系列函数返回的字符串
+ * 
+ * 释放由 JS_ToCStringLen2 等函数分配的字符串。
+ * 必须在字符串不再需要时调用，避免内存泄漏。
+ */
+void JS_FreeCString(JSContext *ctx, const char *ptr);
 
 /* ============================================================================
  * 对象创建 API
+ * 用于创建各种 JavaScript 对象
  * ============================================================================ */
-JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto, JSClassID class_id);  // 创建带原型和类的对象
-JSValue JS_NewObjectClass(JSContext *ctx, int class_id);  // 创建类对象
-JSValue JS_NewObjectProto(JSContext *ctx, JSValueConst proto);  // 创建带指定原型的对象
-JSValue JS_NewObject(JSContext *ctx);  // 创建普通对象 {}
 
-JS_BOOL JS_IsFunction(JSContext* ctx, JSValueConst val);  // 检查是否是函数
-JS_BOOL JS_IsConstructor(JSContext* ctx, JSValueConst val);  // 检查是否是构造函数
-JS_BOOL JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, JS_BOOL val);  // 设置构造函数标志
+/**
+ * JS_NewObjectProtoClass - 创建带指定原型和类的对象
+ * @ctx: 上下文
+ * @proto: 原型对象（JSValue）
+ * @class_id: 类 ID（用于内部类型标识）
+ * @return: 新创建的对象，失败返回 JS_EXCEPTION
+ * 
+ * 创建一个对象，其原型为 proto，内部类为 class_id。
+ * 用于实现自定义对象类型。
+ */
+JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto, JSClassID class_id);
 
-JSValue JS_NewArray(JSContext *ctx);  // 创建数组 []
-int JS_IsArray(JSContext *ctx, JSValueConst val);  // 检查是否是数组
+/**
+ * JS_NewObjectClass - 创建类对象
+ * @ctx: 上下文
+ * @class_id: 类 ID
+ * @return: 新创建的对象，失败返回 JS_EXCEPTION
+ * 
+ * 创建一个对象，其原型由 class_id 决定。
+ * 通常用于创建内置类型的实例。
+ */
+JSValue JS_NewObjectClass(JSContext *ctx, int class_id);
 
-JSValue JS_NewDate(JSContext *ctx, double epoch_ms);  // 创建 Date 对象
+/**
+ * JS_NewObjectProto - 创建带指定原型的对象
+ * @ctx: 上下文
+ * @proto: 原型对象
+ * @return: 新创建的对象，失败返回 JS_EXCEPTION
+ * 
+ * 创建一个对象，其 [[Prototype]] 指向 proto。
+ * 相当于 JavaScript 的 Object.create(proto)。
+ */
+JSValue JS_NewObjectProto(JSContext *ctx, JSValueConst proto);
+
+/**
+ * JS_NewObject - 创建普通对象
+ * @ctx: 上下文
+ * @return: 新创建的空对象 {}，失败返回 JS_EXCEPTION
+ * 
+ * 创建一个普通的 JavaScript 对象，原型为 Object.prototype。
+ * 相当于 JavaScript 的 {} 或 new Object()。
+ */
+JSValue JS_NewObject(JSContext *ctx);
+
+/**
+ * JS_IsFunction - 检查值是否是函数
+ * @ctx: 上下文
+ * @val: 要检查的值
+ * @return: TRUE 表示是函数，FALSE 表示不是
+ * 
+ * 检查 val 是否是可调用函数（包括箭头函数、普通函数、内置函数等）。
+ */
+JS_BOOL JS_IsFunction(JSContext* ctx, JSValueConst val);
+
+/**
+ * JS_IsConstructor - 检查值是否是构造函数
+ * @ctx: 上下文
+ * @val: 要检查的值
+ * @return: TRUE 表示是构造函数，FALSE 表示不是
+ * 
+ * 检查 val 是否可以用 new 调用。
+ * 箭头函数返回 FALSE，因为箭头函数不能作为构造函数。
+ */
+JS_BOOL JS_IsConstructor(JSContext* ctx, JSValueConst val);
+
+/**
+ * JS_SetConstructorBit - 设置函数的构造函数标志
+ * @ctx: 上下文
+ * @func_obj: 函数对象
+ * @val: TRUE 表示是构造函数，FALSE 表示不是
+ * @return: 0 表示成功，-1 表示异常
+ * 
+ * 设置函数的 [[ConstructorKind]] 内部槽。
+ * 用于实现类的构造函数。
+ */
+JS_BOOL JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, JS_BOOL val);
+
+/**
+ * JS_NewArray - 创建数组
+ * @ctx: 上下文
+ * @return: 新创建的空数组 []，失败返回 JS_EXCEPTION
+ * 
+ * 创建一个 JavaScript 数组。
+ * 相当于 JavaScript 的 [] 或 new Array()。
+ */
+JSValue JS_NewArray(JSContext *ctx);
+
+/**
+ * JS_IsArray - 检查值是否是数组
+ * @ctx: 上下文
+ * @val: 要检查的值
+ * @return: 1 表示是数组，0 表示不是，-1 表示异常
+ * 
+ * 相当于 JavaScript 的 Array.isArray()。
+ */
+int JS_IsArray(JSContext *ctx, JSValueConst val);
+
+/**
+ * JS_NewDate - 创建 Date 对象
+ * @ctx: 上下文
+ * @epoch_ms: 时间戳（毫秒，从 1970-01-01 UTC 开始）
+ * @return: 新创建的 Date 对象，失败返回 JS_EXCEPTION
+ * 
+ * 创建一个表示指定时间的 Date 对象。
+ * 相当于 JavaScript 的 new Date(epoch_ms)。
+ */
+JSValue JS_NewDate(JSContext *ctx, double epoch_ms);
 
 /* ============================================================================
  * 属性访问 API
