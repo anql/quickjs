@@ -2408,6 +2408,29 @@ static BOOL update_modifier(BOOL val, int add_mask, int remove_mask,
     return val;
 }
 
+/**
+ * re_parse_term - 解析正则表达式中的单个"项"（term）
+ * 
+ * 这是正则解析器的核心函数之一，负责解析正则表达式中的最基本单元。
+ * 一个"项"可以是：
+ * - 普通字符（如 'a', '中'）
+ * - 转义序列（如 \d, \w, \s, \n）
+ * - 字符类（如 [abc], [0-9]）
+ * - 通配符（.）
+ * - 锚点（^, $）
+ * - 分组（(...)）
+ * - 反向引用（\1, \k<name>）
+ * - 零宽断言（(?=...), (?!...), (?<=...), (?<!...)）
+ * 
+ * 解析完成后会发射相应的字节码到 s->byte_code 缓冲区。
+ * 
+ * @param s: 解析状态结构体（包含解析位置、字节码缓冲区、标志位等）
+ * @param is_backward_dir: 是否为后向解析模式（用于后向查找断言）
+ * @return: 成功返回 0，失败返回 -1 并设置错误信息
+ * 
+ * @note: 本函数会递归调用 re_parse_disjunction 来处理分组内的子表达式
+ * @note: 量词（* + ? {n,m}）的处理也在本函数中，但量词本身不是独立的项
+ */
 static int re_parse_term(REParseState *s, BOOL is_backward_dir)
 {
     const uint8_t *p;
@@ -2935,6 +2958,25 @@ static int re_parse_term(REParseState *s, BOOL is_backward_dir)
     return re_parse_out_of_memory(s);
 }
 
+/**
+ * re_parse_alternative - 解析正则表达式中的"替代"（alternative）
+ * 
+ * 解析由多个"项"（term）顺序连接而成的序列，直到遇到 '|' 或 ')' 为止。
+ * 例如：在正则 "abc|def" 中，"abc" 和 "def" 各是一个 alternative。
+ * 
+ * 核心逻辑：
+ * 1. 循环调用 re_parse_term 解析连续的项
+ * 2. 遇到 '|' 或 ')' 或字符串结束时停止
+ * 3. 如果是后向解析模式（is_backward_dir=TRUE），需要将解析出的字节码反转
+ *    （因为后向匹配时需要从右向左执行）
+ * 
+ * @param s: 解析状态结构体
+ * @param is_backward_dir: 是否为后向解析模式（用于后向查找断言 (?<=...) 和 (?<!...)）
+ * @return: 成功返回 0，失败返回 -1 并设置错误信息
+ * 
+ * @note: 本函数是 re_parse_disjunction 的基础构建块
+ * @note: 后向模式下的字节码反转通过 memmove 实现，虽然效率不高但不影响正确性
+ */
 static int re_parse_alternative(REParseState *s, BOOL is_backward_dir)
 {
     const uint8_t *p;
@@ -2969,6 +3011,29 @@ static int re_parse_alternative(REParseState *s, BOOL is_backward_dir)
     return 0;
 }
 
+/**
+ * re_parse_disjunction - 解析正则表达式中的"析取"（disjunction，即 | 分支结构）
+ * 
+ * 这是解析器的顶层入口函数之一，负责处理由 '|' 连接的多个分支。
+ * 例如：在正则 "cat|dog|bird" 中，有三个分支（alternative）。
+ * 
+ * 字节码生成策略：
+ * 1. 首先解析第一个分支
+ * 2. 如果后面还有 '|'，则在第一个分支前插入 REOP_split_next_first 指令
+ *    - 该指令会在运行时尝试两个分支：先试第一个，失败后回溯试第二个
+ * 3. 发射一个 REOP_goto 跳过后续分支（当当前分支匹配成功时）
+ * 4. 递归解析下一个分支
+ * 5. 循环直到没有 '|' 为止
+ * 6. 最后修补所有 goto 指令的跳转偏移
+ * 
+ * @param s: 解析状态结构体
+ * @param is_backward_dir: 是否为后向解析模式
+ * @return: 成功返回 0，失败返回 -1 并设置错误信息
+ * 
+ * @note: 本函数会递归调用自身，因此有栈溢出风险（通过 lre_check_stack_overflow 检查）
+ * @note: 每进入一个新的分支作用域，会增加 group_name_scope 以支持命名分组的重复检测
+ * @note: 生成的字节码使用回溯（backtracking）策略实现分支选择
+ */
 static int re_parse_disjunction(REParseState *s, BOOL is_backward_dir)
 {
     int start, len, pos;
@@ -3005,8 +3070,26 @@ static int re_parse_disjunction(REParseState *s, BOOL is_backward_dir)
     return 0;
 }
 
-/* Allocate the registers as a stack. The control flow is recursive so
-   the analysis can be linear. */
+/**
+ * compute_register_count - 计算正则字节码所需的寄存器数量
+ * 
+ * 通过分析字节码指令流，确定执行引擎需要分配多少个寄存器（栈空间）。
+ * 寄存器被当作栈来使用：遇到 SET 类指令时压栈，遇到 LOOP/CHECK 类指令时弹栈。
+ * 
+ * 分析过程：
+ * 1. 跳过字节码头部（RE_HEADER_LEN 字节）
+ * 2. 线性扫描所有指令
+ * 3. 对于 SET 类指令（REOP_set_i32, REOP_set_char_pos）：栈大小 +1
+ * 4. 对于 LOOP/CHECK 类指令：栈大小 -1 或 -2
+ * 5. 记录栈大小的最大值作为所需寄存器数量
+ * 
+ * @param bc_buf: 字节码缓冲区
+ * @param bc_buf_len: 字节码长度
+ * @return: 所需寄存器数量，失败返回 -1（超过 REGISTER_COUNT_MAX）
+ * 
+ * @note: 寄存器索引会直接写入字节码指令的操作数位置（bc_buf[pos + 1]）
+ * @note: 最大寄存器数量限制为 REGISTER_COUNT_MAX（通常是 255）
+ */
 static int compute_register_count(uint8_t *bc_buf, int bc_buf_len)
 {
     int stack_size, stack_size_max, pos, opcode, len;
@@ -3070,6 +3153,18 @@ static int compute_register_count(uint8_t *bc_buf, int bc_buf_len)
     return stack_size_max;
 }
 
+/**
+ * lre_bytecode_realloc - 字节码内存重新分配包装函数
+ * 
+ * 为正则字节码的内存分配提供安全限制，防止分配过大的缓冲区。
+ * 
+ * @param opaque: 不透明指针（传递给底层分配器）
+ * @param ptr: 原内存指针（可为 NULL 表示新分配）
+ * @param size: 请求的新大小
+ * @return: 成功返回新指针，失败返回 NULL
+ * 
+ * @note: 限制字节码大小不超过 2GB（INT32_MAX / 2），留出余量防止溢出
+ */
 static void *lre_bytecode_realloc(void *opaque, void *ptr, size_t size)
 {
     if (size > (INT32_MAX / 2)) {
@@ -3233,6 +3328,22 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
     return s->byte_code.buf;
 }
 
+/**
+ * is_line_terminator - 判断字符是否为行终止符
+ * 
+ * 用于多行模式（multiline）下的 ^ 和 $ 锚点匹配。
+ * JavaScript 规范定义的行终止符包括：
+ * - \n (U+000A): LF, Line Feed
+ * - \r (U+000D): CR, Carriage Return
+ * - \u2028 (CP_LS): LS, Line Separator
+ * - \u2029 (CP_PS): PS, Paragraph Separator
+ * 
+ * @param c: 待判断的 Unicode 码点
+ * @return: TRUE=是行终止符，FALSE=不是
+ * 
+ * @note: 这是 ECMAScript 规范定义的完整行终止符集合
+ * @note: 在单行模式下，^ 和 $ 只匹配字符串的开始和结束
+ */
 static BOOL is_line_terminator(uint32_t c)
 {
     return (c == '\n' || c == '\r' || c == CP_LS || c == CP_PS);
@@ -3391,7 +3502,41 @@ static no_inline int stack_realloc(REExecContext *s, size_t n)
 }
 
 /**
- * lre_exec_backtrack - 正则表达式回溯执行引擎
+ * lre_poll_timeout - 超时检查轮询函数
+ * 
+ * 在执行引擎的主循环中定期调用，用于检测是否超过执行时限。
+ * 防止恶意正则表达式（如指数级回溯）导致无限循环。
+ * 
+ * @param s: 执行上下文
+ * @return: 0=未超时，LRE_RET_TIMEOUT=已超时
+ * 
+ * @note: 使用中断计数器（interrupt_counter）减少实际检查次数，避免过度开销
+ * @note: 每次调用递减计数器，归零时重置并调用 lre_check_timeout
+ */
+static int lre_poll_timeout(REExecContext *s)
+{
+    if (unlikely(--s->interrupt_counter <= 0)) {
+        s->interrupt_counter = INTERRUPT_COUNTER_INIT;
+        if (lre_check_timeout(s->opaque))
+            return LRE_RET_TIMEOUT;
+    }
+    return 0;
+}
+
+/**
+ * stack_realloc - 执行栈动态扩容
+ * 
+ * 当回溯栈空间不足时，动态扩大栈容量。
+ * 使用倍增策略（新容量 = 原容量 × 1.5），避免频繁重分配。
+ * 
+ * @param s: 执行上下文
+ * @param n: 所需最小容量
+ * @return: 0=成功，-1=失败（内存不足）
+ * 
+ * @note: 初始使用静态缓冲区（static_stack_buf[32]），避免小正则的分配开销
+ * @note: 首次扩容时，将静态缓冲区内容复制到动态分配的内存
+ */
+static no_inline int stack_realloc(REExecContext *s, size_t n)
  * 
  * 这是正则引擎的核心解释器，使用回溯算法执行字节码。
  * 采用基于栈的虚拟机架构，支持：
