@@ -545,6 +545,24 @@ static int re_string_list_op(REStringList *a, REStringList *b, int op)
     return 0;
 }
 
+/**
+ * @brief 字符串列表规范化（大小写折叠）
+ * @param s1 解析状态（用于内存分配）
+ * @param s 要规范化的字符串列表
+ * @param is_unicode 是否启用 Unicode 模式
+ * @return 0=成功，-1=内存错误
+ * 
+ * 功能：对字符串列表中的所有字符执行大小写规范化（canonicalize）
+ *       用于实现忽略大小写的正则匹配（/i 标志）
+ * 
+ * 流程：
+ * 1. 先对字符范围部分执行规范化（cr_regexp_canonicalize）
+ * 2. 对哈希表中的每个字符串：
+ *    - 逐字符调用 lre_canonicalize 转换为规范形式
+ *    - 重新添加到新的字符串列表中
+ * 
+ * 注意：此函数会重新分配整个哈希表，因为字符串内容改变了
+ */
 static int re_string_list_canonicalize(REParseState *s1,
                                        REStringList *s, BOOL is_unicode)
 {
@@ -1214,7 +1232,19 @@ static BOOL is_unicode_char(int c)
             (c == '_'));
 }
 
-/* XXX: memory error test */
+/**
+ * @brief Unicode 序列属性回调函数
+ * @param opaque 用户数据（REStringList* 类型）
+ * @param seq Unicode 序列（码点数组）
+ * @param seq_len 序列长度
+ * 
+ * 用途：在解析 Unicode 属性（如 \\p{Script=Han}）时，
+ *       用于处理那些由多个码点组成的序列属性。
+ *       当 unicode_sequence_prop 函数找到一个有效序列时，
+ *       会调用此回调将序列添加到字符串列表中。
+ * 
+ * 注意：标记为 XXX: memory error test，表示此处应添加内存错误测试
+ */
 static void seq_prop_cb(void *opaque, const uint32_t *seq, int seq_len)
 {
     REStringList *sl = opaque;
@@ -1661,6 +1691,18 @@ static int re_emit_range(REParseState *s, const CharRange *cr)
     return 0;
 }
 
+/**
+ * @brief 字符串长度比较函数（用于排序）
+ * @param a 第一个字符串指针的指针
+ * @param b 第二个字符串指针的指针
+ * @param arg 未使用（兼容 rqsort 接口）
+ * @return -1=a<b, 0=a=b, 1=a>b（按长度比较）
+ * 
+ * 用途：作为 rqsort 的比较函数，对字符串列表按长度降序排序
+ *       确保在生成匹配代码时优先匹配长字符串（贪婪匹配策略）
+ * 
+ * 实现技巧：使用布尔运算结果相减，避免分支预测失败
+ */
 static int re_string_cmp_len(const void *a, const void *b, void *arg)
 {
     REString *p1 = *(REString **)a;
@@ -1668,6 +1710,17 @@ static int re_string_cmp_len(const void *a, const void *b, void *arg)
     return (p1->len < p2->len) - (p1->len > p2->len);
 }
 
+/**
+ * @brief 发射单个字符匹配指令
+ * @param s 解析状态
+ * @param c 要匹配的字符（Unicode 码点）
+ * 
+ * 根据字符范围和忽略大小写标志选择合适的操作码：
+ * - c <= 0xFFFF：使用 16 位操作码（REOP_char 或 REOP_char_i）
+ * - c > 0xFFFF：使用 32 位操作码（REOP_char32 或 REOP_char32_i）
+ * 
+ * 忽略大小写模式（_i 后缀）：在运行时自动进行大小写折叠匹配
+ */
 static void re_emit_char(REParseState *s, int c)
 {
     if (c <= 0xffff)
@@ -1764,6 +1817,25 @@ static int re_emit_string_list(REParseState *s, const REStringList *sl)
 
 static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_t **pp);
 
+/**
+ * @brief 解析字符集合操作数（用于 && 和 -- 运算）
+ * @param s 解析状态
+ * @param cr 输出的字符串列表
+ * @param pp 输入字符串指针的指针（解析后更新）
+ * @return 0=成功，-1=错误
+ * 
+ * 功能：解析字符集合运算（并集&&、差集--）中的单个操作数
+ *       操作数可以是：
+ *       1. 嵌套字符类：[...], 递归调用 re_parse_nested_class
+ *       2. 单个字符原子：调用 get_class_atom 解析
+ * 
+ * 对于单个字符：
+ * - 初始化字符串列表
+ * - 如果启用忽略大小写，先规范化字符
+ * - 将字符添加到字符范围
+ * 
+ * 此函数是 Unicode 集合模式（unicode_sets）下字符类运算的基础构建块
+ */
 static int re_parse_class_set_operand(REParseState *s, REStringList *cr, const uint8_t **pp)
 {
     int c1;
@@ -1790,6 +1862,37 @@ static int re_parse_class_set_operand(REParseState *s, REStringList *cr, const u
     return 0;
 }
 
+/**
+ * @brief 解析嵌套字符类（支持集合运算的高级字符类）
+ * @param s 解析状态
+ * @param cr 输出的字符串列表
+ * @param pp 输入字符串指针的指针（解析后更新）
+ * @return 0=成功，-1=错误
+ * 
+ * 功能：解析形如 [a-z&&[^aeiou]] 的嵌套字符类，支持：
+ *       - 基本字符类：[abc], [^0-9]
+ *       - 字符范围：a-z, 0-9
+ *       - 预定义类：\d, \s, \w 及其取反
+ *       - Unicode 属性：\p{Script=Han}
+ *       - 集合运算：&& (交集), -- (差集)
+ * 
+ * 解析流程：
+ * 1. 检查栈溢出（防止递归过深）
+ * 2. 处理取反标志 ^
+ * 3. 循环解析字符原子或嵌套类：
+ *    - 单字符：直接添加到字符范围
+ *    - 字符范围：解析 start-end 形式
+ *    - 嵌套类：递归调用自身
+ * 4. 在 Unicode 集合模式下，处理 && 和 -- 运算
+ * 5. 最后应用取反（如果有）
+ * 
+ * 特殊情况处理：
+ * - 忽略大小写模式：对字符进行规范化（canonicalize）
+ * - Annex B 兼容模式：允许某些非标准语法
+ * - 无效范围检测：start > end 时报错
+ * 
+ * 注意：此函数是字符类解析的核心，逻辑复杂，支持 ES2024 最新特性
+ */
 static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_t **pp)
 {
     const uint8_t *p;
