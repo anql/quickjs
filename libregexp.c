@@ -4249,9 +4249,44 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
     }
 }
 
-/* Return 1 if match, 0 if not match or < 0 if error (see LRE_RET_x). cindex is the
-   starting position of the match and must be such as 0 <= cindex <=
-   clen. */
+/**
+ * lre_exec - 执行正则表达式匹配（执行引擎入口函数）
+ * 
+ * 这是正则引擎的执行入口函数，使用已编译的字节码在输入字符串上进行匹配。
+ * 支持 UTF-8 和 UTF-16 编码的输入，支持 Unicode 代理对处理。
+ * 
+ * @param capture: 输出参数，捕获位置数组（调用者分配）
+ *   - 数组大小应为 lre_get_alloc_count(bc_buf)
+ *   - capture[0] = 整个匹配的起始位置
+ *   - capture[1] = 整个匹配的结束位置
+ *   - capture[2*i] = 第 i 个捕获组的起始位置
+ *   - capture[2*i+1] = 第 i 个捕获组的结束位置
+ *   - NULL 表示该捕获组未参与匹配（如在可选分支中）
+ * @param bc_buf: 编译后的字节码缓冲区（由 lre_compile 生成）
+ * @param cbuf: 输入字符串缓冲区
+ * @param cindex: 匹配起始位置（字节索引，非字符索引）
+ * @param clen: 输入字符串长度（字节长度，非字符长度）
+ * @param cbuf_type: 输入缓冲区类型
+ *   - 0 = 8 位字符（char 数组）
+ *   - 1 = 16 位字符（uint16_t 数组，非 UTF-16）
+ *   - 2 = UTF-16 编码（自动处理代理对）
+ * @param opaque: 用户自定义数据（传递给超时检查和内存分配器）
+ * @return: 1=匹配成功，0=未匹配，<0=错误（LRE_RET_TIMEOUT/LRE_RET_MEMORY_ERROR）
+ * 
+ * @note: 匹配成功后，capture 数组包含所有捕获组的起止位置
+ * @note: 调用者负责释放 capture 数组中的指针（如果需要）
+ * @note: 字节码头部包含 capture_count，决定 capture 数组的最小大小
+ * 
+ * 执行流程:
+ * 1. 从字节码头部解析标志位和捕获组数量
+ * 2. 初始化执行上下文（REExecContext）
+ * 3. 设置输入缓冲区类型（自动升级到 UTF-16 模式）
+ * 4. 初始化捕获数组为 NULL
+ * 5. 处理起始位置的代理对边界
+ * 6. 调用 lre_exec_backtrack 执行回溯匹配
+ * 7. 释放动态分配的栈空间（如果有）
+ * 8. 返回匹配结果
+ */
 int lre_exec(uint8_t **capture,
              const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
              int cbuf_type, void *opaque)
@@ -4292,24 +4327,88 @@ int lre_exec(uint8_t **capture,
     return ret;
 }
 
+/**
+ * lre_get_alloc_count - 计算捕获数组所需的分配大小
+ * 
+ * 根据字节码头部信息，计算执行匹配时需要的 capture 数组大小。
+ * 
+ * @param bc_buf: 编译后的字节码缓冲区
+ * @return: 需要分配的 capture 元素数量（每个元素是 uint8_t*）
+ * 
+ * @note: 计算公式：capture_count * 2 + register_count
+ *   - capture_count * 2: 每个捕获组需要起始和结束两个位置
+ *   - register_count: 执行引擎所需的寄存器数量（用于回溯栈）
+ * @note: 调用 lre_exec 前，必须分配至少此大小的 capture 数组
+ */
 int lre_get_alloc_count(const uint8_t *bc_buf)
 {
     return bc_buf[RE_HEADER_CAPTURE_COUNT] * 2 +
         bc_buf[RE_HEADER_REGISTER_COUNT];
 }
 
+/**
+ * lre_get_capture_count - 获取正则表达式的捕获组数量
+ * 
+ * 从字节码头部读取捕获组数量。
+ * 
+ * @param bc_buf: 编译后的字节码缓冲区
+ * @return: 捕获组数量（包括整个匹配作为第 0 组）
+ * 
+ * @note: 捕获组索引从 0 开始：
+ *   - 0: 整个匹配
+ *   - 1..n: 括号分组 (...) 按左括号出现顺序编号
+ *   - 命名分组也占用索引，与普通分组共享编号空间
+ */
 int lre_get_capture_count(const uint8_t *bc_buf)
 {
     return bc_buf[RE_HEADER_CAPTURE_COUNT];
 }
 
+/**
+ * lre_get_flags - 获取正则表达式的编译标志位
+ * 
+ * 从字节码头部读取标志位，反映原始正则表达式的修饰符。
+ * 
+ * @param bc_buf: 编译后的字节码缓冲区
+ * @return: 标志位组合（见 libregexp.h 中的 LRE_FLAG_* 宏定义）
+ * 
+ * 标志位说明:
+ *   - LRE_FLAG_GLOBAL (0x0001): 全局匹配
+ *   - LRE_FLAG_IGNORECASE (0x0002): 忽略大小写 (i)
+ *   - LRE_FLAG_MULTILINE (0x0004): 多行模式 (m)
+ *   - LRE_FLAG_DOTALL (0x0008): 点号匹配所有 (s)
+ *   - LRE_FLAG_UNICODE (0x0010): Unicode 模式 (u)
+ *   - LRE_FLAG_STICKY (0x0020): 粘性模式 (y)
+ *   - LRE_FLAG_UNICODE_SETS (0x0040): Unicode 集合模式 (v)
+ *   - LRE_FLAG_NAMED_GROUPS (0x0080): 包含命名分组
+ */
 int lre_get_flags(const uint8_t *bc_buf)
 {
     return get_u16(bc_buf + RE_HEADER_FLAGS);
 }
 
-/* Return NULL if no group names. Otherwise, return a pointer to
-   'capture_count - 1' zero terminated UTF-8 strings. */
+/**
+ * lre_get_groupnames - 获取命名分组名称表
+ * 
+ * 返回指向命名分组名称表的指针，用于将分组索引映射到名称。
+ * 
+ * @param bc_buf: 编译后的字节码缓冲区
+ * @return: 成功返回名称表指针，无命名分组返回 NULL
+ * 
+ * @note: 名称表格式：
+ *   - 由 capture_count - 1 个零终止的 UTF-8 字符串组成
+ *   - 索引 0（整个匹配）没有名称，因此从索引 1 开始
+ *   - 空字符串表示该索引的分组没有名称（普通数字分组）
+ *   - 字符串按分组索引顺序排列
+ * 
+ * 示例:
+ *   正则：/(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})/
+ *   名称表：["year\0", "month\0", "day\0"]
+ *   索引：   1        2         3
+ * 
+ * @note: 返回的指针指向字节码内部内存，调用者不应释放
+ * @note: 可通过检查 LRE_FLAG_NAMED_GROUPS 标志快速判断是否存在命名分组
+ */
 const char *lre_get_groupnames(const uint8_t *bc_buf)
 {
     uint32_t re_bytecode_len;
