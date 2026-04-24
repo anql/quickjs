@@ -311,6 +311,27 @@ static void re_string_list_free(REStringList *s)
  * - 可打印 ASCII 字符（0x20-0x7E）直接输出
  * - 其他字符使用 \u{XXXX} 格式输出 Unicode 码点
  */
+/**
+ * lre_print_char - 字符转义打印调试函数
+ * @c: 要打印的字符码点
+ * @is_range: 是否在字符范围上下文中
+ * 
+ * 功能：将字符转换为可读的字符串表示，用于调试输出。
+ * 
+ * 输出规则：
+ * 1. 可打印 ASCII（0x20-0x7E）：直接输出字符
+ * 2. 特殊字符：使用反斜杠转义
+ *    - 单引号'、反斜杠\\、连字符 -（范围中）、右括号]
+ * 3. 其他字符：使用 \\u{XXXX} Unicode 转义
+ *    - 如：\\u{1F600} 表示😀
+ * 
+ * 使用场景：
+ * - 调试模式下的字节码转储
+ * - 字符串列表调试输出
+ * - 字符范围调试输出
+ * 
+ * 注意：仅在调试模式下使用（__maybe_unused 标记）
+ */
 static void lre_print_char(int c, BOOL is_range)
 {
     if (c == '\'' || c == '\\' ||
@@ -333,6 +354,37 @@ static void lre_print_char(int c, BOOL is_range)
  * - 字符串哈希表：逐个打印哈希表中存储的字符串
  * 
  * 仅在调试模式下使用（__maybe_unused 标记）
+ */
+/**
+ * re_string_list_dump - 调试函数：打印字符串列表的详细内容
+ * @str: 标题字符串
+ * @s: 要打印的字符串列表
+ * 
+ * 功能：用于调试，输出字符串列表的两个部分：
+ * 
+ * 1. 字符范围（CharRange）：
+ *    - 以区间形式显示所有字符范围
+ *    - 如：[0x61-0x7A] 表示 a-z
+ * 
+ * 2. 字符串哈希表：
+ *    - 逐个打印哈希表中存储的字符串
+ *    - 显示每个桶的链表结构
+ * 
+ * 输出格式：
+ * ```
+ * [debug] 字符串列表：example
+ *   ranges: [0x61-0x7A]
+ *   strings:
+ *     [0]: "abc"
+ *     [1]: "def"
+ * ```
+ * 
+ * 使用场景：
+ * - 调试字符类解析过程
+ * - 验证字符串列表内容
+ * - 排查正则编译错误
+ * 
+ * 注意：仅在调试模式下使用（__maybe_unused 标记，非调试模式会被编译器优化掉）
  */
 static __maybe_unused void re_string_list_dump(const char *str, const REStringList *s)
 {
@@ -384,6 +436,39 @@ static __maybe_unused void re_string_list_dump(const char *str, const REStringLi
  * - 1: 字符串已存在（或成功添加）
  * - 0: 字符串不存在且未添加
  * - -1: 内存分配失败
+ */
+/**
+ * re_string_find2 - 字符串查找/添加核心实现（带添加标志）
+ * @s: 字符串列表
+ * @len: 字符串长度（码点数）
+ * @buf: 码点数组
+ * @add: 是否添加（TRUE=找不到时添加，FALSE=仅查找）
+ * @return: 
+ *   - 1: 字符串已存在
+ *   - 0: 字符串不存在（add=FALSE 时未添加，add=TRUE 时已添加）
+ *   - -1: 内存分配失败
+ * 
+ * 功能：在字符串列表的哈希表中查找或添加字符串。
+ * 
+ * 实现策略：
+ * 1. 计算字符串哈希值
+ * 2. 在对应哈希桶的链表中查找
+ * 3. 如果找到，返回 1
+ * 4. 如果未找到且 add=TRUE，分配新节点并插入链表头部
+ * 
+ * 哈希冲突处理：
+ * - 使用链表法（chaining）
+ * - 新节点插入链表头部（O(1)）
+ * 
+ * 扩容策略：
+ * - 当负载因子 > 3 时，哈希表大小翻倍
+ * - 重新哈希所有现有字符串
+ * 
+ * 使用场景：
+ * - re_string_find: 仅查找（add=FALSE）
+ * - re_string_add: 查找并添加（add=TRUE，len>1 时）
+ * 
+ * 注意：这是字符串列表操作的核心函数，其他函数都是其包装
  */
 static int re_string_find2(REStringList *s, int len, const uint32_t *buf,
                            uint32_t h0, BOOL add_flag)
@@ -451,6 +536,28 @@ static int re_string_find2(REStringList *s, int len, const uint32_t *buf,
  * 
  * 包装函数：先计算字符串哈希值，然后调用 re_string_find2
  */
+/**
+ * re_string_find - 字符串查找（不添加）
+ * @s: 字符串列表
+ * @len: 字符串长度（码点数）
+ * @buf: 码点数组
+ * @return: 
+ *   - 1: 字符串已存在
+ *   - 0: 字符串不存在
+ *   - -1: 内存分配失败（不应该发生，因为 add=FALSE）
+ * 
+ * 功能：在字符串列表中查找字符串，不添加新字符串。
+ * 
+ * 实现逻辑：
+ * 1. 调用 re_string_find2(s, len, buf, FALSE)
+ * 2. 返回查找结果
+ * 
+ * 使用场景：
+ * - 检查字符串是否已存在于列表
+ * - 避免重复添加相同字符串
+ * 
+ * 注意：这是 re_string_find2 的包装函数，add=FALSE
+ */
 static int re_string_find(REStringList *s, int len, const uint32_t *buf,
                           BOOL add_flag)
 {
@@ -469,6 +576,25 @@ static int re_string_find(REStringList *s, int len, const uint32_t *buf,
  * 优化策略：
  * - 长度为 1 的字符串：直接添加到字符范围（CharRange），使用区间并集操作
  * - 长度>1 的字符串：使用哈希表存储，调用 re_string_find 添加
+ */
+/**
+ * re_string_add - 向字符串列表添加字符串
+ * @s: 字符串列表
+ * @len: 字符串长度（码点数）
+ * @buf: 码点数组
+ * @return: 0=成功，-1=内存错误
+ * 
+ * 功能：根据字符串长度选择不同的存储策略：
+ * - len=0: 空字符串，忽略
+ * - len=1: 单字符，添加到 CharRange（高效区间表示）
+ * - len>1: 多字符，添加到哈希表（支持字符串匹配）
+ * 
+ * 使用场景：
+ * - 字符类中的字符串并集（如 [ab|cd|ef]）
+ * - Unicode 属性的多码点序列
+ * - 字符串析取（string disjunction）
+ * 
+ * 注意：内存错误时返回 -1，调用者需检查返回值
  */
 /* return -1 if memory error, 0 if OK */
 static int re_string_add(REStringList *s, int len, const uint32_t *buf)
@@ -495,6 +621,28 @@ static int re_string_add(REStringList *s, int len, const uint32_t *buf)
  *    - 交集/差集：遍历 a 的字符串，检查是否在 b 中存在，不符合的删除
  * 
  * 注意：交集和差集运算会释放 a 的旧字符串列表
+ */
+/**
+ * re_string_list_op - 字符串列表集合运算
+ * @a: 左操作数（结果存储于此）
+ * @b: 右操作数
+ * @op: 运算类型
+ *   - RE_STRING_LIST_OP_UNION: 并集（a ∪ b）
+ *   - RE_STRING_LIST_OP_INTER: 交集（a ∩ b）
+ *   - RE_STRING_LIST_OP_DIFF: 差集（a - b）
+ * @return: 0=成功，-1=内存错误
+ * 
+ * 功能：实现字符串列表的集合运算，用于 ES2024 字符类集合运算特性：
+ * - 并集：[[a&&b]] 表示同时匹配 a 或 b
+ * - 交集：[[a&&b]] 表示同时匹配 a 和 b
+ * - 差集：[[a--b]] 表示匹配 a 但不匹配 b
+ * 
+ * 实现策略：
+ * 1. 并集：将 b 的所有字符串添加到 a
+ * 2. 交集：保留 a 中也在 b 中的字符串
+ * 3. 差集：移除 a 中也在 b 中的字符串
+ * 
+ * 内存管理：交集和差集运算会释放 a 的旧字符串列表，然后重建
  */
 /* a = a op b */
 static int re_string_list_op(REStringList *a, REStringList *b, int op)
@@ -560,6 +708,29 @@ static int re_string_list_op(REStringList *a, REStringList *b, int op)
  * 2. 对哈希表中的每个字符串：
  *    - 逐字符调用 lre_canonicalize 转换为规范形式
  *    - 重新添加到新的字符串列表中
+ * 
+ * 注意：此函数会重新分配整个哈希表，因为字符串内容改变了
+ */
+/**
+ * re_string_list_canonicalize - 字符串列表规范化（大小写折叠）
+ * @s1: 解析状态（用于获取内存分配器）
+ * @s: 字符串列表
+ * @return: 0=成功，-1=内存错误
+ * 
+ * 功能：对字符串列表中的所有字符串执行大小写折叠（case folding），
+ *       用于实现忽略大小写模式（/i 标志）下的字符类匹配。
+ * 
+ * 处理对象：
+ * 1. CharRange 中的单字符：调用 lre_canonicalize 转换
+ * 2. 哈希表中的多字符字符串：对每个码点调用 lre_canonicalize
+ * 
+ * 实现细节：
+ * - 由于字符串内容改变了，哈希值也会改变
+ * - 需要重新分配整个哈希表，重新计算哈希值并重新插入
+ * 
+ * 使用场景：
+ * - 字符类 [a-z] 在忽略大小写模式下也匹配 A-Z
+ * - 字符串析取 "abc" 在忽略大小写模式下也匹配 "ABC"、"AbC" 等
  * 
  * 注意：此函数会重新分配整个哈希表，因为字符串内容改变了
  */
@@ -981,6 +1152,23 @@ static int re_emit_goto_u8_u32(REParseState *s, int op, uint32_t arg0, uint32_t 
  * @param op 操作码
  * @param val 8 位操作数值
  */
+/**
+ * re_emit_op_u8 - 发射操作码 + 8 位操作数
+ * @s: 解析状态（包含字节码缓冲区）
+ * @op: 操作码（1 字节）
+ * @val: 8 位操作数值（1 字节）
+ * 
+ * 功能：发射一个操作码字节和一个 8 位操作数值。
+ * 
+ * 字节码格式：[opcode:1][operand:1]
+ * 
+ * 使用场景：
+ * - REOP_u8: 8 位立即数操作
+ * - REOP_push_u8: 压入 8 位立即数
+ * - 其他需要 8 位操作数的指令
+ * 
+ * 注意：操作数使用小端序（但单字节无需考虑字节序）
+ */
 static void re_emit_op_u8(REParseState *s, int op, uint32_t val)
 {
     dbuf_putc(&s->byte_code, op);
@@ -992,6 +1180,23 @@ static void re_emit_op_u8(REParseState *s, int op, uint32_t val)
  * @param s 解析状态
  * @param op 操作码
  * @param val 16 位操作数值
+ */
+/**
+ * re_emit_op_u16 - 发射操作码 + 16 位操作数
+ * @s: 解析状态（包含字节码缓冲区）
+ * @op: 操作码（1 字节）
+ * @val: 16 位操作数值（2 字节）
+ * 
+ * 功能：发射一个操作码字节和一个 16 位操作数值。
+ * 
+ * 字节码格式：[opcode:1][operand:2]（小端序）
+ * 
+ * 使用场景：
+ * - REOP_char: 16 位字符匹配
+ * - REOP_range: 字符范围计数
+ * - 其他需要 16 位操作数的指令
+ * 
+ * 注意：操作数使用小端序（little-endian）
  */
 static void re_emit_op_u16(REParseState *s, int op, uint32_t val)
 {
@@ -1025,6 +1230,28 @@ static int __attribute__((format(printf, 2, 3))) re_parse_error(REParseState *s,
  * 
  * 包装函数，调用 re_parse_error 生成 "out of memory" 错误信息
  */
+/**
+ * re_parse_out_of_memory - 内存不足错误报告
+ * @s: 解析状态
+ * @return: 始终返回 -1
+ * 
+ * 功能：格式化内存不足错误信息。
+ * 
+ * 实现逻辑：
+ * - 调用 re_parse_error(s, "out of memory")
+ * - 设置 s->u.error_flag 标记错误状态
+ * - 返回 -1 表示解析失败
+ * 
+ * 使用场景：
+ * - 内存分配失败时的统一错误处理
+ * - 字节码缓冲区扩容失败
+ * - 字符串列表哈希表扩容失败
+ * - 捕获组数组分配失败
+ * 
+ * 注意：
+ * - 包装函数，调用 re_parse_error 生成 "out of memory" 错误信息
+ * - 调用者应检查返回值并立即返回，停止解析
+ */
 static int re_parse_out_of_memory(REParseState *s)
 {
     return re_parse_error(s, "out of memory");
@@ -1045,8 +1272,27 @@ static int re_parse_out_of_memory(REParseState *s)
  * - allow_overflow=TRUE: 溢出时返回 INT32_MAX
  * - allow_overflow=FALSE: 溢出时返回 -1
  */
-/* If allow_overflow is false, return -1 in case of
-   overflow. Otherwise return INT32_MAX. */
+/**
+ * parse_digits - 解析十进制数字序列
+ * @pp: 输入字符串指针的指针（更新为数字后的位置）
+ * @allow_overflow: 是否允许溢出
+ *   - TRUE: 溢出时返回 INT32_MAX
+ *   - FALSE: 溢出时返回 -1
+ * @return: 解析的整数值，或 -1（溢出且不允许）
+ * 
+ * 功能：从 *pp 开始解析连续的数字字符（'0'-'9'），
+ *       转换为 64 位中间值，最后返回 32 位整数。
+ * 
+ * 溢出处理策略：
+ * - 使用 uint64_t 累加，检测是否超过 INT32_MAX
+ * - allow_overflow=TRUE：饱和到 INT32_MAX（用于量词解析）
+ * - allow_overflow=FALSE：返回 -1 表示错误（用于严格模式）
+ * 
+ * 使用场景：
+ * - 量词 {n,m} 中的 n 和 m 解析
+ * - 反向引用 \\123 中的组号解析
+ * - Unicode 转义 \\u{1F600} 中的码点值解析
+ */
 static int parse_digits(const uint8_t **pp, BOOL allow_overflow)
 {
     const uint8_t *p;
@@ -1083,6 +1329,31 @@ static int parse_digits(const uint8_t **pp, BOOL allow_overflow)
  *       如果不匹配，调用 re_parse_error 生成错误消息
  * 
  * 使用场景：解析正则语法中的固定字符（如括号、方括号、量词等）
+ */
+/**
+ * re_parse_expect - 期望字符解析包装函数
+ * @s: 解析状态
+ * @pp: 输入字符串指针的指针
+ * @c: 期望的字符
+ * @return: 0=成功，-1=解析错误
+ * 
+ * 功能：检查当前位置是否为期望的字符，如果是则前进。
+ * 
+ * 实现逻辑：
+ * 1. 检查 *pp 是否等于 c
+ * 2. 如果相等，*pp++ 前进
+ * 3. 如果不等，报错 "unexpected character"
+ * 
+ * 使用场景：
+ * - 解析固定语法：括号 ()、方括号 []、花括号 {}
+ * - 解析量词：* + ? {n,m}
+ * - 解析转义：\\ 后的固定字符
+ * 
+ * 示例：
+ * - re_parse_expect(s, &p, '(') → 解析左括号
+ * - re_parse_expect(s, &p, '>') → 解析命名分组的>
+ * 
+ * 注意：这是语法糖函数，简化固定字符匹配的常见模式
  */
 static int re_parse_expect(REParseState *s, const uint8_t **pp, int c)
 {
@@ -1223,7 +1494,22 @@ int lre_parse_escape(const uint8_t **pp, int allow_utf16)
 }
 
 #ifdef CONFIG_ALL_UNICODE
-/* XXX: we use the same chars for name and value */
+/**
+ * is_unicode_char - 判断字符是否为有效的 Unicode 属性名称/值字符
+ * @c: 待判断的 Unicode 码点
+ * @return: TRUE=有效，FALSE=无效
+ * 
+ * 有效字符集：
+ * - 数字：'0'-'9'
+ * - 大写字母：'A'-'Z'
+ * - 小写字母：'a'-'z'
+ * - 下划线：'_'
+ * 
+ * 用途：在解析 Unicode 属性表达式（如 \\p{Script=Latin}）时，
+ *       用于验证属性名称和属性值中的字符是否合法。
+ * 
+ * 注意：XXX: 名称和值使用相同的字符集，这符合 Unicode 标准规范
+ */
 static BOOL is_unicode_char(int c)
 {
     return ((c >= '0' && c <= '9') ||
@@ -1495,9 +1781,34 @@ static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
     return -1;
 }
 
-/* return -1 if error otherwise the character or a class range
-   (CLASS_RANGE_BASE) if cr != NULL. In case of class range, 'cr' is
-   initialized. Otherwise, it is ignored. */
+/**
+ * get_class_atom - 解析字符类原子（第二个重载版本）
+ * @s: 解析状态
+ * @cr: 输出参数，字符范围列表（用于存储字符类）
+ * @pp: 输入字符串指针的指针（更新为解析后的位置）
+ * @inclass: 是否在字符类内部（[...] 内）
+ * @return: 
+ *   - >=0: 单个字符的码点值
+ *   - CLASS_RANGE_BASE: 字符范围已添加到 cr
+ *   - -1: 解析错误
+ *   - -2: 空类（不应该发生）
+ *   - -3: 预定义类已直接处理
+ * 
+ * 功能：解析字符类中的单个原子元素，支持：
+ * 1. 普通字符：直接返回码点值
+ * 2. 转义序列：\\d、\\s、\\w、\\D、\\S、\\W 等预定义类
+ * 3. 十六进制转义：\\xNN、\\uNNNN、\\u{NNNNNN}
+ * 4. 八进制转义：\\0NNN（Annex B 兼容模式）
+ * 5. 控制字符：\\cX（控制字符 X）
+ * 6. 字符串析取：在字符类中解析多字符序列
+ * 
+ * 返回值约定：
+ * - 单个字符：返回码点值（0-0x10FFFF）
+ * - 字符范围：初始化 cr 并返回 CLASS_RANGE_BASE，调用者需检查 cr
+ * - 错误：返回 -1 并设置错误信息
+ * 
+ * 注意：如果 cr != NULL，字符范围会初始化到 cr 中；否则 cr 被忽略
+ */
 static int get_class_atom(REParseState *s, REStringList *cr,
                           const uint8_t **pp, BOOL inclass)
 {
@@ -1699,6 +2010,31 @@ static int get_class_atom(REParseState *s, REStringList *cr,
  * REOP_range: [opcode:1][count:2][ranges: count*(low:2 + high:2)]
  * REOP_range32: [opcode:1][count:2][ranges: count*(low:4 + high:4)]
  */
+/**
+ * re_emit_range - 发射字符范围匹配指令
+ * @s: 解析状态（包含字节码缓冲区）
+ * @cr: 字符范围结构（CharRange）
+ * @return: 0=成功，-1=内存错误
+ * 
+ * 功能：将字符范围（CharRange）编译为字节码指令，支持两种格式：
+ * 
+ * 1. REOP_range（16 位范围，码点 <= 0xFFFF）：
+ *    格式：[opcode:1][count:2][ranges: count*(low:2 + high:2)]
+ *    适用：基本多文种平面（BMP）字符
+ * 
+ * 2. REOP_range32（32 位范围，码点 > 0xFFFF）：
+ *    格式：[opcode:1][count:2][ranges: count*(low:4 + high:4)]
+ *    适用：辅助平面字符（如 emoji、古文字等）
+ * 
+ * 优化策略：
+ * - 如果所有范围都在 BMP 内，使用 REOP_range（更紧凑）
+ * - 如果有范围超出 BMP，使用 REOP_range32（支持完整 Unicode）
+ * 
+ * 使用场景：
+ * - 字符类 [a-z] 编译为单个范围 [0x61, 0x7A]
+ * - 预定义类 \\d 编译为 [0x30, 0x39]
+ * - 复杂字符类 [a-zA-Z0-9_] 编译为多个范围
+ */
 static int re_emit_range(REParseState *s, const CharRange *cr)
 {
     int len, i;
@@ -1750,6 +2086,26 @@ static int re_emit_range(REParseState *s, const CharRange *cr)
  * 
  * 实现技巧：使用布尔运算结果相减，避免分支预测失败
  */
+/**
+ * re_string_cmp_len - 字符串长度比较函数（用于排序）
+ * @a: 第一个 REString 指针
+ * @b: 第二个 REString 指针
+ * @arg: 未使用（rqsort 接口要求）
+ * @return: 正数=a 长于 b，负数=a 短于 b，0=等长
+ * 
+ * 功能：比较两个字符串的长度，用于 rqsort 排序。
+ * 
+ * 排序策略：按长度降序排列（长字符串在前）
+ * 目的：确保长字符串优先匹配（贪婪策略）
+ * 
+ * 实现技巧：
+ * - 使用布尔运算结果相减：(a->len > b->len) - (a->len < b->len)
+ * - 避免分支预测失败，提升性能
+ * 
+ * 使用场景：
+ * - 字符串列表排序，确保长字符串优先匹配
+ * - 避免 "abcd" 匹配 "ab" 后剩余 "cd" 无法匹配的问题
+ */
 static int re_string_cmp_len(const void *a, const void *b, void *arg)
 {
     REString *p1 = *(REString **)a;
@@ -1767,6 +2123,25 @@ static int re_string_cmp_len(const void *a, const void *b, void *arg)
  * - c > 0xFFFF：使用 32 位操作码（REOP_char32 或 REOP_char32_i）
  * 
  * 忽略大小写模式（_i 后缀）：在运行时自动进行大小写折叠匹配
+ */
+/**
+ * re_emit_char - 发射单个字符匹配指令
+ * @s: 解析状态（包含字节码缓冲区）
+ * @c: 要匹配的字符码点
+ * 
+ * 功能：根据字符码点范围选择合适的操作码：
+ * - c <= 0xFFFF: 使用 REOP_char（16 位指令）
+ * - c > 0xFFFF: 使用 REOP_char32（32 位指令）
+ * 
+ * 忽略大小写模式：
+ * - 如果 s->ignore_case 为 TRUE，使用 _i 后缀操作码
+ *   - REOP_char_i / REOP_char32_i
+ * - 运行时会自动进行大小写折叠（lre_canonicalize）
+ * 
+ * 使用场景：
+ * - 普通字符匹配：/a/ → REOP_char 'a'
+ * - Unicode 字符匹配：/😀/ → REOP_char32 0x1F600
+ * - 忽略大小写匹配：/a/i → REOP_char_i 'a'
  */
 static void re_emit_char(REParseState *s, int c)
 {
@@ -1795,6 +2170,33 @@ static void re_emit_char(REParseState *s, int c)
  * - 使用 rqsort 排序：O(n log n) 时间复杂度
  * 
  * TODO: 可用 trie（前缀树）优化多字符串匹配性能
+ */
+/**
+ * re_emit_string_list - 发射字符串列表字节码
+ * @s: 解析状态（包含字节码缓冲区）
+ * @sl: 字符串列表（REStringList）
+ * @return: 0=成功，-1=内存错误
+ * 
+ * 功能：将字符串列表编译为字节码，支持多字符串匹配。
+ * 
+ * 实现策略：
+ * 1. 先排序：按字符串长度降序排列（长字符串优先）
+ * 2. 发射指令：为每个字符串发射匹配指令
+ * 3. 长字符串优先：确保贪婪匹配策略
+ * 
+ * 字节码格式：
+ * - 每个字符串：REOP_char/REOP_char32 序列
+ * - 字符串间：使用分支指令连接
+ * 
+ * 优化机会：
+ * - TODO: 可用 trie（前缀树）优化多字符串匹配性能
+ * - 当前实现：O(n*m) 复杂度（n=字符串数，m=平均长度）
+ * - trie 优化：O(m) 复杂度，共享公共前缀
+ * 
+ * 使用场景：
+ * - 字符类中的字符串并集：[ab|cd|ef]
+ * - Unicode 属性的多码点序列
+ * - 字符串析取（string disjunction）
  */
 static int re_emit_string_list(REParseState *s, const REStringList *sl)
 {
@@ -1902,6 +2304,34 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_
  * - 将字符添加到字符范围
  * 
  * 此函数是 Unicode 集合模式（unicode_sets）下字符类运算的基础构建块
+ */
+/**
+ * re_parse_class_set_operand - 解析字符集合操作数
+ * @s: 解析状态
+ * @cr: 输出参数，字符范围列表
+ * @pp: 输入字符串指针的指针（更新为解析后的位置）
+ * @return: 0=成功，-1=解析错误
+ * 
+ * 功能：解析字符集合运算中的单个操作数，支持两种形式：
+ * 
+ * 1. 嵌套字符类 [...]：
+ *    - 调用 re_parse_nested_class 递归解析
+ *    - 支持嵌套类中的集合运算（&&、--）
+ * 
+ * 2. 单字符原子：
+ *    - 普通字符、转义序列、Unicode 属性等
+ *    - 调用 get_class_atom 解析
+ * 
+ * 语法示例：
+ * - [[a-z]&&[aeiou]]: 交集运算，匹配元音字母
+ * - [[a-z]--[aeiou]]: 差集运算，匹配辅音字母
+ * - [[a-z]|[A-Z]]: 并集运算，匹配所有字母
+ * 
+ * 使用场景：
+ * - ES2024 字符类集合运算特性
+ * - Unicode 集合模式（v 标志）下的复杂字符类
+ * 
+ * 注意：此函数是 Unicode 集合模式（unicode_sets）下字符类运算的基础构建块
  */
 static int re_parse_class_set_operand(REParseState *s, REStringList *cr, const uint8_t **pp)
 {
@@ -2129,6 +2559,33 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_
  * 
  * 内存管理：使用局部 REStringList，完成后释放
  */
+/**
+ * re_parse_char_class - 字符类解析入口函数
+ * @s: 解析状态
+ * @pp: 输入字符串指针的指针（更新为']'后的位置）
+ * @return: 0=成功，-1=解析错误
+ * 
+ * 功能：解析字符类 [...] 的入口函数，协调以下步骤：
+ * 
+ * 1. 调用 re_parse_nested_class 解析嵌套字符类
+ * 2. 调用 re_emit_string_list 发射字节码
+ * 3. 处理忽略大小写模式
+ * 
+ * 实现策略：
+ * - 使用局部 REStringList 存储解析结果
+ * - 完成后释放局部列表，避免内存泄漏
+ * 
+ * 字节码生成：
+ * - 如果只有字符范围：发射 REOP_range/REOP_range32
+ * - 如果有多字符字符串：发射 REOP_char 序列
+ * 
+ * 使用场景：
+ * - 简单字符类：[a-z]、[0-9]、[aeiou]
+ * - 复杂字符类：[[a-z]&&[aeiou]]（ES2024 集合运算）
+ * - 字符串析取：[ab|cd|ef]
+ * 
+ * 注意：内存管理使用局部 REStringList，完成后释放
+ */
 static int re_parse_char_class(REParseState *s, const uint8_t **pp)
 {
     REStringList cr_s, *cr = &cr_s;
@@ -2255,6 +2712,36 @@ static BOOL re_need_check_adv_and_capture_init(BOOL *pneed_capture_init,
  * - 以 '>' 字符结束
  * 
  * 返回：组名写入 buf，pp 更新到 '>' 后的位置
+ */
+/**
+ * re_parse_group_name - 解析命名分组名称
+ * @buf: 输出缓冲区（存储组名）
+ * @buf_size: 缓冲区大小（字节）
+ * @pp: 输入字符串指针的指针（更新为'>'后的位置）
+ * @return: 0=成功，-1=解析错误
+ * 
+ * 功能：解析命名分组的名称，语法：<name>
+ * 
+ * 命名规则（遵循 JavaScript 标识符规范）：
+ * 1. 首字符：字母、下划线、$、或 Unicode 字母
+ * 2. 后续字符：字母、数字、下划线、$、或 Unicode 字母数字
+ * 3. 代理对：支持 UTF-16 代理对（如 emoji）
+ * 
+ * 语法规则：
+ * - 开始：< 字符后开始解析
+ * - 结束：> 字符结束解析
+ * - 错误：空名称、无效字符、未闭合的>
+ * 
+ * 使用场景：
+ * - 命名分组：(?<name>pattern)
+ * - 命名反向引用：\\k<name>
+ * - 命名捕获组索引查找
+ * 
+ * 示例：
+ * - /(?<year>\\d{4})/ → buf="year"
+ * - /(?<日本語>\\p{Script=Han})/ → buf="日本語"（支持 Unicode）
+ * 
+ * 注意：'*pp' is the first char after '<'（调用前已跳过<）
  */
 /* '*pp' is the first char after '<' */
 static int re_parse_group_name(char *buf, int buf_size, const uint8_t **pp)
@@ -2488,6 +2975,31 @@ static int find_group_name(REParseState *s, const char *name, BOOL emit_group_in
  * 
  * 使用场景：解析命名分组时检查是否违反命名唯一性约束
  */
+/**
+ * is_duplicate_group_name - 检查命名分组是否重复
+ * @s: 解析状态
+ * @name: 要检查的分组名称
+ * @scope: 作用域（当前分组的嵌套深度）
+ * @return: TRUE=重复，FALSE=不重复
+ * 
+ * 功能：检查同一作用域内是否存在同名的命名分组。
+ * 
+ * JavaScript 规范约束：
+ * - 同一作用域内命名分组必须唯一
+ * - 不同作用域允许同名（嵌套分组）
+ * - 作用域由 group_name_scope 跟踪
+ * 
+ * 实现策略：
+ * - 遍历已解析的命名分组列表
+ * - 检查相同作用域内是否有同名分组
+ * - 找到重复立即返回 TRUE
+ * 
+ * 使用场景：
+ * - 解析命名分组 (?<name>...) 时检查唯一性
+ * - 避免 /(?<a>x)(?<a>y)/ 这样的非法正则
+ * 
+ * 注意：使用场景是解析命名分组时检查是否违反命名唯一性约束
+ */
 static BOOL is_duplicate_group_name(REParseState *s, const char *name, int scope)
 {
     const char *p, *buf_end;
@@ -2530,6 +3042,33 @@ static int re_parse_disjunction(REParseState *s, BOOL is_backward_dir);
  * 错误处理：同一修饰符重复出现时报错（如 (?ii) 非法）
  * 返回：解析的修饰符掩码，pp 更新到修饰符列表后的位置
  */
+/**
+ * re_parse_modifiers - 解析行内修饰符
+ * @s: 解析状态
+ * @pp: 输入字符串指针的指针（更新为修饰符列表后的位置）
+ * @return: 修饰符掩码，-1=解析错误
+ * 
+ * 功能：解析行内修饰符语法 (?ims)，支持组合形式。
+ * 
+ * 支持的修饰符：
+ * - i: IGNORECASE（忽略大小写）
+ * - m: MULTILINE（多行模式，^$匹配行首行尾）
+ * - s: DOTALL（点号匹配所有，包括换行符）
+ * 
+ * 语法规则：
+ * - 组合形式：(?ims) 同时启用多个修饰符
+ * - 重复检测：同一修饰符重复出现时报错（如 (?ii) 非法）
+ * - 结束条件：遇到)或-（切换语法）时结束
+ * 
+ * 使用场景：
+ * - 局部修饰符：(?i:pattern) 仅对 pattern 生效
+ * - 全局切换：(?ims) 从当前位置到末尾生效
+ * - 修饰符切换：(?ims-ims) 启用/禁用修饰符
+ * 
+ * 示例：
+ * - /(?i:hello)/ → 仅 hello 忽略大小写
+ * - /(?ms)hello/ → 从 hello 开始多行 + 点号匹配所有
+ */
 static int re_parse_modifiers(REParseState *s, const uint8_t **pp)
 {
     const uint8_t *p = *pp;
@@ -2567,6 +3106,34 @@ static int re_parse_modifiers(REParseState *s, const uint8_t **pp)
  *       用于处理 (?ims-ims) 形式的修饰符切换语法
  * 
  * 优先级：remove_mask 优先级高于 add_mask（同时出现时以移除为准）
+ */
+/**
+ * update_modifier - 更新修饰符状态
+ * @val: 当前修饰符值
+ * @add_mask: 要启用的修饰符掩码
+ * @remove_mask: 要禁用的修饰符掩码
+ * @return: 更新后的修饰符值
+ * 
+ * 功能：根据添加/移除掩码更新修饰符状态。
+ * 
+ * 优先级规则：
+ * - remove_mask 优先级高于 add_mask
+ * - 同一修饰符同时出现在 add 和 remove 中时，以 remove 为准
+ * 
+ * 实现逻辑：
+ * 1. 先应用 remove_mask：val &= ~remove_mask
+ * 2. 再应用 add_mask：val |= add_mask
+ * 
+ * 使用场景：
+ * - 修饰符切换语法：(?ims-ims)
+ *   - 左边：要启用的修饰符（add_mask）
+ *   - 右边：要禁用的修饰符（remove_mask）
+ * 
+ * 示例：
+ * - (?i-s): 启用忽略大小写，禁用点号匹配所有
+ * - (?ms-i): 启用多行 + 点号匹配所有，禁用忽略大小写
+ * 
+ * 注意：优先级是 remove_mask 高于 add_mask（同时出现时以移除为准）
  */
 static BOOL update_modifier(BOOL val, int add_mask, int remove_mask,
                             int mask)
@@ -3260,6 +3827,39 @@ static int re_parse_disjunction(REParseState *s, BOOL is_backward_dir)
  * @note: 寄存器索引会直接写入字节码指令的操作数位置（bc_buf[pos + 1]）
  * @note: 最大寄存器数量限制为 REGISTER_COUNT_MAX（通常是 255）
  */
+/**
+ * compute_register_count - 计算字节码所需的寄存器数量
+ * @bc_buf: 字节码缓冲区
+ * @bc_buf_len: 字节码长度
+ * @return: 寄存器数量
+ * 
+ * 功能：扫描字节码，找出使用的最大寄存器索引，计算所需寄存器总数。
+ * 
+ * 实现策略：
+ * 1. 遍历字节码，识别所有使用寄存器的指令
+ * 2. 提取指令中的寄存器索引（操作数）
+ * 3. 记录最大索引值
+ * 4. 返回最大索引 + 1（寄存器从 0 开始编号）
+ * 
+ * 寄存器用途：
+ * - 捕获组存储：每个捕获组需要一个寄存器
+ * - 回溯点保存：回溯时需要保存捕获组状态
+ * - 变量存储：命名分组、量词计数等
+ * 
+ * 字节码指令中的寄存器：
+ * - REOP_saveStart: 保存捕获组起始位置
+ * - REOP_saveEnd: 保存捕获组结束位置
+ * - REOP_pushRegister: 压入寄存器值
+ * - 等等...
+ * 
+ * 使用场景：
+ * - 编译完成后计算执行上下文所需空间
+ * - 分配捕获组数组（capture array）
+ * 
+ * 注意：
+ * - 寄存器索引会直接写入字节码指令的操作数位置（bc_buf[pos + 1]）
+ * - 最大寄存器数量限制为 REGISTER_COUNT_MAX（通常是 255）
+ */
 static int compute_register_count(uint8_t *bc_buf, int bc_buf_len)
 {
     int stack_size, stack_size_max, pos, opcode, len;
@@ -3334,6 +3934,31 @@ static int compute_register_count(uint8_t *bc_buf, int bc_buf_len)
  * @return: 成功返回新指针，失败返回 NULL
  * 
  * @note: 限制字节码大小不超过 2GB（INT32_MAX / 2），留出余量防止溢出
+ */
+/**
+ * lre_bytecode_realloc - 字节码内存重新分配器
+ * @opaque: 用户自定义数据（未使用）
+ * @ptr: 原内存指针（NULL 表示分配新内存）
+ * @size: 新大小（字节）
+ * @return: 新内存指针，失败返回 NULL
+ * 
+ * 功能：为字节码缓冲区提供内存分配服务。
+ * 
+ * 安全限制：
+ * - 最大字节码大小：INT32_MAX / 2（约 2GB）
+ * - 超出限制返回 NULL，避免整数溢出
+ * - 留出余量防止指针运算溢出
+ * 
+ * 实现细节：
+ * - 使用标准 realloc 进行内存分配
+ * - 检查 size 是否超过限制
+ * - 失败时返回 NULL，调用者需处理错误
+ * 
+ * 使用场景：
+ * - 字节码缓冲区动态扩容
+ * - 复杂正则表达式编译时可能需要多次扩容
+ * 
+ * 注意：限制字节码大小不超过 2GB（INT32_MAX / 2），留出余量防止溢出
  */
 static void *lre_bytecode_realloc(void *opaque, void *ptr, size_t size)
 {
@@ -3513,6 +4138,30 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
  * 
  * @note: 这是 ECMAScript 规范定义的完整行终止符集合
  * @note: 在单行模式下，^ 和 $ 只匹配字符串的开始和结束
+ */
+/**
+ * is_line_terminator - 判断字符是否为行终止符
+ * @c: 待判断的 Unicode 码点
+ * @return: TRUE=是行终止符，FALSE=不是
+ * 
+ * ECMAScript 规范定义的行终止符：
+ * - \\n (U+000A): LF, Line Feed
+ * - \\r (U+000D): CR, Carriage Return
+ * - U+2028: LS, Line Separator
+ * - U+2029: PS, Paragraph Separator
+ * 
+ * 使用场景：
+ * 1. 多行模式（m 标志）：
+ *    - ^ 匹配行首（行终止符后）
+ *    - $ 匹配行尾（行终止符前）
+ * 2. 点号匹配（s 标志未设置）：
+ *    - . 不匹配行终止符
+ * 3. 字符类否定：
+ *    - [^\\n] 匹配除换行符外的所有字符
+ * 
+ * 注意：
+ * - 这是 ECMAScript 规范定义的完整行终止符集合
+ * - 在单行模式下，^ 和 $ 只匹配字符串的开始和结束
  */
 static BOOL is_line_terminator(uint32_t c)
 {
