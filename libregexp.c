@@ -1251,6 +1251,33 @@ static void seq_prop_cb(void *opaque, const uint32_t *seq, int seq_len)
     re_string_add(sl, seq_len, seq);
 }
 
+/**
+ * @brief 解析 Unicode 属性表达式 \\p{...} 或 \\P{...}
+ * @param s 解析状态
+ * @param cr 输出的字符串列表（字符范围）
+ * @param pp 输入字符串指针的指针（指向 '\\p' 或 '\\P' 之后）
+ * @param is_inv TRUE=\\P{...}（取反），FALSE=\\p{...}
+ * @param allow_sequence_prop TRUE=允许多码点序列属性
+ * @return 0=成功，-1=错误
+ * 
+ * 支持的属性语法：
+ * - \\p{Script=Latin} 或 \\p{sc=Latin}: 拉丁脚本
+ * - \\p{Script_Extensions=Han} 或 \\p{scx=Han}: 汉字脚本扩展
+ * - \\p{General_Category=Lu} 或 \\p{gc=Lu}: 大写字母
+ * - \\p{Lu}: 简写形式（General_Category）
+ * - \\p{Alphabetic}: 布尔属性
+ * 
+ * 实现流程：
+ * 1. 解析属性名和可选的属性值（用 '=' 分隔）
+ * 2. 根据属性名调用相应的 Unicode 查询函数：
+ *    - unicode_script: 查询脚本
+ *    - unicode_general_category: 查询一般分类
+ *    - unicode_prop: 查询布尔属性
+ * 3. 将结果添加到字符范围
+ * 4. 如果 is_inv 为真，对结果取反
+ * 
+ * @note: 需要 CONFIG_ALL_UNICODE 编译选项支持
+ */
 static int parse_unicode_property(REParseState *s, REStringList *cr,
                                   const uint8_t **pp, BOOL is_inv,
                                   BOOL allow_sequence_prop)
@@ -1372,6 +1399,26 @@ static int parse_unicode_property(REParseState *s, REStringList *cr,
 }
 #endif /* CONFIG_ALL_UNICODE */
 
+/**
+ * @brief 获取字符类原子（单个字符或预定义类）
+ * @param s 解析状态
+ * @param cr 输出的字符串列表
+ * @param pp 输入字符串指针的指针（解析后更新）
+ * @param inclass TRUE=在字符类内部 [...]，FALSE=在字符类外部
+ * @return 字符码点（0-0x10FFFF），或特殊值：
+ *         -1=错误，-2=空类，-3=预定义类已处理
+ * 
+ * 功能：解析字符类中的单个原子元素，支持：
+ * 1. 普通字符：直接返回字符码点
+ * 2. 转义序列：\\n, \\t, \\r, \\f, \\v, \\b, \\0
+ * 3. 十六进制转义：\\xHH, \\uHHHH, \\u{HHHHHH}
+ * 4. 预定义字符类：\\d, \\D, \\s, \\S, \\w, \\W
+ * 5. Unicode 属性：\\p{...}, \\P{...}
+ * 6. 字符串析取：\\q{...}（仅当 inclass=TRUE）
+ * 7. 字符类嵌套：[...]（仅当 inclass=TRUE）
+ * 
+ * @note: 如果返回 -3，表示预定义类已直接添加到 cr，无需进一步处理
+ */
 static int get_class_atom(REParseState *s, REStringList *cr,
                           const uint8_t **pp, BOOL inclass);
 
@@ -1729,6 +1776,26 @@ static void re_emit_char(REParseState *s, int c)
         re_emit_op_u32(s, s->ignore_case ? REOP_char32_i : REOP_char32, c);
 }
 
+/**
+ * @brief 为字符串列表发射字节码
+ * @param s 解析状态
+ * @param sl 字符串列表（包含字符范围和多字符字符串）
+ * @return 0=成功，-1=错误
+ * 
+ * 功能：将字符串列表编译为字节码，支持两种情况：
+ * 1. 简单情况（n_strings=0）：只有字符范围，直接调用 re_emit_range
+ * 2. 复杂情况（n_strings>0）：有多字符字符串，需要：
+ *    - 按长度降序排序（长字符串优先匹配，贪婪策略）
+ *    - 为每个字符串发射字符匹配序列
+ *    - 使用跳转指令实现分支选择
+ * 
+ * 优化策略：
+ * - 长字符串优先：确保 "abc" 比 "ab" 先匹配（贪婪）
+ * - 空字符串特殊处理：最后匹配，避免提前消耗输入
+ * - 使用 rqsort 排序：O(n log n) 时间复杂度
+ * 
+ * TODO: 可用 trie（前缀树）优化多字符串匹配性能
+ */
 static int re_emit_string_list(REParseState *s, const REStringList *sl)
 {
     REString **tab, *p;
@@ -3571,6 +3638,21 @@ typedef struct {
     StackElem static_stack_buf[32]; /* static stack to avoid allocation in most cases */
 } REExecContext;
 
+/**
+ * @brief 超时检查轮询函数
+ * @param s 执行上下文
+ * @return 0=未超时，LRE_RET_TIMEOUT=超时
+ * 
+ * 功能：递减中断计数器，当计数器归零时调用 lre_check_timeout 检查是否超时
+ *       用于防止正则表达式执行时间过长（如灾难性回溯）
+ * 
+ * 机制：
+ * - 每次调用递减 interrupt_counter
+ * - 归零时重置为 INTERRUPT_COUNTER_INIT 并检查超时
+ * - 超时检查由调用者提供的回调函数 lre_check_timeout 实现
+ * 
+ * @note: 使用 unlikely() 提示编译器优化分支预测（超时是罕见情况）
+ */
 static int lre_poll_timeout(REExecContext *s)
 {
     if (unlikely(--s->interrupt_counter <= 0)) {
@@ -3581,6 +3663,23 @@ static int lre_poll_timeout(REExecContext *s)
     return 0;
 }
 
+/**
+ * @brief 执行栈扩容函数
+ * @param s 执行上下文
+ * @param n 需要的最小栈元素数量
+ * @return 0=成功，-1=内存错误
+ * 
+ * 功能：当回溯引擎的执行栈空间不足时，动态扩容
+ *       扩容策略：新大小 = max(原大小 * 1.5, n)
+ * 
+ * 内存管理：
+ * - 首次扩容：从静态缓冲区（static_stack_buf）切换到动态分配
+ * - 后续扩容：使用 lre_realloc 调整动态缓冲区大小
+ * - 扩容后需要更新 s->stack_buf 和 s->stack_size
+ * 
+ * @note: 使用 no_inline 避免内联，减少代码膨胀
+ * @note: XXX 注释提示可以优化为精确大小分配，但当前策略更简单
+ */
 static no_inline int stack_realloc(REExecContext *s, size_t n)
 {
     StackElem *new_stack;
