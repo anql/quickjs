@@ -2618,9 +2618,30 @@ static int re_parse_char_class(REParseState *s, const uint8_t **pp)
  * 
  * 优化意义：避免不必要的运行时检查，提升匹配性能
  */
-/* need_check_adv: false if the opcodes always advance the char pointer
-   need_capture_init: true if all the captures in the atom are not set
-*/
+/**
+ * re_need_check_adv_and_capture_init - 分析字节码是否需要前进检查和捕获组初始化
+ * 
+ * 通过静态分析字节码序列，确定执行引擎是否需要：
+ * 1. 显式检查字符指针是否前进（need_check_adv）
+ * 2. 初始化捕获组状态（need_capture_init）
+ * 
+ * @param pneed_capture_init: 输出参数，返回是否需要捕获组初始化
+ * @param bc_buf: 字节码缓冲区
+ * @param bc_buf_len: 字节码长度
+ * @return: TRUE=需要检查前进，FALSE=操作码总是消耗字符
+ * 
+ * 判断逻辑：
+ * - 如果字节码只包含消耗字符的操作（char/dot/any/range 等），返回 FALSE
+ * - 如果包含零宽断言（line_start/line_end/boundary 等），返回 TRUE
+ * - 如果包含反向引用，需要捕获组初始化（need_capture_init=TRUE）
+ * 
+ * 优化意义：
+ * - 避免不必要的运行时检查，提升匹配性能
+ * - 对于简单正则（如 /abc/），跳过前进检查
+ * - 对于复杂正则（如 /(?=abc)/），保留检查逻辑
+ * 
+ * @note: 这是编译期优化，结果用于指导执行引擎的代码生成
+ */
 static BOOL re_need_check_adv_and_capture_init(BOOL *pneed_capture_init,
                                                const uint8_t *bc_buf, int bc_buf_len)
 {
