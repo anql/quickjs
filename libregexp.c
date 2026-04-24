@@ -1054,6 +1054,18 @@ static int parse_digits(const uint8_t **pp, BOOL allow_overflow)
     return v;
 }
 
+/**
+ * @brief 解析期望字符（语法糖包装函数）
+ * @param s 解析状态
+ * @param pp 输入字符串指针的指针（解析后更新）
+ * @param c 期望的字符
+ * @return 0=成功，-1=错误（设置错误消息）
+ * 
+ * 功能：检查当前位置是否为期望字符 c，如果是则前进指针
+ *       如果不匹配，调用 re_parse_error 生成错误消息
+ * 
+ * 使用场景：解析正则语法中的固定字符（如括号、方括号、量词等）
+ */
 static int re_parse_expect(REParseState *s, const uint8_t **pp, int c)
 {
     const uint8_t *p;
@@ -1935,6 +1947,18 @@ static int re_parse_nested_class(REParseState *s, REStringList *cr, const uint8_
     return -1;
 }
 
+/**
+ * @brief 解析字符类（方括号表达式 [...]）
+ * @param s 解析状态
+ * @param pp 输入字符串指针的指针（解析后更新）
+ * @return 0=成功，-1=错误
+ * 
+ * 功能：解析形如 [abc]、[^0-9] 的字符类表达式
+ *       调用 re_parse_nested_class 处理嵌套类语法
+ *       将结果转换为字符串列表并发射字节码
+ * 
+ * 内存管理：使用局部 REStringList，完成后释放
+ */
 static int re_parse_char_class(REParseState *s, const uint8_t **pp)
 {
     REStringList cr_s, *cr = &cr_s;
@@ -1950,6 +1974,23 @@ static int re_parse_char_class(REParseState *s, const uint8_t **pp)
     return -1;
 }
 
+/**
+ * @brief 检查字节码是否需要前进检查和捕获组初始化
+ * @param pneed_capture_init 输出参数：是否需要捕获组初始化
+ * @param bc_buf 字节码缓冲区
+ * @param bc_buf_len 字节码长度
+ * @return TRUE=需要检查前进，FALSE=操作码总是前进字符指针
+ * 
+ * 功能：分析字节码序列，确定执行时是否需要显式检查字符指针前进
+ *       以及是否需要初始化捕获组状态
+ * 
+ * 判断逻辑：
+ * - 如果字节码包含不消耗字符的操作（如断言、边界检查），返回 TRUE
+ * - 如果字节码包含反向引用，需要捕获组初始化
+ * - 如果字节码只包含消耗字符的匹配操作，返回 FALSE
+ * 
+ * 优化意义：避免不必要的运行时检查，提升匹配性能
+ */
 /* need_check_adv: false if the opcodes always advance the char pointer
    need_capture_init: true if all the captures in the atom are not set
 */
@@ -2026,6 +2067,25 @@ static BOOL re_need_check_adv_and_capture_init(BOOL *pneed_capture_init,
     return need_check_adv;
 }
 
+/**
+ * @brief 解析命名分组的组名
+ * @param buf 输出缓冲区（存储组名）
+ * @param buf_size 缓冲区大小
+ * @param pp 输入字符串指针的指针（指向 '<' 后的第一个字符）
+ * @return 0=成功，-1=无效组名
+ * 
+ * 功能：解析 (?<name>...) 语法中的组名部分
+ *       支持 Unicode 字符（包括代理对）
+ *       遵循 JavaScript 标识符命名规则
+ * 
+ * 命名规则：
+ * - 首字符必须是有效的标识符起始字符（lre_js_is_ident_first）
+ * - 后续字符必须是有效的标识符 continuation 字符（lre_js_is_ident_next）
+ * - 支持转义序列（\uXXXX 形式）
+ * - 以 '>' 字符结束
+ * 
+ * 返回：组名写入 buf，pp 更新到 '>' 后的位置
+ */
 /* '*pp' is the first char after '<' */
 static int re_parse_group_name(char *buf, int buf_size, const uint8_t **pp)
 {
@@ -2081,8 +2141,27 @@ static int re_parse_group_name(char *buf, int buf_size, const uint8_t **pp)
     return 0;
 }
 
-/* if capture_name = NULL: return the number of captures + 1.
-   Otherwise, return the number of matching capture groups  */
+/**
+ * @brief 解析捕获组信息（计数或查找命名分组）
+ * @param s 解析状态
+ * @param phas_named_captures 输出参数：是否包含命名分组（0/1）
+ * @param capture_name 可选：要查找的命名分组名称（NULL=仅计数）
+ * @param emit_group_index 是否发射组索引到字节码
+ * @return capture_name=NULL 时返回捕获组总数 +1；否则返回匹配的命名分组数量
+ * 
+ * 功能：遍历正则表达式字符串，统计捕获组数量或查找特定命名分组
+ *       支持命名分组（?<name>...）和匿名分组 (...) 两种形式
+ * 
+ * 处理逻辑：
+ * - 扫描整个正则字符串，识别 '(' 开头的分组
+ * - 跳过转义字符（\）和字符类（[...]）中的括号
+ * - 对命名分组，检查组名是否匹配 capture_name
+ * - 如果匹配且 emit_group_index=TRUE，将组索引写入字节码
+ * 
+ * 使用场景：
+ * - capture_name=NULL：计算总捕获组数（用于分配寄存器）
+ * - capture_name 非 NULL：查找特定命名分组的索引（用于反向引用）
+ */
 static int re_parse_captures(REParseState *s, int *phas_named_captures,
                              const char *capture_name, BOOL emit_group_index)
 {
@@ -2139,6 +2218,18 @@ static int re_parse_captures(REParseState *s, int *phas_named_captures,
     }
 }
 
+/**
+ * @brief 计算捕获组总数（带缓存）
+ * @param s 解析状态
+ * @return 捕获组总数（包含整个匹配的隐式组 0）
+ * 
+ * 功能：调用 re_parse_captures 计算总捕获组数，结果缓存在 s->total_capture_count
+ *       避免重复解析，提升性能
+ * 
+ * 缓存机制：
+ * - 首次调用时 total_capture_count=-1，触发解析并缓存结果
+ * - 后续调用直接返回缓存值
+ */
 static int re_count_captures(REParseState *s)
 {
     if (s->total_capture_count < 0) {
@@ -2148,6 +2239,18 @@ static int re_count_captures(REParseState *s)
     return s->total_capture_count;
 }
 
+/**
+ * @brief 检查是否包含命名分组（带缓存）
+ * @param s 解析状态
+ * @return TRUE=包含命名分组，FALSE=无命名分组
+ * 
+ * 功能：调用 re_count_captures 确保 has_named_captures 已初始化，然后返回
+ *       避免重复解析，提升性能
+ * 
+ * 缓存机制：
+ * - 首次调用时 has_named_captures=-1，re_count_captures 会触发解析并缓存结果（0 或 1）
+ * - 后续调用直接返回缓存值
+ */
 static BOOL re_has_named_captures(REParseState *s)
 {
     if (s->has_named_captures < 0)
@@ -2155,6 +2258,23 @@ static BOOL re_has_named_captures(REParseState *s)
     return s->has_named_captures;
 }
 
+/**
+ * @brief 查找命名分组的索引
+ * @param s 解析状态
+ * @param name 要查找的组名
+ * @param emit_group_index 是否将匹配的组索引发射到字节码
+ * @return 匹配的组名数量（通常为 0 或 1，允许重复定义时为多次）
+ * 
+ * 功能：在 group_names 表中查找指定名称的分组，返回其捕获组索引
+ *       如果 emit_group_index=TRUE，将匹配的组索引写入字节码（用于反向引用）
+ * 
+ * 遍历逻辑：
+ * - group_names 表存储所有命名分组的名称，按定义顺序排列
+ * - 每个条目格式：名称字符串 + LRE_GROUP_NAME_TRAILER_LEN 字节尾部
+ * - 逐个比较，统计匹配次数
+ * 
+ * 使用场景：解析反向引用（如 \k<name>）时查找对应组索引
+ */
 static int find_group_name(REParseState *s, const char *name, BOOL emit_group_index)
 {
     const char *p, *buf_end;
@@ -2181,6 +2301,23 @@ static int find_group_name(REParseState *s, const char *name, BOOL emit_group_in
     return n;
 }
 
+/**
+ * @brief 检查命名分组是否重复定义（同一作用域内）
+ * @param s 解析状态
+ * @param name 要检查的组名
+ * @param scope 当前作用域
+ * @return TRUE=重复定义，FALSE=无重复
+ * 
+ * 功能：在 group_names 表中查找是否存在同名且同作用域的分组
+ *       JavaScript 规范要求同一作用域内不能有重复的命名分组
+ * 
+ * 作用域机制：
+ * - 每个命名分组在存储时附带其定义时的作用域（scope）
+ * - 不同作用域允许同名分组（如嵌套分组 (?<x>...(?<x>...))）
+ * - 同一作用域内重复定义会报错
+ * 
+ * 使用场景：解析命名分组时检查是否违反命名唯一性约束
+ */
 static BOOL is_duplicate_group_name(REParseState *s, const char *name, int scope)
 {
     const char *p, *buf_end;
@@ -2206,6 +2343,23 @@ static BOOL is_duplicate_group_name(REParseState *s, const char *name, int scope
 
 static int re_parse_disjunction(REParseState *s, BOOL is_backward_dir);
 
+/**
+ * @brief 解析行内修饰符（(?ims)... 语法）
+ * @param s 解析状态
+ * @param pp 输入字符串指针的指针（解析后更新）
+ * @return 修饰符掩码（LRE_FLAG_* 组合），-1=错误
+ * 
+ * 功能：解析内联标志位，如 (?i) 忽略大小写、(?m) 多行模式、(?s) 点号匹配所有
+ *       支持组合形式如 (?im)、(?ims) 等
+ * 
+ * 修饰符含义：
+ * - i (LRE_FLAG_IGNORECASE): 忽略大小写匹配
+ * - m (LRE_FLAG_MULTILINE): 多行模式（^$ 匹配行首行尾）
+ * - s (LRE_FLAG_DOTALL): 点号匹配所有字符（包括换行符）
+ * 
+ * 错误处理：同一修饰符重复出现时报错（如 (?ii) 非法）
+ * 返回：解析的修饰符掩码，pp 更新到修饰符列表后的位置
+ */
 static int re_parse_modifiers(REParseState *s, const uint8_t **pp)
 {
     const uint8_t *p = *pp;
@@ -2231,6 +2385,19 @@ static int re_parse_modifiers(REParseState *s, const uint8_t **pp)
     return mask;
 }
 
+/**
+ * @brief 更新修饰符状态（根据添加/移除掩码）
+ * @param val 当前布尔值
+ * @param add_mask 添加掩码（位=1 表示设置为 TRUE）
+ * @param remove_mask 移除掩码（位=1 表示设置为 FALSE）
+ * @param mask 要检查的修饰符位
+ * @return 更新后的布尔值
+ * 
+ * 功能：根据修饰符的添加/移除状态更新对应的标志位
+ *       用于处理 (?ims-ims) 形式的修饰符切换语法
+ * 
+ * 优先级：remove_mask 优先级高于 add_mask（同时出现时以移除为准）
+ */
 static BOOL update_modifier(BOOL val, int add_mask, int remove_mask,
                             int mask)
 {
